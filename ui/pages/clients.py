@@ -1,6 +1,7 @@
 
 import flet as ft
-from ui.flet_compat import elevated_button, text_button
+from core.config import DATABASE_PATH
+from ui.flet_compat import text_button
 
 from services.client_service import (
     ClientServiceError,
@@ -18,22 +19,22 @@ from services.client_service import (
 )
 
 
-# def open_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
-#     """Open a dialog with compatibility for Flet API versions."""
-#     if hasattr(page, "open"):
-#         page.open(dialog)
-#     else:
-#         page.dialog = dialog
-#         dialog.open = True
-#         page.update()
-
-
-def open_dialog(page, dialog):
-    page.show_dialog(dialog)
+def open_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
+    """Show a form dialog using the API provided by the installed Flet."""
+    if hasattr(page, "show_dialog"):
+        page.show_dialog(dialog)
+    else:
+        page.dialog = dialog
+        dialog.open = True
+        page.update()
 
 
 def close_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
-    if hasattr(page, "close"):
+    # Flet 1.x tracks open dialogs as a stack; popping it also removes the
+    # dialog from that stack so the next CRUD form can open normally.
+    if hasattr(page, "pop_dialog"):
+        page.pop_dialog()
+    elif hasattr(page, "close"):
         page.close(dialog)
     else:
         dialog.open = False
@@ -44,7 +45,10 @@ def notify(page: ft.Page, message: str) -> None:
     """Display a brief notification."""
     snackbar = ft.SnackBar(content=ft.Text(message))
 
-    if hasattr(page, "open"):
+    # In Flet 1.x SnackBar is displayed through show_dialog as well.
+    if hasattr(page, "show_dialog"):
+        page.show_dialog(snackbar)
+    elif hasattr(page, "open"):
         page.open(snackbar)
     else:
         page.snack_bar = snackbar
@@ -52,13 +56,19 @@ def notify(page: ft.Page, message: str) -> None:
         page.update()
 
 
-# responsible for building the clients page
 def build_clients_page(page: ft.Page) -> ft.Control:
+    """Build the client screen and connect its controls to client services.
+
+    UI events call services.client_service; that service reads/writes the
+    SQLAlchemy models, which core.database stores in DATABASE_PATH.
+    """
     # search field for the page
     search_field = ft.TextField(
         label="Search name, CNIC, father name, or referral",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
-        expand=True,
+        # A fixed search width lets the status and action buttons stay visible
+        # and wrap cleanly when the application window is narrow.
+        width=320,
     )
 
     # creating a dropdown list
@@ -74,11 +84,13 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         ],
     )
 
-    # clients container
-    clients_container = ft.Column(
+    # This flexing ListView uses the remaining page height and scrolls
+    # independently, while the title, filters, and actions remain in view.
+    clients_container = ft.ListView(
         spacing=10,
         scroll=ft.ScrollMode.AUTO,
         expand=True,
+        padding=ft.Padding(left=2, right=8, top=2, bottom=8),
     )
 
     result_label = ft.Text(
@@ -87,8 +99,9 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         color="#64748B",
     )
 
-    def refresh_clients(e=None):
-        # it a container with a column
+    def refresh_clients(e=None, *, update_page=True):
+        # Search/status controls -> list_clients() -> SQLAlchemy/SQLite.
+        # The result cards below are the visible read side of that same flow.
         clients_container.controls.clear()
 
         try:
@@ -96,74 +109,70 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                 search=search_field.value or "",
                 status=status_filter.value or "",
             )
-            # print("clients: ",clients)
-        # in case there is an error
+            result_label.value = f"{len(clients)} client(s) found"
+
+            if not clients:
+                clients_container.controls.append(
+                    ft.Container(
+                        content=ft.Column(
+                            controls=[
+                                ft.Text(
+                                    "No clients found",
+                                    size=18,
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    "Add a client or change the search "
+                                    "and status filters.",
+                                    color="#64748B",
+                                ),
+                                ft.Text(
+                                    f"Database: {DATABASE_PATH}",
+                                    size=11,
+                                    color="#94A3B8",
+                                    selectable=True,
+                                ),
+                            ],
+                            horizontal_alignment=(
+                                ft.CrossAxisAlignment.CENTER
+                            ),
+                            spacing=8,
+                        ),
+                        padding=30,
+                        alignment=ft.Alignment(0, 0),
+                    )
+                )
+            else:
+                # Each model from the read query becomes one client card.
+                for client in clients:
+                    clients_container.controls.append(
+                        build_client_card(client)
+                    )
+        # Catch both query failures and rendering failures, and show which
+        # database file this running app tried to read.
         except Exception as exc:
+            clients_container.controls.clear()
+            result_label.value = "Unable to load clients"
+            # Don't leave a partially rendered result on screen.
             clients_container.controls.append(
                 ft.Text(
-                    f"Unable to load clients: {exc}",
+                    f"Unable to load clients from {DATABASE_PATH}: {exc}",
                     color="#B91C1C",
+                    selectable=True,
                 )
             )
-            result_label.value = "Database error"
+
+        # Page.update sends the rebuilt list controls to the running client.
+        # On initial page construction AppShell mounts this control tree and
+        # performs the first page update. Event-driven refreshes update now.
+        if update_page:
             page.update()
-            return
 
-        result_label.value = f"{len(clients)} client(s) found"
-
-        if not clients:
-            clients_container.controls.append(
-                ft.Container(
-                    content=ft.Column(
-                        controls=[
-                            ft.Text(
-                                "No clients found",
-                                size=18,
-                                weight=ft.FontWeight.BOLD,
-                            ),
-                            ft.Text(
-                                "Add a client or change the search "
-                                "and status filters.",
-                                color="#64748B",
-                            ),
-                        ],
-                        horizontal_alignment=(
-                            ft.CrossAxisAlignment.CENTER
-                        ),
-                        spacing=8,
-                    ),
-                    padding=30,
-                    alignment=ft.Alignment(0, 0),
-                )
-            )
-            page.update()
-        else:
-            for client in clients:
-                clients_container.controls.append(
-                    build_client_card(client)
-                )
-
-        # got error, control must be added to the page first
-        # clients_container.update()
-
-        page.update()
-
-    # def refresh_clients(e=None):
-    #     clients = list_clients(
-    #         search=search_field.value or "",
-    #         status=status_dropdown.value or "",
-    #     )
-
-    #     client_list.controls.clear()
-
-    #     for client in clients:
-    #         client_list.controls.append(
-    #             build_client_card(client)
-    #         )
-
-    #     client_list.update()
-
+    # Each card is built from a Client model returned by list_clients(); its
+    # buttons pass that model's id to the matching service operation.
     def build_client_card(client):
+        # Card buttons below hand the selected model/id to update, delete,
+        # asset, or custom-field service functions.
         status = client.current_status or "Unspecified"
 
         return ft.Container(
@@ -249,9 +258,6 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             border_radius=12,
         )
 
-    # refresh_clients()
-
-    # responsible for saving a client details
     def open_client_form(client=None):
         editing = client is not None
 
@@ -288,14 +294,11 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             ],
         )
 
-        # pin_field = ft.TextField(
-        #     label="PIN",
-        #     value=(client.pin or "") if editing else "",
-        # )
-
         error_text = ft.Text("", color="#B91C1C", size=12)
 
         def save(e):
+            # Form values -> create_client/update_client -> committed DB row;
+            # refresh_clients then reads that row back into the card list.
             try:
                 data = {
                     "name": name_field.value or "",
@@ -303,7 +306,6 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                     "cnic": cnic_field.value or "",
                     "current_status": status_field.value or "",
                     "referred_by": referral_field.value or "",
-                    # "pin": pin_field.value or "",
                 }
 
                 if editing:
@@ -313,17 +315,19 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                     create_client(**data)
                     message = "Client added successfully."
 
-                close_dialog(page, dialog)
+                # Refresh from the committed database record first. This
+                # keeps the list current even if the dialog lifecycle reports
+                # an error after the save has already succeeded.
                 refresh_clients()
+                close_dialog(page, dialog)
                 notify(page, message)
 
             except ClientServiceError as exc:
                 error_text.value = str(exc)
                 page.update()
-            except Exception:
+            except Exception as exc:
                 error_text.value = (
-                    "Could not save the record. Check the "
-                    "application log for details."
+                    f"Could not save the record: {exc}"
                 )
                 page.update()
 
@@ -753,6 +757,10 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             search_field,
             status_filter,
             ft.OutlinedButton(
+                "Refresh",
+                on_click=refresh_clients,
+            ),
+            ft.OutlinedButton(
                 "Manage columns",
                 on_click=open_column_manager,
             ),
@@ -761,7 +769,9 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         wrap=True,
     )
 
-    refresh_clients()
+    # Navigation calls this builder each time FBR Clients opens, so every
+    # visit starts with a new database query and current client records.
+    refresh_clients(update_page=False)
 
     return ft.Column(
         controls=[

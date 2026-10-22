@@ -1,5 +1,5 @@
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 # our declared db path
@@ -17,6 +17,15 @@ engine = create_engine(
     f"sqlite:///{DATABASE_PATH.as_posix()}",
     connect_args={"check_same_thread": False},
 )
+
+
+@event.listens_for(engine, "connect")
+def enable_sqlite_foreign_keys(connection, _record) -> None:
+    # SQLite leaves FK checks off unless enabled for every connection;
+    # this makes Client relationships' ON DELETE CASCADE guarantees real.
+    cursor = connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 
 # Each operation can obtain its own database session.

@@ -172,6 +172,8 @@ class AppShell:
     def render(self) -> None:
         item = self.get_current_item()
 
+        # Building the selected page runs its initial data query; the completed
+        # layout is attached to Page and sent to the Flet client below.
         content = ft.Column(
             controls=[
                 self.build_topbar(item),
