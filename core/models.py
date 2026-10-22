@@ -1,14 +1,17 @@
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Date,
     Float,
     ForeignKey,
     Integer,
     LargeBinary,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -36,6 +39,19 @@ class Client(Base):
     cnic: Mapped[Optional[str]] = mapped_column(
         String(20), unique=True, index=True
     )
+    cnic_expiry_date: Mapped[Optional[date]] = mapped_column(Date)
+    date_of_birth: Mapped[Optional[date]] = mapped_column(Date)
+    registration_date: Mapped[Optional[date]] = mapped_column(Date)
+    status_updated_date: Mapped[Optional[date]] = mapped_column(Date)
+    phone_number: Mapped[Optional[str]] = mapped_column(String(30))
+    email: Mapped[Optional[str]] = mapped_column(String(254))
+    address: Mapped[Optional[str]] = mapped_column(Text)
+    tehsil: Mapped[Optional[str]] = mapped_column(String(120))
+    district: Mapped[Optional[str]] = mapped_column(String(120))
+    city: Mapped[Optional[str]] = mapped_column(String(120))
+    province: Mapped[Optional[str]] = mapped_column(String(120))
+    payment_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    amount_received: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
 
     current_status: Mapped[Optional[str]] = mapped_column(String(100))
     referred_by: Mapped[Optional[str]] = mapped_column(String(200))

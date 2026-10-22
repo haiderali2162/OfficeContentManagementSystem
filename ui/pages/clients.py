@@ -1,4 +1,7 @@
 
+from datetime import date
+from decimal import Decimal, InvalidOperation
+
 import flet as ft
 from core.config import DATABASE_PATH
 from ui.flet_compat import text_button
@@ -10,13 +13,18 @@ from services.client_service import (
     create_custom_field,
     delete_client,
     delete_custom_field,
+    get_client,
     get_custom_values,
+    get_referrer_payment_totals,
+    list_referrers,
     list_assets,
     list_clients,
     list_custom_fields,
     save_custom_values,
     update_client,
 )
+from core.security import generate_secure_password
+from core.security import decrypt_secret
 
 
 def open_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
@@ -84,6 +92,36 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         ],
     )
 
+    # Sort values are a small allowlist mapped by the service to SQL orderings.
+    sort_filter = ft.Dropdown(
+        label="Sort by",
+        width=220,
+        value="name",
+        options=[
+            ft.dropdown.Option("name", "Name (A–Z)"),
+            ft.dropdown.Option("modified", "Recently modified"),
+            ft.dropdown.Option("tehsil", "Tehsil, district, city"),
+            ft.dropdown.Option("district", "District, tehsil, city"),
+            ft.dropdown.Option("city", "City, district, tehsil"),
+            ft.dropdown.Option("pending", "Highest pending payment"),
+            ft.dropdown.Option("paid", "Paid / lowest balance first"),
+        ],
+    )
+    # Clipboard is a Flet service so credential text can be fetched and copied
+    # only after the user clicks a card action, rather than exposed in the UI.
+    clipboard = next(
+        (service for service in getattr(page, "services", [])
+         if isinstance(service, ft.Clipboard)),
+        None,
+    )
+    if clipboard is None:
+        clipboard = ft.Clipboard()
+        # Services created outside an active Flet event context may not
+        # self-register, so attach it to this page explicitly as a fallback.
+        services = getattr(page, "services", None)
+        if services is not None and clipboard not in services:
+            services.append(clipboard)
+
     # This flexing ListView uses the remaining page height and scrolls
     # independently, while the title, filters, and actions remain in view.
     clients_container = ft.ListView(
@@ -108,6 +146,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             clients = list_clients(
                 search=search_field.value or "",
                 status=status_filter.value or "",
+                sort_by=sort_filter.value or "name",
             )
             result_label.value = f"{len(clients)} client(s) found"
 
@@ -174,6 +213,31 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         # Card buttons below hand the selected model/id to update, delete,
         # asset, or custom-field service functions.
         status = client.current_status or "Unspecified"
+        address_parts = [client.address, client.tehsil, client.district, client.city, client.province]
+        full_address = ", ".join(part.strip() for part in address_parts if part and part.strip())
+
+        # These are async event handlers themselves. Assigning a normal lambda
+        # that merely returns a coroutine makes Flet treat it as synchronous,
+        # so the copy request may never be awaited.
+        async def copy_cnic(e):
+            await copy_to_clipboard(client.cnic or "", "CNIC")
+
+        async def copy_address(e):
+            await copy_to_clipboard(full_address, "Address")
+
+        async def copy_password(e):
+            await copy_client_password(client.id)
+        if client.payment_amount is None:
+            payment_summary = "Payment details have not been entered."
+        else:
+            pending = max(
+                client.payment_amount - (client.amount_received or 0), 0
+            )
+            payment_summary = (
+                f"Business PKR {client.payment_amount:,.2f} · received "
+                f"PKR {client.amount_received or 0:,.2f} · pending "
+                f"PKR {pending:,.2f}"
+            )
 
         return ft.Container(
             content=ft.Column(
@@ -218,13 +282,41 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                         size=13,
                     ),
                     ft.Text(
+                        f"Address: {full_address or '—'}",
+                        size=12,
+                        color="#334155",
+                    ),
+                    ft.Text(
                         f"Referred by: {client.referred_by or '—'}",
                         size=12,
                         color="#64748B",
                     ),
+                    ft.Text(
+                        payment_summary,
+                        size=12,
+                        color="#334155",
+                    ),
                     ft.Divider(height=1, color="#E2E8F0"),
                     ft.Row(
                         controls=[
+                            ft.OutlinedButton(
+                                "Copy CNIC",
+                                icon=ft.Icons.CONTENT_COPY,
+                                on_click=copy_cnic,
+                                disabled=not bool(client.cnic),
+                            ),
+                            ft.OutlinedButton(
+                                "Copy address",
+                                icon=ft.Icons.CONTENT_COPY,
+                                on_click=copy_address,
+                                disabled=not bool(full_address),
+                            ),
+                            ft.OutlinedButton(
+                                "Copy password",
+                                icon=ft.Icons.CONTENT_COPY,
+                                on_click=copy_password,
+                                disabled=not bool(client.password_ciphertext),
+                            ),
                             text_button(
                                 "Custom data",
                                 on_click=lambda e, cid=client.id:
@@ -258,25 +350,174 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             border_radius=12,
         )
 
+    async def copy_to_clipboard(value: str, label: str):
+        if not value:
+            notify(page, f"No {label.lower()} is saved for this client.")
+            return
+        try:
+            await clipboard.set(value)
+            notify(page, f"{label} copied to clipboard.")
+        except Exception as exc:
+            notify(page, f"Could not copy {label.lower()}: {exc}")
+
+    async def copy_client_password(client_id: int):
+        # Load and decrypt only when the user explicitly requests a copy.
+        try:
+            saved_client = get_client(client_id)
+            password = decrypt_secret(
+                saved_client.password_ciphertext if saved_client else None
+            )
+            if not password:
+                notify(page, "No password is saved for this client.")
+                return
+            await clipboard.set(password)
+            notify(page, "Password copied to clipboard.")
+        except Exception as exc:
+            notify(page, f"Could not copy password: {exc}")
+
     def open_client_form(client=None):
         editing = client is not None
+        saved_custom_values = get_custom_values(client.id) if editing else {}
+        # Column definitions come from the column manager; each control below
+        # is keyed by its definition ID so the service can write the value FK.
+        active_fields = list_custom_fields()
 
-        name_field = ft.TextField(
-            label="Client name *",
-            value=client.name if editing else "",
-            autofocus=True,
+        def date_text(attribute):
+            value = getattr(client, attribute, None) if editing else None
+            if value:
+                return value.isoformat()
+            if not editing and attribute in {"registration_date", "status_updated_date"}:
+                return date.today().isoformat()
+            return ""
+
+        def half_width(controls):
+            for control in controls:
+                control.col = {"sm": 6, "md": 6}
+            return controls
+
+        name_field = ft.TextField(label="Client name *", value=client.name if editing else "", autofocus=True)
+        father_field = ft.TextField(label="Father name", value=(client.father_name or "") if editing else "")
+        cnic_field = ft.TextField(label="CNIC number *", hint_text="00000-0000000-0", value=(client.cnic or "") if editing else "")
+        cnic_expiry_field = ft.TextField(label="CNIC expiry date *", hint_text="YYYY-MM-DD", value=date_text("cnic_expiry_date"))
+        address_field = ft.TextField(label="Street / postal address", value=(client.address or "") if editing else "", multiline=True, min_lines=2, max_lines=3)
+        tehsil_field = ft.TextField(label="Tehsil", value=(client.tehsil or "") if editing else "")
+        district_field = ft.TextField(label="District", value=(client.district or "") if editing else "")
+        city_field = ft.TextField(label="City", value=(client.city or "") if editing else "")
+        province_field = ft.TextField(label="Province", value=(client.province or "") if editing else "")
+        birth_field = ft.TextField(label="Date of birth", hint_text="YYYY-MM-DD", value=date_text("date_of_birth"))
+        registration_field = ft.TextField(label="Registration date", hint_text="YYYY-MM-DD", value=date_text("registration_date"))
+        status_date_field = ft.TextField(label="Status update date", hint_text="YYYY-MM-DD", value=date_text("status_updated_date"))
+        referrers = list_referrers()
+        referrer_options = [ft.dropdown.Option(value) for value in referrers]
+        if editing and client.referred_by and client.referred_by not in referrers:
+            referrer_options.append(ft.dropdown.Option(client.referred_by))
+        referral_field = ft.Dropdown(
+            label="Referred by *",
+            value=client.referred_by if editing else None,
+            options=referrer_options,
+            editable=True,
+            enable_filter=True,
+            enable_search=True,
         )
-        father_field = ft.TextField(
-            label="Father name",
-            value=(client.father_name or "") if editing else "",
+
+        def sync_referrer_text(e):
+            # Typing should supersede an older selected option; Flet keeps
+            # the typed string in `.text` and the selected key in `.value`.
+            if referral_field.text:
+                referral_field.value = None
+
+        referral_field.on_text_change = sync_referrer_text
+        phone_field = ft.TextField(label="Phone number *", value=(client.phone_number or "") if editing else "")
+        email_field = ft.TextField(label="Email *", value=(client.email or "") if editing else "", keyboard_type=ft.KeyboardType.EMAIL)
+        payment_field = ft.TextField(label="Total payment / business *", value=str(client.payment_amount or "") if editing else "", keyboard_type=ft.KeyboardType.NUMBER)
+        received_field = ft.TextField(label="Amount received", value=str(client.amount_received or "0") if editing else "0", keyboard_type=ft.KeyboardType.NUMBER)
+        payment_received = ft.Checkbox(
+            label="Payment fully received",
+            value=bool(editing and client.payment_amount is not None and client.amount_received is not None and client.amount_received >= client.payment_amount),
         )
-        cnic_field = ft.TextField(
-            label="CNIC (00000-0000000-0)",
-            value=(client.cnic or "") if editing else "",
+
+        def sync_received_from_checkbox(e):
+            received_field.value = payment_field.value if payment_received.value else "0"
+            page.update()
+
+        payment_received.on_change = sync_received_from_checkbox
+
+        def sync_checkbox_from_amount(e):
+            try:
+                total = Decimal(payment_field.value or "0")
+                paid = Decimal(received_field.value or "0")
+                payment_received.value = total > 0 and paid >= total
+                page.update()
+            except (InvalidOperation, ValueError):
+                payment_received.value = False
+                page.update()
+
+        payment_field.on_change = sync_checkbox_from_amount
+        received_field.on_change = sync_checkbox_from_amount
+        password_field = ft.TextField(
+            label=(
+                "New password (leave blank to keep current)"
+                if editing and client.password_ciphertext
+                else "Password *"
+            ),
+            password=True,
+            can_reveal_password=True,
+            value="",
+            width=520,
+            filled=False,
         )
-        referral_field = ft.TextField(
-            label="Referred by",
-            value=(client.referred_by or "") if editing else "",
+        pin_field = ft.TextField(
+            label="PIN (optional; blank keeps current PIN when editing)",
+            password=True,
+            can_reveal_password=True,
+            value="",
+        )
+        password_length = ft.TextField(
+            label="Length (12–64)",
+            value="20",
+            width=110,
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        generated_password_info = ft.Text(
+            "", size=11, color="#64748B"
+        )
+        generation_count = 0
+
+        def generate_password(e):
+            nonlocal generation_count
+            try:
+                length = int(password_length.value or "20")
+                new_password = generate_secure_password(length)
+                password_field.value = new_password
+                error_text.value = ""
+                generation_count += 1
+                generated_password_info.value = (
+                    f"Generated {length}-character password "
+                    f"(generation {generation_count})."
+                )
+                page.update()
+            except (ValueError, TypeError) as exc:
+                generated_password_info.value = ""
+                error_text.value = str(exc)
+                page.update()
+
+        credential_controls = ft.Column(
+            controls=[
+                password_field,
+                ft.Row(
+                    controls=[
+                        password_length,
+                        ft.Button(
+                            "Generate password",
+                            on_click=generate_password,
+                        ),
+                    ],
+                    spacing=8,
+                ),
+                generated_password_info,
+                pin_field,
+            ],
+            spacing=8,
         )
         status_field = ft.Dropdown(
             label="Current status",
@@ -294,19 +535,73 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             ],
         )
 
+        def update_status_date(e):
+            status_date_field.value = date.today().isoformat()
+            page.update()
+
+        status_field.on_change = update_status_date
+
         error_text = ft.Text("", color="#B91C1C", size=12)
+
+        custom_controls = []
+        custom_value_controls = {}
+        for field in active_fields:
+            initial = saved_custom_values.get(field.id, "")
+            if field.data_type == "boolean":
+                control = ft.Dropdown(
+                    label=f"{field.label}{' *' if field.is_required else ''}",
+                    value=initial or None,
+                    options=[ft.dropdown.Option("true", "Yes"), ft.dropdown.Option("false", "No")],
+                )
+            else:
+                control = ft.TextField(
+                    label=f"{field.label}{' *' if field.is_required else ''}",
+                    value=initial,
+                    multiline=field.data_type == "long_text",
+                    keyboard_type=(ft.KeyboardType.NUMBER if field.data_type in {"integer", "decimal"} else None),
+                    hint_text="YYYY-MM-DD" if field.data_type == "date" else None,
+                )
+            custom_controls.append(control)
+            custom_value_controls[field.id] = control
+
+        def collect_form_data():
+            # The form's normal fields map to Client columns; custom controls
+            # travel as a field-ID map and save in the same service transaction.
+            return {
+                "name": name_field.value or "",
+                "father_name": father_field.value or "",
+                "cnic": cnic_field.value or "",
+                "cnic_expiry_date": cnic_expiry_field.value or "",
+                "address": address_field.value or "",
+                "tehsil": tehsil_field.value or "",
+                "district": district_field.value or "",
+                "city": city_field.value or "",
+                "province": province_field.value or "",
+                "date_of_birth": birth_field.value or "",
+                "registration_date": registration_field.value or "",
+                "status_updated_date": status_date_field.value or "",
+                "phone_number": phone_field.value or "",
+                "email": email_field.value or "",
+                "payment_amount": payment_field.value or "",
+                "amount_received": received_field.value or "0",
+                "current_status": status_field.value or "",
+                # Editable Dropdown stores typed text separately from a
+                # selected option, so accept either representation.
+                "referred_by": referral_field.text or referral_field.value or "",
+                "password": password_field.value or "",
+                "pin": pin_field.value or "",
+                "custom_values": {
+                    field_id: control.value or ""
+                    for field_id, control in custom_value_controls.items()
+                },
+            }
 
         def save(e):
             # Form values -> create_client/update_client -> committed DB row;
             # refresh_clients then reads that row back into the card list.
             try:
-                data = {
-                    "name": name_field.value or "",
-                    "father_name": father_field.value or "",
-                    "cnic": cnic_field.value or "",
-                    "current_status": status_field.value or "",
-                    "referred_by": referral_field.value or "",
-                }
+                error_text.value = ""
+                data = collect_form_data()
 
                 if editing:
                     update_client(client.id, **data)
@@ -339,18 +634,34 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             content=ft.Container(
                 content=ft.Column(
                     controls=[
-                        name_field,
-                        father_field,
-                        cnic_field,
-                        status_field,
-                        referral_field,
                         error_text,
+                        ft.Text("Identity and referral", weight=ft.FontWeight.BOLD),
+                        ft.ResponsiveRow(controls=half_width([
+                            name_field, father_field, cnic_field,
+                            cnic_expiry_field, birth_field, referral_field,
+                        ]), run_spacing=4),
+                        ft.Text("Address", weight=ft.FontWeight.BOLD),
+                        address_field,
+                        ft.ResponsiveRow(controls=half_width([
+                            tehsil_field, district_field, city_field, province_field,
+                        ]), run_spacing=4),
+                        ft.Text("Contact and status", weight=ft.FontWeight.BOLD),
+                        ft.ResponsiveRow(controls=half_width([
+                            phone_field, email_field, registration_field,
+                            status_field, status_date_field,
+                        ]), run_spacing=4),
+                        ft.Text("Payment", weight=ft.FontWeight.BOLD),
+                        ft.ResponsiveRow(controls=half_width([payment_field, received_field]), run_spacing=4),
+                        payment_received,
+                        ft.Text("Portal credentials", weight=ft.FontWeight.BOLD),
+                        credential_controls,
+                        *([ft.Text("Additional fields", weight=ft.FontWeight.BOLD), *custom_controls] if custom_controls else []),
                     ],
-                    tight=True,
                     scroll=ft.ScrollMode.AUTO,
                     spacing=12,
                 ),
-                width=440,
+                width=760,
+                height=600,
             ),
             actions=[
                 text_button(
@@ -581,6 +892,77 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
         open_dialog(page, dialog)
 
+    def open_referrer_totals(e=None):
+        """Show total business, receipts, and outstanding by referrer."""
+        filter_field = ft.TextField(
+            label="Find a referrer",
+            prefix_icon=getattr(ft.Icons, "SEARCH", None),
+        )
+        rows = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, expand=True)
+        dialog_mounted = False
+
+        def refresh_totals(event=None):
+            query = (filter_field.value or "").strip().casefold()
+            rows.controls.clear()
+            rows.controls.append(
+                ft.Row(
+                    controls=[
+                        ft.Text("Referrer", weight=ft.FontWeight.BOLD, expand=2),
+                        ft.Text("Clients", weight=ft.FontWeight.BOLD, expand=1),
+                        ft.Text("Business", weight=ft.FontWeight.BOLD, expand=1),
+                        ft.Text("Received", weight=ft.FontWeight.BOLD, expand=1),
+                        ft.Text("Pending", weight=ft.FontWeight.BOLD, expand=1),
+                    ],
+                    spacing=8,
+                )
+            )
+            # This service query aggregates each referrer's client payment
+            # amounts; the search narrows the result rows in this dialog.
+            totals = get_referrer_payment_totals()
+            matches = [item for item in totals if query in item["referrer"].casefold()]
+            for item in matches:
+                rows.controls.append(
+                    ft.Row(
+                        controls=[
+                            ft.Text(item["referrer"], expand=2),
+                            ft.Text(str(item["clients"]), expand=1),
+                            ft.Text(f"PKR {item['business']:,.2f}", expand=1),
+                            ft.Text(f"PKR {item['received']:,.2f}", expand=1),
+                            ft.Text(f"PKR {item['pending']:,.2f}", expand=1, color="#B91C1C" if item["pending"] else "#15803D"),
+                        ],
+                        spacing=8,
+                    )
+                )
+            if not matches:
+                rows.controls.append(ft.Text("No matching referral records."))
+            if dialog_mounted:
+                rows.update()
+
+        filter_field.on_change = refresh_totals
+        refresh_totals()
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Referrer business and pending payments"),
+            content=ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text(
+                            "Business is total client payment; pending is business minus received. "
+                            "Legacy clients without payment data show zero in these totals until updated."
+                        ),
+                        filter_field,
+                        rows,
+                    ],
+                    expand=True,
+                ),
+                width=850,
+                height=520,
+            ),
+            actions=[text_button("Close", on_click=lambda event: close_dialog(page, dialog))],
+        )
+        open_dialog(page, dialog)
+        dialog_mounted = True
+
     def open_column_manager(e=None):
         fields_container = ft.Column(
             spacing=8,
@@ -724,6 +1106,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
     search_field.on_change = refresh_clients
     status_filter.on_change = refresh_clients
+    sort_filter.on_change = refresh_clients
 
     header = ft.Row(
         controls=[
@@ -756,6 +1139,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         controls=[
             search_field,
             status_filter,
+            sort_filter,
             ft.OutlinedButton(
                 "Refresh",
                 on_click=refresh_clients,
@@ -763,6 +1147,10 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             ft.OutlinedButton(
                 "Manage columns",
                 on_click=open_column_manager,
+            ),
+            ft.OutlinedButton(
+                "Referrer totals",
+                on_click=open_referrer_totals,
             ),
         ],
         spacing=10,

@@ -1,8 +1,9 @@
 
+import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from core.database import SessionLocal
@@ -12,6 +13,7 @@ from core.models import (
     ClientCustomFieldValue,
     CustomFieldDefinition,
 )
+from core.security import encrypt_secret
 
 
 class ClientServiceError(Exception):
@@ -66,10 +68,34 @@ def normalize_field_value(data_type: str, value: str | None):
     )
 
 # it fetches all the clients from the db
-def list_clients(search: str = "", status: str = "") -> list[Client]:
+def list_clients(
+    search: str = "", status: str = "", sort_by: str = "name"
+) -> list[Client]:
     """Return clients matching the optional search and status."""
     with SessionLocal() as session:
-        statement = select(Client).order_by(Client.name)
+        pending_amount = func.coalesce(Client.payment_amount, 0) - func.coalesce(Client.amount_received, 0)
+        sort_columns = {
+            "modified": (Client.updated_at.desc(), Client.name.asc()),
+            "name": (func.lower(Client.name).asc(),),
+            "tehsil": (func.lower(Client.tehsil).asc(), func.lower(Client.district).asc(), func.lower(Client.city).asc(), func.lower(Client.name).asc()),
+            "district": (func.lower(Client.district).asc(), func.lower(Client.tehsil).asc(), func.lower(Client.city).asc(), func.lower(Client.name).asc()),
+            "city": (func.lower(Client.city).asc(), func.lower(Client.district).asc(), func.lower(Client.tehsil).asc(), func.lower(Client.name).asc()),
+            "pending": (pending_amount.desc(), Client.name.asc()),
+            "paid": (
+                case(
+                    (
+                        Client.payment_amount.is_not(None)
+                        & (pending_amount <= 0),
+                        0,
+                    ),
+                    else_=1,
+                ),
+                pending_amount.asc(),
+                Client.name.asc(),
+            ),
+        }
+        # Only predefined sort expressions are accepted from the UI.
+        statement = select(Client).order_by(*sort_columns.get(sort_by, sort_columns["name"]))
 
         if search.strip():
             term = f"%{search.strip()}%"
@@ -80,6 +106,11 @@ def list_clients(search: str = "", status: str = "") -> list[Client]:
                     Client.father_name.ilike(term),
                     Client.cnic.ilike(term),
                     Client.referred_by.ilike(term),
+                    Client.address.ilike(term),
+                    Client.tehsil.ilike(term),
+                    Client.district.ilike(term),
+                    Client.city.ilike(term),
+                    Client.province.ilike(term),
                 )
             )
 
@@ -98,50 +129,228 @@ def get_client(client_id: int) -> Client | None:
         return session.get(Client, client_id)
 
 
+def list_referrers() -> list[str]:
+    """Return distinct referral names for the editable form suggestions."""
+    with SessionLocal() as session:
+        statement = (
+            select(func.min(Client.referred_by))
+            .where(Client.referred_by.is_not(None), Client.referred_by != "")
+            .group_by(func.lower(func.trim(Client.referred_by)))
+            .order_by(func.lower(func.min(Client.referred_by)))
+        )
+        return list(session.scalars(statement).all())
+
+
+def get_referrer_payment_totals() -> list[dict[str, Decimal | int | str]]:
+    """Summarize total business, money received, and balance by referrer."""
+    with SessionLocal() as session:
+        statement = (
+            select(
+                func.min(Client.referred_by),
+                func.count(Client.id),
+                func.coalesce(func.sum(Client.payment_amount), 0),
+                func.coalesce(func.sum(Client.amount_received), 0),
+            )
+            .where(Client.referred_by.is_not(None), Client.referred_by != "")
+            .group_by(func.lower(func.trim(Client.referred_by)))
+            .order_by(func.lower(func.min(Client.referred_by)))
+        )
+        results = []
+        for referrer, count, business, received in session.execute(statement):
+            total = Decimal(str(business or 0)).quantize(Decimal("0.01"))
+            paid = Decimal(str(received or 0)).quantize(Decimal("0.01"))
+            results.append({
+                "referrer": referrer,
+                "clients": count,
+                "business": total,
+                "received": paid,
+                "pending": max(total - paid, Decimal("0.00")),
+            })
+        return results
+
+
+def _parse_date(
+    value: str, label: str, *, required: bool = False
+) -> date | None:
+    value = (value or "").strip()
+    if not value:
+        if required:
+            raise ClientServiceError(f"{label} is required.")
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ClientServiceError(f"{label} must use YYYY-MM-DD format.") from exc
+
+
+def _parse_amount(
+    value: str | Decimal | None,
+    label: str,
+    *,
+    default: str | None = None,
+) -> Decimal:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if default is not None:
+            return Decimal(default)
+        raise ClientServiceError(f"{label} is required.")
+    try:
+        amount = Decimal(str(value).strip())
+    except InvalidOperation as exc:
+        raise ClientServiceError(f"{label} must be a valid amount.") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ClientServiceError(f"{label} must be a non-negative amount.")
+    try:
+        amount = amount.quantize(Decimal("0.01"))
+    except InvalidOperation as exc:
+        raise ClientServiceError(f"{label} is too large.") from exc
+    if amount > Decimal("9999999999.99"):
+        raise ClientServiceError(f"{label} exceeds the supported maximum.")
+    return amount
+
+
+def _validate_client_data(
+    *, name, cnic, cnic_expiry_date, phone_number, email, referred_by,
+    payment_amount, amount_received,
+):
+    normalized_name = (name or "").strip()
+    if not normalized_name:
+        raise ClientServiceError("Client name is required.")
+
+    normalized_cnic = (cnic or "").strip()
+    if not re.fullmatch(r"\d{5}-\d{7}-\d", normalized_cnic):
+        raise ClientServiceError("CNIC is required in 00000-0000000-0 format.")
+
+    normalized_referrer = (referred_by or "").strip()
+    if not normalized_referrer:
+        raise ClientServiceError("Referred by is required.")
+
+    normalized_phone = (phone_number or "").strip()
+    digits = re.sub(r"\D", "", normalized_phone)
+    if (
+        not 7 <= len(digits) <= 15
+        or not re.fullmatch(r"\+?[0-9 ().-]+", normalized_phone)
+    ):
+        raise ClientServiceError("Enter a valid phone number (7 to 15 digits).")
+
+    normalized_email = (email or "").strip()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized_email):
+        raise ClientServiceError("Enter a valid email address.")
+
+    expiry = _parse_date(cnic_expiry_date, "CNIC expiry date", required=True)
+    total = _parse_amount(payment_amount, "Payment")
+    received = _parse_amount(amount_received, "Amount received", default="0")
+    if received > total:
+        raise ClientServiceError("Amount received cannot exceed the payment amount.")
+
+    return (
+        normalized_name, normalized_cnic, expiry, normalized_referrer,
+        normalized_phone, normalized_email, total, received,
+    )
+
+
+def _save_custom_values(session, client: Client, values: dict[int, str]) -> None:
+    """Validate and persist current active custom fields in the same transaction."""
+    fields = list(
+        session.scalars(
+            select(CustomFieldDefinition).where(
+                CustomFieldDefinition.entity_type == "client",
+                CustomFieldDefinition.is_active.is_(True),
+            )
+        ).all()
+    )
+    old_values = {
+        item.field_id: item
+        for item in session.scalars(
+            select(ClientCustomFieldValue).where(
+                ClientCustomFieldValue.client_id == client.id
+            )
+        ).all()
+    } if client.id is not None else {}
+
+    for field in fields:
+        raw = str(values.get(field.id, "") or "")
+        if field.is_required and not raw.strip():
+            raise ClientServiceError(f"{field.label} is required.")
+        normalized = normalize_field_value(field.data_type, raw)
+        record = old_values.get(field.id)
+        if record is None and normalized is not None:
+            session.add(ClientCustomFieldValue(
+                client_id=client.id,
+                field_id=field.id,
+                value_text=normalized,
+            ))
+        elif record is not None:
+            record.value_text = normalized
+
+
+def _encrypt_optional(value: str | None) -> bytes | None:
+    normalized = (value or "").strip()
+    return encrypt_secret(normalized) if normalized else None
+
+
 def create_client(
     *,
     name: str,
     father_name: str = "",
     cnic: str = "",
+    cnic_expiry_date: str = "",
+    date_of_birth: str = "",
+    registration_date: str = "",
+    status_updated_date: str = "",
+    phone_number: str = "",
+    email: str = "",
+    address: str = "",
+    tehsil: str = "",
+    district: str = "",
+    city: str = "",
+    province: str = "",
+    payment_amount: str | Decimal | None = None,
+    amount_received: str | Decimal | None = None,
     current_status: str = "",
     referred_by: str = "",
+    password: str = "",
+    pin: str = "",
+    custom_values: dict[int, str] | None = None,
 ) -> int:
-    name = name.strip()
+    values = _validate_client_data(
+        name=name, cnic=cnic, cnic_expiry_date=cnic_expiry_date,
+        phone_number=phone_number, email=email, referred_by=referred_by,
+        payment_amount=payment_amount, amount_received=amount_received,
+    )
+    name, cnic, expiry, referred_by, phone_number, email, total, received = values
+    password = (password or "").strip()
+    if not password:
+        raise ClientServiceError("Password is required.")
 
-    if not name:
-        raise ClientServiceError("Client name is required.")
-
-    cnic = cnic.strip() or None
-
-    if cnic and not (
-        len(cnic) == 15
-        and cnic[5] == "-"
-        and cnic[13] == "-"
-        and cnic[:5].isdigit()
-        and cnic[6:13].isdigit()
-        and cnic[14].isdigit()
-    ):
-        raise ClientServiceError(
-            "Enter CNIC in 00000-0000000-0 format."
-        )
-
-    with SessionLocal() as session:
+    with SessionLocal.begin() as session:
         client = Client(
             name=name,
             father_name=father_name.strip() or None,
             cnic=cnic,
+            cnic_expiry_date=expiry,
+            date_of_birth=_parse_date(date_of_birth, "Date of birth"),
+            registration_date=_parse_date(registration_date, "Registration date") or date.today(),
+            status_updated_date=_parse_date(status_updated_date, "Status update date") or date.today(),
+            phone_number=phone_number,
+            email=email,
+            address=address.strip() or None,
+            tehsil=tehsil.strip() or None,
+            district=district.strip() or None,
+            city=city.strip() or None,
+            province=province.strip() or None,
+            payment_amount=total,
+            amount_received=received,
             current_status=current_status.strip() or None,
-            referred_by=referred_by.strip() or None,
+            referred_by=referred_by,
+            password_ciphertext=encrypt_secret(password),
+            pin_ciphertext=_encrypt_optional(pin),
         )
-
         session.add(client)
-
         try:
-            session.commit()
-            session.refresh(client)
+            session.flush()
+            _save_custom_values(session, client, custom_values or {})
             return client.id
         except IntegrityError as exc:
-            session.rollback()
             raise ClientServiceError(
                 "This CNIC already exists in the client database."
             ) from exc
@@ -153,44 +362,82 @@ def update_client(
     name: str,
     father_name: str = "",
     cnic: str = "",
+    cnic_expiry_date: str = "",
+    date_of_birth: str = "",
+    registration_date: str = "",
+    status_updated_date: str = "",
+    phone_number: str = "",
+    email: str = "",
+    address: str = "",
+    tehsil: str = "",
+    district: str = "",
+    city: str = "",
+    province: str = "",
+    payment_amount: str | Decimal | None = None,
+    amount_received: str | Decimal | None = None,
     current_status: str = "",
     referred_by: str = "",
+    password: str = "",
+    pin: str = "",
+    custom_values: dict[int, str] | None = None,
 ) -> None:
-    name = name.strip()
+    values = _validate_client_data(
+        name=name, cnic=cnic, cnic_expiry_date=cnic_expiry_date,
+        phone_number=phone_number, email=email, referred_by=referred_by,
+        payment_amount=payment_amount, amount_received=amount_received,
+    )
+    name, cnic, expiry, referred_by, phone_number, email, total, received = values
 
-    if not name:
-        raise ClientServiceError("Client name is required.")
-
-    cnic = cnic.strip() or None
-
-    if cnic and not (
-        len(cnic) == 15
-        and cnic[5] == "-"
-        and cnic[13] == "-"
-        and cnic[:5].isdigit()
-        and cnic[6:13].isdigit()
-        and cnic[14].isdigit()
-    ):
-        raise ClientServiceError(
-            "Enter CNIC in 00000-0000000-0 format."
-        )
-
-    with SessionLocal() as session:
+    with SessionLocal.begin() as session:
         client = session.get(Client, client_id)
-
         if client is None:
             raise ClientServiceError("Client record not found.")
 
+        old_status = client.current_status
+        new_status = current_status.strip() or None
+        entered_status_date = _parse_date(
+            status_updated_date, "Status update date"
+        )
         client.name = name
         client.father_name = father_name.strip() or None
         client.cnic = cnic
-        client.current_status = current_status.strip() or None
-        client.referred_by = referred_by.strip() or None
+        client.cnic_expiry_date = expiry
+        client.date_of_birth = _parse_date(date_of_birth, "Date of birth")
+        client.registration_date = _parse_date(registration_date, "Registration date") or client.registration_date or date.today()
+        if (
+            old_status != new_status
+            and entered_status_date in {None, client.status_updated_date}
+        ):
+            client.status_updated_date = date.today()
+        else:
+            client.status_updated_date = (
+                entered_status_date
+                or client.status_updated_date
+                or date.today()
+            )
+        client.phone_number = phone_number
+        client.email = email
+        client.address = address.strip() or None
+        client.tehsil = tehsil.strip() or None
+        client.district = district.strip() or None
+        client.city = city.strip() or None
+        client.province = province.strip() or None
+        client.payment_amount = total
+        client.amount_received = received
+        client.current_status = new_status
+        client.referred_by = referred_by
+        new_password = (password or "").strip()
+        if new_password:
+            client.password_ciphertext = encrypt_secret(new_password)
+        elif client.password_ciphertext is None:
+            raise ClientServiceError("Password is required for this client.")
+        if (pin or "").strip():
+            client.pin_ciphertext = encrypt_secret(pin.strip())
 
         try:
-            session.commit()
+            session.flush()
+            _save_custom_values(session, client, custom_values or {})
         except IntegrityError as exc:
-            session.rollback()
             raise ClientServiceError(
                 "This CNIC belongs to another client."
             ) from exc

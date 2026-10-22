@@ -1,5 +1,6 @@
 
 from sqlalchemy import create_engine, event
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 # our declared db path
@@ -37,11 +38,48 @@ SessionLocal = sessionmaker(
 
 
 def initialize_database() -> None:
-    """Create all registered database tables."""
+    """Create tables and add newer client columns without losing old rows."""
     # Import models so SQLAlchemy registers their tables.
     import core.models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    migrate_client_columns()
+
+
+def migrate_client_columns() -> None:
+    """Apply additive SQLite changes for client fields introduced later.
+
+    SQLite's ``create_all`` does not alter an existing table. Inspecting the
+    actual columns makes this migration safe to run each time the app starts.
+    New fields remain nullable at the schema level so older rows stay valid;
+    the service enforces required values for all new and edited records.
+    """
+    additions = {
+        "cnic_expiry_date": "DATE",
+        "date_of_birth": "DATE",
+        "registration_date": "DATE",
+        "status_updated_date": "DATE",
+        "phone_number": "VARCHAR(30)",
+        "email": "VARCHAR(254)",
+        "address": "TEXT",
+        "tehsil": "VARCHAR(120)",
+        "district": "VARCHAR(120)",
+        "city": "VARCHAR(120)",
+        "province": "VARCHAR(120)",
+        "payment_amount": "NUMERIC(12, 2)",
+        "amount_received": "NUMERIC(12, 2)",
+    }
+    inspector = inspect(engine)
+    if "clients" not in inspector.get_table_names():
+        return
+
+    existing = {column["name"] for column in inspector.get_columns("clients")}
+    with engine.begin() as connection:
+        for name, sql_type in additions.items():
+            if name not in existing:
+                connection.execute(
+                    text(f'ALTER TABLE clients ADD COLUMN "{name}" {sql_type}')
+                )
 
 
 def check_database_connection() -> bool:

@@ -6,3 +6,6 @@ __pycache__/
 data/
 .env
 *.log
+
+# Local generated implementation notes and plans.
+change-notes/
