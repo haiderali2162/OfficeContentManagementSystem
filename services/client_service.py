@@ -676,6 +676,8 @@ def create_asset(
     client_id: int,
     asset_type: str,
     category: str = "Other",
+    fiscal_year: str = "",
+    tax_year: str = "",
     description: str = "",
     valuation_amount: Decimal | None = None,
     location: str = "",
@@ -689,7 +691,9 @@ def create_asset(
     annual_income: str | Decimal | None = None,
 ) -> int:
     values = _validate_asset_data(
-        asset_type=asset_type, category=category, description=description,
+        asset_type=asset_type, category=category,
+        fiscal_year=fiscal_year, tax_year=tax_year,
+        description=description,
         valuation_amount=valuation_amount, location=location,
         make_model=make_model, registration_number=registration_number,
         purchase_date=purchase_date, sale_date=sale_date,
@@ -713,8 +717,44 @@ def _optional_asset_amount(value, label: str) -> Decimal | None:
     return _parse_amount(value, label)
 
 
+def _resolve_fiscal_year(fiscal_year: str, tax_year: str) -> str:
+    """Require a fiscal year or derive it from its ending tax year."""
+    fiscal = (fiscal_year or "").strip()
+    tax = (tax_year or "").strip()
+
+    if tax:
+        if not re.fullmatch(r"\d{4}", tax):
+            raise ClientServiceError(
+                "Tax year must be a four-digit year, such as 2026."
+            )
+        tax_end = int(tax)
+        if tax_end < 1901 or tax_end > 9999:
+            raise ClientServiceError("Enter a tax year between 1901 and 9999.")
+        derived = f"{tax_end - 1}-{tax_end % 100:02d}"
+        if fiscal and fiscal != derived:
+            raise ClientServiceError(
+                f"Tax year {tax} corresponds to fiscal year {derived}."
+            )
+        return derived
+
+    match = re.fullmatch(r"(\d{4})-(\d{2})", fiscal)
+    if not match:
+        raise ClientServiceError(
+            "Enter a fiscal year like 2025-26 or enter its tax year, such as 2026."
+        )
+    start_year, end_suffix = int(match.group(1)), match.group(2)
+    if (
+        start_year < 1900
+        or start_year >= 9999
+        or end_suffix != f"{(start_year + 1) % 100:02d}"
+    ):
+        raise ClientServiceError("Fiscal year must be consecutive, such as 2025-26.")
+    return fiscal
+
+
 def _validate_asset_data(
-    *, asset_type, category, description, valuation_amount, location,
+    *, asset_type, category, fiscal_year, tax_year, description,
+    valuation_amount, location,
     make_model, registration_number, purchase_date, sale_date,
     purchase_price, sale_price, income_source_type, annual_income,
 ) -> dict:
@@ -727,6 +767,7 @@ def _validate_asset_data(
     normalized_type = (asset_type or "").strip()
     if not normalized_type:
         raise ClientServiceError("Asset or source name is required.")
+    normalized_fiscal_year = _resolve_fiscal_year(fiscal_year, tax_year)
 
     purchased = _parse_date(purchase_date, "Purchase date")
     sold = _parse_date(sale_date, "Sale date")
@@ -740,6 +781,7 @@ def _validate_asset_data(
     return {
         "asset_type": normalized_type,
         "category": normalized_category,
+        "fiscal_year": normalized_fiscal_year,
         "description": (description or "").strip() or None,
         "location": (location or "").strip() or None,
         "make_model": (make_model or "").strip() or None,
@@ -758,7 +800,8 @@ def _validate_asset_data(
 
 def update_asset(
     *, asset_id: int, client_id: int, asset_type: str,
-    category: str = "Other", description: str = "",
+    category: str = "Other", fiscal_year: str = "", tax_year: str = "",
+    description: str = "",
     valuation_amount: Decimal | None = None, location: str = "",
     make_model: str = "", registration_number: str = "",
     purchase_date: str = "", sale_date: str = "",
@@ -769,7 +812,9 @@ def update_asset(
 ) -> None:
     """Update one asset only when it belongs to the requested client."""
     values = _validate_asset_data(
-        asset_type=asset_type, category=category, description=description,
+        asset_type=asset_type, category=category,
+        fiscal_year=fiscal_year, tax_year=tax_year,
+        description=description,
         valuation_amount=valuation_amount, location=location,
         make_model=make_model, registration_number=registration_number,
         purchase_date=purchase_date, sale_date=sale_date,

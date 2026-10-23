@@ -187,6 +187,7 @@ class ClientAsset(Base):
 
     asset_type: Mapped[str] = mapped_column(String(100))
     category: Mapped[Optional[str]] = mapped_column(String(40))
+    fiscal_year: Mapped[Optional[str]] = mapped_column(String(7))
     description: Mapped[Optional[str]] = mapped_column(Text)
     location: Mapped[Optional[str]] = mapped_column(Text)
     make_model: Mapped[Optional[str]] = mapped_column(String(160))

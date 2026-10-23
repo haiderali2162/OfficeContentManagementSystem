@@ -90,6 +90,7 @@ def migrate_client_columns() -> None:
 
     asset_additions = {
         "category": "VARCHAR(40)",
+        "fiscal_year": "VARCHAR(7)",
         "location": "TEXT",
         "make_model": "VARCHAR(160)",
         "registration_number": "VARCHAR(60)",

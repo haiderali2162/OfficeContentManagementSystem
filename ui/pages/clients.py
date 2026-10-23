@@ -870,6 +870,59 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                 ft.dropdown.Option("Other"),
             ],
         )
+        saved_fiscal_year = (
+            asset.fiscal_year if editing and asset.fiscal_year else ""
+        )
+        saved_tax_year = (
+            str(int(saved_fiscal_year[:4]) + 1)
+            if len(saved_fiscal_year) == 7
+            and saved_fiscal_year[:4].isdecimal()
+            else ""
+        )
+        tax_year_field = ft.TextField(
+            label="Tax year (ending year)",
+            hint_text="For example: 2026",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            value=saved_tax_year,
+        )
+        fiscal_year_field = ft.TextField(
+            label="Fiscal year *",
+            hint_text="For example: 2025-26",
+            value=saved_fiscal_year,
+        )
+
+        def derive_fiscal_year(e):
+            """Map a tax year to the fiscal year ending in that year."""
+            raw_year = (tax_year_field.value or "").strip()
+            if len(raw_year) == 4 and raw_year.isdecimal():
+                year = int(raw_year)
+                fiscal_year_field.value = (
+                    f"{year - 1}-{year % 100:02d}"
+                    if 1901 <= year <= 9999
+                    else ""
+                )
+            else:
+                fiscal_year_field.value = ""
+            page.update()
+
+        def sync_tax_year_from_fiscal(e):
+            """Keep the ending tax year in sync with a manually entered FY."""
+            value = (fiscal_year_field.value or "").strip()
+            parts = value.split("-")
+            if (
+                len(parts) == 2
+                and len(parts[0]) == 4
+                and len(parts[1]) == 2
+                and parts[0].isdecimal()
+                and parts[1].isdecimal()
+            ):
+                tax_year_field.value = str(int(parts[0]) + 1)
+            else:
+                tax_year_field.value = ""
+            page.update()
+
+        tax_year_field.on_change = derive_fiscal_year
+        fiscal_year_field.on_change = sync_tax_year_from_fiscal
         asset_type_field = ft.TextField(
             label="Asset or source name *",
             hint_text="House, plot, car, employer, business, etc.",
@@ -967,6 +1020,8 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                 data = {
                     "client_id": client_id,
                     "category": category_field.value or "Other",
+                    "fiscal_year": fiscal_year_field.value or "",
+                    "tax_year": tax_year_field.value or "",
                     "asset_type": asset_type_field.value or "",
                     "description": description_field.value or "",
                     "location": location_field.value or "",
@@ -1004,6 +1059,9 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                             "income sources, and other tax information."
                         ),
                         category_field,
+                        ft.Text("Tax year selection", weight=ft.FontWeight.BOLD),
+                        tax_year_field,
+                        fiscal_year_field,
                         asset_type_field,
                         property_group,
                         vehicle_group,
@@ -1030,7 +1088,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         assets = list_assets(client_id)
         asset_rows = []
         for asset in assets:
-            summary = []
+            summary = [f"Fiscal year: {asset.fiscal_year or 'Not recorded'}"]
             if asset.location:
                 summary.append(f"Location: {asset.location}")
             if asset.make_model:
