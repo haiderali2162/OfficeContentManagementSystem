@@ -23,6 +23,7 @@ from services.client_service import (
     save_custom_values,
     update_client,
     update_client_status,
+    update_asset,
 )
 from core.security import generate_secure_password
 from core.security import decrypt_secret
@@ -73,7 +74,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
     """
     # search field for the page
     search_field = ft.TextField(
-        label="Search name, CNIC, referral, or address",
+        label="Search name, CNIC, NTN, referral, or address",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
         # A fixed search width lets the status and action buttons stay visible
         # and wrap cleanly when the application window is narrow.
@@ -330,7 +331,8 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                     ),
 
                     ft.Text(
-                        f"CNIC: {client.cnic or '—'}",
+                        f"CNIC: {client.cnic or '—'}  ·  "
+                        f"NTN: {client.ntn_number or '—'}",
                         size=13,
                     ),
                     ft.Text(
@@ -375,7 +377,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                                     open_custom_values(cid),
                             ),
                             text_button(
-                                "Assets",
+                                "Tax assets",
                                 on_click=lambda e, cid=client.id:
                                     open_assets(cid),
                             ),
@@ -449,8 +451,9 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
         name_field = ft.TextField(label="Client name *", value=client.name if editing else "", autofocus=True)
         father_field = ft.TextField(label="Father name", value=(client.father_name or "") if editing else "")
-        cnic_field = ft.TextField(label="CNIC number *", hint_text="00000-0000000-0", value=(client.cnic or "") if editing else "")
-        cnic_expiry_field = ft.TextField(label="CNIC expiry date *", hint_text="YYYY-MM-DD", value=date_text("cnic_expiry_date"))
+        cnic_field = ft.TextField(label="CNIC number (optional)", hint_text="00000-0000000-0", value=(client.cnic or "") if editing else "")
+        ntn_field = ft.TextField(label="NTN number (optional)", value=(client.ntn_number or "") if editing else "")
+        cnic_expiry_field = ft.TextField(label="CNIC expiry date (required when CNIC is entered)", hint_text="YYYY-MM-DD", value=date_text("cnic_expiry_date"))
         address_field = ft.TextField(label="Street / postal address", value=(client.address or "") if editing else "", multiline=True, min_lines=2, max_lines=3)
         tehsil_field = ft.TextField(label="Tehsil", value=(client.tehsil or "") if editing else "")
         district_field = ft.TextField(label="District", value=(client.district or "") if editing else "")
@@ -623,6 +626,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                 "name": name_field.value or "",
                 "father_name": father_field.value or "",
                 "cnic": cnic_field.value or "",
+                "ntn_number": ntn_field.value or "",
                 "cnic_expiry_date": cnic_expiry_field.value or "",
                 "address": address_field.value or "",
                 "tehsil": tehsil_field.value or "",
@@ -689,7 +693,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                         error_text,
                         ft.Text("Identity and referral", weight=ft.FontWeight.BOLD),
                         ft.ResponsiveRow(controls=half_width([
-                            name_field, father_field, cnic_field,
+                            name_field, father_field, cnic_field, ntn_field,
                             cnic_expiry_field, birth_field, referral_field,
                         ]), run_spacing=4),
                         ft.Text("Address", weight=ft.FontWeight.BOLD),
@@ -853,95 +857,263 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
         open_dialog(page, dialog)
 
-    def open_assets(client_id: int):
-        assets = list_assets(client_id)
-
-        asset_type = ft.TextField(label="Asset type *")
-        description = ft.TextField(
-            label="Description",
+    def open_asset_form(client_id: int, asset=None):
+        """Create or edit one tax asset and persist it through the service."""
+        editing = asset is not None
+        category_field = ft.Dropdown(
+            label="Record category *",
+            value=(asset.category if editing and asset.category else "Other"),
+            options=[
+                ft.dropdown.Option("Property"),
+                ft.dropdown.Option("Motor vehicle"),
+                ft.dropdown.Option("Income source"),
+                ft.dropdown.Option("Other"),
+            ],
+        )
+        asset_type_field = ft.TextField(
+            label="Asset or source name *",
+            hint_text="House, plot, car, employer, business, etc.",
+            value=asset.asset_type if editing else "",
+        )
+        location_field = ft.TextField(
+            label="Property location / address",
+            value=(asset.location or "") if editing else "",
             multiline=True,
         )
-        valuation = ft.TextField(
-            label="Valuation (PKR)",
+        make_model_field = ft.TextField(
+            label="Vehicle make and model",
+            value=(asset.make_model or "") if editing else "",
+        )
+        registration_field = ft.TextField(
+            label="Vehicle registration number",
+            value=(asset.registration_number or "") if editing else "",
+        )
+        purchase_date_field = ft.TextField(
+            label="Purchase date (YYYY-MM-DD)",
+            value=(asset.purchase_date.isoformat() if editing and asset.purchase_date else ""),
+        )
+        sale_date_field = ft.TextField(
+            label="Sale date (YYYY-MM-DD)",
+            value=(asset.sale_date.isoformat() if editing and asset.sale_date else ""),
+        )
+        purchase_price_field = ft.TextField(
+            label="Purchase price (PKR)",
             keyboard_type=ft.KeyboardType.NUMBER,
+            value=str(asset.purchase_price or "") if editing else "",
+        )
+        sale_price_field = ft.TextField(
+            label="Sale price (PKR)",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            value=str(asset.sale_price or "") if editing else "",
+        )
+        income_source_field = ft.TextField(
+            label="Income source type",
+            hint_text="Salary, business, rent, agriculture, investment, etc.",
+            value=(asset.income_source_type or "") if editing else "",
+        )
+        annual_income_field = ft.TextField(
+            label="Annual income from this source (PKR)",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            value=str(asset.annual_income or "") if editing else "",
+        )
+        current_value_field = ft.TextField(
+            label="Current value (PKR)",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            value=str(asset.valuation_amount or "") if editing else "",
+        )
+        description_field = ft.TextField(
+            label="Additional details",
+            multiline=True,
+            value=(asset.description or "") if editing else "",
         )
         error_text = ft.Text("", color="#B91C1C", size=12)
 
-        asset_rows = [
-            ft.ListTile(
-                title=ft.Text(asset.asset_type),
-                subtitle=ft.Text(
-                    f"{asset.description or ''} "
-                    f"| Value: "
-                    f"{asset.valuation_amount if asset.valuation_amount is not None else '—'}"
-                ),
-            )
-            for asset in assets
-        ]
+        ownership_group = ft.Column(
+            controls=[
+                ft.Text("Purchase and sale history", weight=ft.FontWeight.BOLD),
+                ft.ResponsiveRow(controls=[
+                    purchase_date_field, sale_date_field,
+                    purchase_price_field, sale_price_field,
+                ]),
+            ],
+            spacing=8,
+        )
+        property_group = ft.Column(controls=[location_field])
+        vehicle_group = ft.Column(controls=[make_model_field, registration_field])
+        income_group = ft.Column(
+            controls=[
+                ft.Text("Income source", weight=ft.FontWeight.BOLD),
+                income_source_field,
+                annual_income_field,
+            ],
+            spacing=8,
+        )
+
+        def update_category_fields(e=None):
+            """Show only fields relevant to the selected record category."""
+            category = category_field.value or "Other"
+            ownership_group.visible = category != "Income source"
+            property_group.visible = category == "Property"
+            vehicle_group.visible = category == "Motor vehicle"
+            income_group.visible = category == "Income source"
+            if e is not None:
+                page.update()
+
+        category_field.on_select = update_category_fields
+        update_category_fields()
 
         def save_asset(e):
-            from decimal import Decimal, InvalidOperation
-
             try:
-                amount = None
-                if (valuation.value or "").strip():
-                    amount = Decimal(valuation.value)
-
-                create_asset(
-                    client_id=client_id,
-                    asset_type=asset_type.value or "",
-                    description=description.value or "",
-                    valuation_amount=amount,
-                )
+                data = {
+                    "client_id": client_id,
+                    "category": category_field.value or "Other",
+                    "asset_type": asset_type_field.value or "",
+                    "description": description_field.value or "",
+                    "location": location_field.value or "",
+                    "make_model": make_model_field.value or "",
+                    "registration_number": registration_field.value or "",
+                    "purchase_date": purchase_date_field.value or "",
+                    "sale_date": sale_date_field.value or "",
+                    "purchase_price": purchase_price_field.value or None,
+                    "sale_price": sale_price_field.value or None,
+                    "income_source_type": income_source_field.value or "",
+                    "annual_income": annual_income_field.value or None,
+                    "valuation_amount": current_value_field.value or None,
+                }
+                if editing:
+                    update_asset(asset_id=asset.id, **data)
+                else:
+                    create_asset(**data)
 
                 close_dialog(page, dialog)
-                notify(page, "Asset added.")
+                notify(page, "Asset details saved.")
                 open_assets(client_id)
-
-            except (ClientServiceError, InvalidOperation, ValueError) as exc:
+            except ClientServiceError as exc:
                 error_text.value = str(exc)
                 page.update()
 
         dialog = ft.AlertDialog(
             modal=True,
-            title=ft.Text("Client assets"),
+            title=ft.Text("Edit tax record" if editing else "Add tax record"),
+            content=ft.Container(
+                content=ft.Column(
+                    controls=[
+                        error_text,
+                        ft.Text(
+                            "Record category separates property, vehicles, "
+                            "income sources, and other tax information."
+                        ),
+                        category_field,
+                        asset_type_field,
+                        property_group,
+                        vehicle_group,
+                        ownership_group,
+                        income_group,
+                        current_value_field,
+                        description_field,
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                    spacing=10,
+                ),
+                width=650,
+                height=600,
+            ),
+            actions=[
+                text_button("Cancel", on_click=lambda event: close_dialog(page, dialog)),
+                ft.Button("Save changes" if editing else "Add record", on_click=save_asset),
+            ],
+        )
+        open_dialog(page, dialog)
+
+    def open_assets(client_id: int):
+        """Show one client's tax assets and provide per-record edit actions."""
+        assets = list_assets(client_id)
+        asset_rows = []
+        for asset in assets:
+            summary = []
+            if asset.location:
+                summary.append(f"Location: {asset.location}")
+            if asset.make_model:
+                summary.append(f"Vehicle: {asset.make_model}")
+            if asset.registration_number:
+                summary.append(f"Registration: {asset.registration_number}")
+            if asset.purchase_date:
+                summary.append(f"Purchased: {asset.purchase_date.isoformat()}")
+            if asset.sale_date:
+                summary.append(f"Sold: {asset.sale_date.isoformat()}")
+            if asset.purchase_price is not None:
+                summary.append(f"Purchase PKR {asset.purchase_price:,.2f}")
+            if asset.sale_price is not None:
+                summary.append(f"Sale PKR {asset.sale_price:,.2f}")
+            if asset.income_source_type:
+                summary.append(f"Income: {asset.income_source_type}")
+            if asset.annual_income is not None:
+                summary.append(f"Annual PKR {asset.annual_income:,.2f}")
+            if asset.valuation_amount is not None:
+                summary.append(f"Current value PKR {asset.valuation_amount:,.2f}")
+            if asset.description:
+                summary.append(asset.description)
+
+            asset_rows.append(
+                ft.Row(
+                    controls=[
+                        ft.Column(
+                            controls=[
+                                ft.Text(
+                                    f"{asset.category or 'Other'} · {asset.asset_type}",
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text("  ·  ".join(summary) or "No extra details"),
+                            ],
+                            spacing=4,
+                            expand=True,
+                        ),
+                        ft.IconButton(
+                            ft.Icons.EDIT_OUTLINED,
+                            tooltip="Edit this tax record",
+                            on_click=lambda event, record=asset: (
+                                close_dialog(page, dialog),
+                                open_asset_form(client_id, record),
+                            ),
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            )
+
+        if not asset_rows:
+            asset_rows.append(ft.Text("No tax assets or income sources have been recorded."))
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Client tax assets and income"),
             content=ft.Container(
                 content=ft.Column(
                     controls=[
                         ft.Text(
-                            "Existing assets",
-                            weight=ft.FontWeight.BOLD,
+                            "Properties, vehicles, income sources, and their "
+                            "purchase/sale details for this client."
                         ),
-                        *asset_rows,
                         ft.Divider(),
-                        ft.Text(
-                            "Add an asset",
-                            weight=ft.FontWeight.BOLD,
-                        ),
-                        asset_type,
-                        description,
-                        valuation,
-                        error_text,
+                        *asset_rows,
                     ],
                     scroll=ft.ScrollMode.AUTO,
-                    tight=True,
                     spacing=10,
                 ),
-                width=480,
-                height=440,
+                width=760,
+                height=520,
             ),
             actions=[
-                text_button(
-                    "Close",
-                    on_click=lambda e: close_dialog(page, dialog),
-                ),
+                text_button("Close", on_click=lambda event: close_dialog(page, dialog)),
                 ft.Button(
-                    "Add asset",
-                    on_click=save_asset,
+                    "Add asset or income source",
+                    on_click=lambda event: (
+                        close_dialog(page, dialog),
+                        open_asset_form(client_id),
+                    ),
                 ),
             ],
         )
-
         open_dialog(page, dialog)
 
     def open_referrer_totals(e=None, *, pending_only=False):

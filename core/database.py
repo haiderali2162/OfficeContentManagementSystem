@@ -38,7 +38,7 @@ SessionLocal = sessionmaker(
 
 
 def initialize_database() -> None:
-    """Create tables and add newer client columns without losing old rows."""
+    """Create tables and add newer client/asset columns without data loss."""
     # Import models so SQLAlchemy registers their tables.
     import core.models  # noqa: F401
 
@@ -47,15 +47,16 @@ def initialize_database() -> None:
 
 
 def migrate_client_columns() -> None:
-    """Apply additive SQLite changes for client fields introduced later.
+    """Apply additive SQLite changes for newer client and asset fields.
 
     SQLite's ``create_all`` does not alter an existing table. Inspecting the
     actual columns makes this migration safe to run each time the app starts.
     New fields remain nullable at the schema level so older rows stay valid;
-    the service enforces required values for all new and edited records.
+    the service enforces required values for new and edited records.
     """
     additions = {
         "cnic_expiry_date": "DATE",
+        "ntn_number": "VARCHAR(30)",
         "date_of_birth": "DATE",
         "registration_date": "DATE",
         "status_updated_date": "DATE",
@@ -80,6 +81,38 @@ def migrate_client_columns() -> None:
                 connection.execute(
                     text(f'ALTER TABLE clients ADD COLUMN "{name}" {sql_type}')
                 )
+        # A nullable unique index supports records identified by NTN only,
+        # while still enforcing uniqueness once a number is provided.
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_clients_ntn_number "
+            "ON clients (ntn_number)"
+        ))
+
+    asset_additions = {
+        "category": "VARCHAR(40)",
+        "location": "TEXT",
+        "make_model": "VARCHAR(160)",
+        "registration_number": "VARCHAR(60)",
+        "purchase_date": "DATE",
+        "sale_date": "DATE",
+        "purchase_price": "NUMERIC(14, 2)",
+        "sale_price": "NUMERIC(14, 2)",
+        "income_source_type": "VARCHAR(100)",
+        "annual_income": "NUMERIC(14, 2)",
+    }
+    asset_tables = inspect(engine).get_table_names()
+    if "client_assets" not in asset_tables:
+        return
+
+    existing_asset_columns = {
+        column["name"] for column in inspect(engine).get_columns("client_assets")
+    }
+    with engine.begin() as connection:
+        for name, sql_type in asset_additions.items():
+            if name not in existing_asset_columns:
+                connection.execute(text(
+                    f'ALTER TABLE client_assets ADD COLUMN "{name}" {sql_type}'
+                ))
 
 
 def check_database_connection() -> bool:

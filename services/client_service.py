@@ -133,6 +133,7 @@ def list_clients(
                     Client.name.ilike(term),
                     Client.father_name.ilike(term),
                     Client.cnic.ilike(term),
+                    Client.ntn_number.ilike(term),
                     Client.referred_by.ilike(term),
                     Client.address.ilike(term),
                     Client.tehsil.ilike(term),
@@ -254,7 +255,7 @@ def _parse_amount(
 
 
 def _validate_client_data(
-    *, name, cnic, cnic_expiry_date, phone_number, email, referred_by,
+    *, name, cnic, ntn_number, cnic_expiry_date, phone_number, email, referred_by,
     payment_amount, amount_received,
 ):
     normalized_name = (name or "").strip()
@@ -262,8 +263,13 @@ def _validate_client_data(
         raise ClientServiceError("Client name is required.")
 
     normalized_cnic = (cnic or "").strip()
-    if not re.fullmatch(r"\d{5}-\d{7}-\d", normalized_cnic):
-        raise ClientServiceError("CNIC is required in 00000-0000000-0 format.")
+    normalized_ntn = (ntn_number or "").strip()
+    if normalized_cnic and not re.fullmatch(r"\d{5}-\d{7}-\d", normalized_cnic):
+        raise ClientServiceError("CNIC must use 00000-0000000-0 format.")
+    if len(normalized_ntn) > 30:
+        raise ClientServiceError("NTN number cannot exceed 30 characters.")
+    if not normalized_cnic and not normalized_ntn:
+        raise ClientServiceError("Enter a CNIC number, an NTN number, or both.")
 
     normalized_referrer = (referred_by or "").strip()
     if not normalized_referrer:
@@ -281,14 +287,20 @@ def _validate_client_data(
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized_email):
         raise ClientServiceError("Enter a valid email address.")
 
-    expiry = _parse_date(cnic_expiry_date, "CNIC expiry date", required=True)
+    # CNIC expiry applies only when the record includes a CNIC identifier.
+    expiry = _parse_date(
+        cnic_expiry_date,
+        "CNIC expiry date",
+        required=bool(normalized_cnic),
+    )
     total = _parse_amount(payment_amount, "Payment")
     received = _parse_amount(amount_received, "Amount received", default="0")
     if received > total:
         raise ClientServiceError("Amount received cannot exceed the payment amount.")
 
     return (
-        normalized_name, normalized_cnic, expiry, normalized_referrer,
+        normalized_name, normalized_cnic or None, normalized_ntn or None,
+        expiry, normalized_referrer,
         normalized_phone, normalized_email, total, received,
     )
 
@@ -338,6 +350,7 @@ def create_client(
     name: str,
     father_name: str = "",
     cnic: str = "",
+    ntn_number: str = "",
     cnic_expiry_date: str = "",
     date_of_birth: str = "",
     registration_date: str = "",
@@ -358,11 +371,15 @@ def create_client(
     custom_values: dict[int, str] | None = None,
 ) -> int:
     values = _validate_client_data(
-        name=name, cnic=cnic, cnic_expiry_date=cnic_expiry_date,
+        name=name, cnic=cnic, ntn_number=ntn_number,
+        cnic_expiry_date=cnic_expiry_date,
         phone_number=phone_number, email=email, referred_by=referred_by,
         payment_amount=payment_amount, amount_received=amount_received,
     )
-    name, cnic, expiry, referred_by, phone_number, email, total, received = values
+    (
+        name, cnic, ntn_number, expiry, referred_by,
+        phone_number, email, total, received,
+    ) = values
     password = (password or "").strip()
     if not password:
         raise ClientServiceError("Password is required.")
@@ -372,6 +389,7 @@ def create_client(
             name=name,
             father_name=father_name.strip() or None,
             cnic=cnic,
+            ntn_number=ntn_number,
             cnic_expiry_date=expiry,
             date_of_birth=_parse_date(date_of_birth, "Date of birth"),
             registration_date=_parse_date(registration_date, "Registration date") or date.today(),
@@ -397,7 +415,7 @@ def create_client(
             return client.id
         except IntegrityError as exc:
             raise ClientServiceError(
-                "This CNIC already exists in the client database."
+                "This CNIC or NTN already exists in the client database."
             ) from exc
 
 
@@ -407,6 +425,7 @@ def update_client(
     name: str,
     father_name: str = "",
     cnic: str = "",
+    ntn_number: str = "",
     cnic_expiry_date: str = "",
     date_of_birth: str = "",
     registration_date: str = "",
@@ -427,11 +446,15 @@ def update_client(
     custom_values: dict[int, str] | None = None,
 ) -> None:
     values = _validate_client_data(
-        name=name, cnic=cnic, cnic_expiry_date=cnic_expiry_date,
+        name=name, cnic=cnic, ntn_number=ntn_number,
+        cnic_expiry_date=cnic_expiry_date,
         phone_number=phone_number, email=email, referred_by=referred_by,
         payment_amount=payment_amount, amount_received=amount_received,
     )
-    name, cnic, expiry, referred_by, phone_number, email, total, received = values
+    (
+        name, cnic, ntn_number, expiry, referred_by,
+        phone_number, email, total, received,
+    ) = values
 
     with SessionLocal.begin() as session:
         client = session.get(Client, client_id)
@@ -446,6 +469,7 @@ def update_client(
         client.name = name
         client.father_name = father_name.strip() or None
         client.cnic = cnic
+        client.ntn_number = ntn_number
         client.cnic_expiry_date = expiry
         client.date_of_birth = _parse_date(date_of_birth, "Date of birth")
         client.registration_date = _parse_date(registration_date, "Registration date") or client.registration_date or date.today()
@@ -484,7 +508,7 @@ def update_client(
             _save_custom_values(session, client, custom_values or {})
         except IntegrityError as exc:
             raise ClientServiceError(
-                "This CNIC belongs to another client."
+                "This CNIC or NTN belongs to another client."
             ) from exc
 
 
@@ -651,37 +675,113 @@ def create_asset(
     *,
     client_id: int,
     asset_type: str,
+    category: str = "Other",
     description: str = "",
     valuation_amount: Decimal | None = None,
+    location: str = "",
+    make_model: str = "",
+    registration_number: str = "",
+    purchase_date: str = "",
+    sale_date: str = "",
+    purchase_price: str | Decimal | None = None,
+    sale_price: str | Decimal | None = None,
+    income_source_type: str = "",
+    annual_income: str | Decimal | None = None,
 ) -> int:
-    if not asset_type.strip():
-        raise ClientServiceError("Asset type is required.")
-
-    if valuation_amount is not None:
-        if not valuation_amount.is_finite() or valuation_amount < 0:
-            raise ClientServiceError(
-                "Asset valuation must be a non-negative amount."
-            )
-
-    with SessionLocal() as session:
+    values = _validate_asset_data(
+        asset_type=asset_type, category=category, description=description,
+        valuation_amount=valuation_amount, location=location,
+        make_model=make_model, registration_number=registration_number,
+        purchase_date=purchase_date, sale_date=sale_date,
+        purchase_price=purchase_price, sale_price=sale_price,
+        income_source_type=income_source_type, annual_income=annual_income,
+    )
+    with SessionLocal.begin() as session:
         if session.get(Client, client_id) is None:
             raise ClientServiceError("Client record not found.")
 
-        asset = ClientAsset(
-            client_id=client_id,
-            asset_type=asset_type.strip(),
-            description=description.strip() or None,
-            valuation_amount=(
-                float(valuation_amount)
-                if valuation_amount is not None
-                else None
-            ),
-        )
-
+        asset = ClientAsset(client_id=client_id, **values)
         session.add(asset)
-        session.commit()
-        session.refresh(asset)
+        session.flush()
         return asset.id
+
+
+def _optional_asset_amount(value, label: str) -> Decimal | None:
+    """Parse a blankable non-negative monetary value for asset records."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return _parse_amount(value, label)
+
+
+def _validate_asset_data(
+    *, asset_type, category, description, valuation_amount, location,
+    make_model, registration_number, purchase_date, sale_date,
+    purchase_price, sale_price, income_source_type, annual_income,
+) -> dict:
+    allowed_categories = {
+        "Property", "Motor vehicle", "Income source", "Other",
+    }
+    normalized_category = (category or "Other").strip()
+    if normalized_category not in allowed_categories:
+        raise ClientServiceError("Choose a supported asset category.")
+    normalized_type = (asset_type or "").strip()
+    if not normalized_type:
+        raise ClientServiceError("Asset or source name is required.")
+
+    purchased = _parse_date(purchase_date, "Purchase date")
+    sold = _parse_date(sale_date, "Sale date")
+    if purchased and sold and sold < purchased:
+        raise ClientServiceError("Sale date cannot be before the purchase date.")
+
+    valuation = _optional_asset_amount(valuation_amount, "Current value")
+    purchase = _optional_asset_amount(purchase_price, "Purchase price")
+    sale = _optional_asset_amount(sale_price, "Sale price")
+    income = _optional_asset_amount(annual_income, "Annual income")
+    return {
+        "asset_type": normalized_type,
+        "category": normalized_category,
+        "description": (description or "").strip() or None,
+        "location": (location or "").strip() or None,
+        "make_model": (make_model or "").strip() or None,
+        "registration_number": (registration_number or "").strip() or None,
+        "purchase_date": purchased,
+        "sale_date": sold,
+        "purchase_price": purchase,
+        "sale_price": sale,
+        "income_source_type": (income_source_type or "").strip() or None,
+        "annual_income": income,
+        # Older records use this column for a valuation; keep it populated
+        # while new forms write a decimal-backed current value.
+        "valuation_amount": float(valuation) if valuation is not None else None,
+    }
+
+
+def update_asset(
+    *, asset_id: int, client_id: int, asset_type: str,
+    category: str = "Other", description: str = "",
+    valuation_amount: Decimal | None = None, location: str = "",
+    make_model: str = "", registration_number: str = "",
+    purchase_date: str = "", sale_date: str = "",
+    purchase_price: str | Decimal | None = None,
+    sale_price: str | Decimal | None = None,
+    income_source_type: str = "",
+    annual_income: str | Decimal | None = None,
+) -> None:
+    """Update one asset only when it belongs to the requested client."""
+    values = _validate_asset_data(
+        asset_type=asset_type, category=category, description=description,
+        valuation_amount=valuation_amount, location=location,
+        make_model=make_model, registration_number=registration_number,
+        purchase_date=purchase_date, sale_date=sale_date,
+        purchase_price=purchase_price, sale_price=sale_price,
+        income_source_type=income_source_type, annual_income=annual_income,
+    )
+    with SessionLocal.begin() as session:
+        asset = session.get(ClientAsset, asset_id)
+        if asset is None or asset.client_id != client_id:
+            raise ClientServiceError("Asset record not found for this client.")
+        for field, value in values.items():
+            setattr(asset, field, value)
 
 
 def list_assets(client_id: int) -> list[ClientAsset]:

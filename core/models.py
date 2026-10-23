@@ -39,6 +39,9 @@ class Client(Base):
     cnic: Mapped[Optional[str]] = mapped_column(
         String(20), unique=True, index=True
     )
+    ntn_number: Mapped[Optional[str]] = mapped_column(
+        String(30), unique=True, index=True
+    )
     cnic_expiry_date: Mapped[Optional[date]] = mapped_column(Date)
     date_of_birth: Mapped[Optional[date]] = mapped_column(Date)
     registration_date: Mapped[Optional[date]] = mapped_column(Date)
@@ -183,7 +186,17 @@ class ClientAsset(Base):
     )
 
     asset_type: Mapped[str] = mapped_column(String(100))
+    category: Mapped[Optional[str]] = mapped_column(String(40))
     description: Mapped[Optional[str]] = mapped_column(Text)
+    location: Mapped[Optional[str]] = mapped_column(Text)
+    make_model: Mapped[Optional[str]] = mapped_column(String(160))
+    registration_number: Mapped[Optional[str]] = mapped_column(String(60))
+    purchase_date: Mapped[Optional[date]] = mapped_column(Date)
+    sale_date: Mapped[Optional[date]] = mapped_column(Date)
+    purchase_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    sale_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    income_source_type: Mapped[Optional[str]] = mapped_column(String(100))
+    annual_income: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
 
     valuation_amount: Mapped[Optional[float]] = mapped_column(
         Float
