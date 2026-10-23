@@ -72,7 +72,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
     """
     # search field for the page
     search_field = ft.TextField(
-        label="Search name, CNIC, father name, or referral",
+        label="Search name, CNIC, referral, or address",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
         # A fixed search width lets the status and action buttons stay visible
         # and wrap cleanly when the application window is narrow.
@@ -98,13 +98,22 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         width=220,
         value="name",
         options=[
-            ft.dropdown.Option("name", "Name (A–Z)"),
+            ft.dropdown.Option("name", "Name"),
             ft.dropdown.Option("modified", "Recently modified"),
             ft.dropdown.Option("tehsil", "Tehsil, district, city"),
             ft.dropdown.Option("district", "District, tehsil, city"),
             ft.dropdown.Option("city", "City, district, tehsil"),
             ft.dropdown.Option("pending", "Highest pending payment"),
             ft.dropdown.Option("paid", "Paid / lowest balance first"),
+        ],
+    )
+    sort_direction_filter = ft.Dropdown(
+        label="Order",
+        width=150,
+        value="asc",
+        options=[
+            ft.dropdown.Option("asc", "Ascending"),
+            ft.dropdown.Option("desc", "Descending"),
         ],
     )
     # Clipboard is a Flet service so credential text can be fetched and copied
@@ -147,6 +156,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                 search=search_field.value or "",
                 status=status_filter.value or "",
                 sort_by=sort_filter.value or "name",
+                sort_direction=sort_direction_filter.value or "asc",
             )
             result_label.value = f"{len(clients)} client(s) found"
 
@@ -892,8 +902,8 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
         open_dialog(page, dialog)
 
-    def open_referrer_totals(e=None):
-        """Show total business, receipts, and outstanding by referrer."""
+    def open_referrer_totals(e=None, *, pending_only=False):
+        """Show referrer totals, optionally limiting the table to balances due."""
         filter_field = ft.TextField(
             label="Find a referrer",
             prefix_icon=getattr(ft.Icons, "SEARCH", None),
@@ -919,7 +929,11 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             # This service query aggregates each referrer's client payment
             # amounts; the search narrows the result rows in this dialog.
             totals = get_referrer_payment_totals()
-            matches = [item for item in totals if query in item["referrer"].casefold()]
+            matches = [
+                item for item in totals
+                if query in item["referrer"].casefold()
+                and (not pending_only or item["pending"] > 0)
+            ]
             for item in matches:
                 rows.controls.append(
                     ft.Row(
@@ -934,7 +948,14 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                     )
                 )
             if not matches:
-                rows.controls.append(ft.Text("No matching referral records."))
+                empty_message = (
+                    "No referrers have pending payments."
+                    if pending_only and not query
+                    else "No matching referrers with pending payments."
+                    if pending_only
+                    else "No matching referral records."
+                )
+                rows.controls.append(ft.Text(empty_message))
             if dialog_mounted:
                 rows.update()
 
@@ -942,12 +963,18 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         refresh_totals()
         dialog = ft.AlertDialog(
             modal=True,
-            title=ft.Text("Referrer business and pending payments"),
+            title=ft.Text(
+                "Referrers with pending payments"
+                if pending_only
+                else "Referrer business and pending payments"
+            ),
             content=ft.Container(
                 content=ft.Column(
                     controls=[
                         ft.Text(
-                            "Business is total client payment; pending is business minus received. "
+                            "Showing only referrers whose combined client balances are still due."
+                            if pending_only
+                            else "Business is total client payment; pending is business minus received. "
                             "Legacy clients without payment data show zero in these totals until updated."
                         ),
                         filter_field,
@@ -962,6 +989,10 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         )
         open_dialog(page, dialog)
         dialog_mounted = True
+
+    def open_pending_referrers(e=None):
+        """Open the existing totals report filtered to positive balances."""
+        open_referrer_totals(e, pending_only=True)
 
     def open_column_manager(e=None):
         fields_container = ft.Column(
@@ -1104,9 +1135,19 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
         open_dialog(page, dialog)
 
-    search_field.on_change = refresh_clients
-    status_filter.on_change = refresh_clients
-    sort_filter.on_change = refresh_clients
+    # Keep handlers explicit so every user input change runs the query and
+    # updates the client list immediately; Refresh remains available for a
+    # manual reload after external database changes.
+    def apply_search_change(e):
+        refresh_clients()
+
+    def apply_filter_change(e):
+        refresh_clients()
+
+    search_field.on_change = apply_search_change
+    status_filter.on_change = apply_filter_change
+    sort_filter.on_change = apply_filter_change
+    sort_direction_filter.on_change = apply_filter_change
 
     header = ft.Row(
         controls=[
@@ -1140,6 +1181,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             search_field,
             status_filter,
             sort_filter,
+            sort_direction_filter,
             ft.OutlinedButton(
                 "Refresh",
                 on_click=refresh_clients,
@@ -1151,6 +1193,10 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             ft.OutlinedButton(
                 "Referrer totals",
                 on_click=open_referrer_totals,
+            ),
+            ft.OutlinedButton(
+                "Pending referrers",
+                on_click=open_pending_referrers,
             ),
         ],
         spacing=10,

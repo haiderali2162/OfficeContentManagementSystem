@@ -69,33 +69,61 @@ def normalize_field_value(data_type: str, value: str | None):
 
 # it fetches all the clients from the db
 def list_clients(
-    search: str = "", status: str = "", sort_by: str = "name"
+    search: str = "",
+    status: str = "",
+    sort_by: str = "name",
+    sort_direction: str = "asc",
 ) -> list[Client]:
-    """Return clients matching the optional search and status."""
+    """Return filtered clients in a validated sort order and direction."""
     with SessionLocal() as session:
         pending_amount = func.coalesce(Client.payment_amount, 0) - func.coalesce(Client.amount_received, 0)
+        direction = (sort_direction or "asc").strip().lower()
+        descending = direction == "desc"
+
+        def ordered(column):
+            return column.desc() if descending else column.asc()
+
+        paid_group = case(
+            (
+                Client.payment_amount.is_(None),
+                2,
+            ),
+            (pending_amount <= 0, 0),
+            else_=1,
+        )
         sort_columns = {
-            "modified": (Client.updated_at.desc(), Client.name.asc()),
-            "name": (func.lower(Client.name).asc(),),
-            "tehsil": (func.lower(Client.tehsil).asc(), func.lower(Client.district).asc(), func.lower(Client.city).asc(), func.lower(Client.name).asc()),
-            "district": (func.lower(Client.district).asc(), func.lower(Client.tehsil).asc(), func.lower(Client.city).asc(), func.lower(Client.name).asc()),
-            "city": (func.lower(Client.city).asc(), func.lower(Client.district).asc(), func.lower(Client.tehsil).asc(), func.lower(Client.name).asc()),
-            "pending": (pending_amount.desc(), Client.name.asc()),
+            "modified": (ordered(Client.updated_at), ordered(func.lower(Client.name))),
+            "name": (ordered(func.lower(Client.name)),),
+            "tehsil": (
+                ordered(func.lower(Client.tehsil)),
+                ordered(func.lower(Client.district)),
+                ordered(func.lower(Client.city)),
+                ordered(func.lower(Client.name)),
+            ),
+            "district": (
+                ordered(func.lower(Client.district)),
+                ordered(func.lower(Client.tehsil)),
+                ordered(func.lower(Client.city)),
+                ordered(func.lower(Client.name)),
+            ),
+            "city": (
+                ordered(func.lower(Client.city)),
+                ordered(func.lower(Client.district)),
+                ordered(func.lower(Client.tehsil)),
+                ordered(func.lower(Client.name)),
+            ),
+            "pending": (ordered(pending_amount), ordered(func.lower(Client.name))),
             "paid": (
-                case(
-                    (
-                        Client.payment_amount.is_not(None)
-                        & (pending_amount <= 0),
-                        0,
-                    ),
-                    else_=1,
-                ),
-                pending_amount.asc(),
-                Client.name.asc(),
+                ordered(paid_group),
+                ordered(pending_amount),
+                ordered(func.lower(Client.name)),
             ),
         }
-        # Only predefined sort expressions are accepted from the UI.
-        statement = select(Client).order_by(*sort_columns.get(sort_by, sort_columns["name"]))
+        # Only predefined sort keys are accepted. Unknown directions default
+        # to ascending order in ordered() above.
+        statement = select(Client).order_by(
+            *sort_columns.get(sort_by, sort_columns["name"])
+        )
 
         if search.strip():
             term = f"%{search.strip()}%"
