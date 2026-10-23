@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import flet as ft
+from ui.pages.area_calculator import build_area_calculator_page
 
 
 # model for navigation
@@ -53,16 +54,23 @@ def build_navigation() -> list[NavigationItem]:
             icon=get_icon("PEOPLE"),
             page_builder=build_clients_page,
         ),
+        # NavigationItem(
+        #     key="revenue",
+        #     title="Revenue Calculator",
+        #     description="Land area and unit conversions",
+        #     icon=get_icon("CALCULATE"),
+        #     page_builder=placeholder(
+        #         "Revenue Calculator",
+        #         "Area calculations will be implemented in Part 4.",
+        #     ),
+        # ),
         NavigationItem(
-            key="revenue",
-            title="Revenue Calculator",
-            description="Land area and unit conversions",
-            icon=get_icon("CALCULATE"),
-            page_builder=placeholder(
-                "Revenue Calculator",
-                "Area calculations will be implemented in Part 4.",
-            ),
-        ),
+                    key="area_calculator",
+                    title="Area Calculator",
+                    description="Land area calculations and conversions",
+                    icon=ft.Icons.CALCULATE,
+                    page_builder=build_area_calculator_page,
+                ),
         NavigationItem(
             key="valuation",
             title="Valuation & Taxes",

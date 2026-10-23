@@ -2,6 +2,9 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
+from sqlalchemy import Integer, String, Text, DateTime
+from sqlalchemy.orm import Mapped, mapped_column
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -209,3 +212,32 @@ class ClientAsset(Base):
     client: Mapped["Client"] = relationship(
         back_populates="assets"
     )
+
+# =========================================
+
+
+class AreaCalculationHistory(Base):
+    """Stores a calculation and the conventions used to produce it."""
+
+    __tablename__ = "area_calculation_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+
+    operation: Mapped[str] = mapped_column(String(50), nullable=False)
+    input_format: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # JSON strings preserve the original inputs and selected conventions.
+    inputs_json: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    result: Mapped[str] = mapped_column(Text, nullable=False)
+    calculation_details: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+
