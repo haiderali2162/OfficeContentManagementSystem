@@ -22,6 +22,7 @@ from services.client_service import (
     list_custom_fields,
     save_custom_values,
     update_client,
+    update_client_status,
 )
 from core.security import generate_secure_password
 from core.security import decrypt_secret
@@ -223,6 +224,15 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         # Card buttons below hand the selected model/id to update, delete,
         # asset, or custom-field service functions.
         status = client.current_status or "Unspecified"
+        status_colors = {
+            "Active": ("#15803D", "#DCFCE7"),
+            "Pending": ("#B91C1C", "#FEE2E2"),
+            "Inactive": ("#C2410C", "#FFEDD5"),
+            "Unspecified": ("#475569", "#F1F5F9"),
+        }
+        status_text_color, status_background = status_colors.get(
+            status, status_colors["Unspecified"]
+        )
         address_parts = [client.address, client.tehsil, client.district, client.city, client.province]
         full_address = ", ".join(part.strip() for part in address_parts if part and part.strip())
 
@@ -237,6 +247,47 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
         async def copy_password(e):
             await copy_client_password(client.id)
+
+        def save_card_status(e, client_id=client.id, previous=client.current_status):
+            """Save this card's status immediately and restore it on failure."""
+            selected_status = e.control.value or ""
+            if selected_status == (previous or ""):
+                return
+            try:
+                # Card selector -> focused service update -> committed client row.
+                update_client_status(client_id, selected_status)
+                refresh_clients()
+                notify(page, f"{client.name}: status saved as {selected_status or 'Unspecified'}.")
+            except Exception as exc:
+                e.control.value = previous or ""
+                page.update()
+                notify(page, f"Could not update status: {exc}")
+
+        status_options = [
+            ft.dropdown.Option("", "Unspecified"),
+            ft.dropdown.Option("Active"),
+            ft.dropdown.Option("Pending"),
+            ft.dropdown.Option("Inactive"),
+        ]
+        if client.current_status and client.current_status not in {
+            "Active", "Pending", "Inactive"
+        }:
+            # Keep legacy values visible until a user selects a supported one.
+            status_options.append(ft.dropdown.Option(client.current_status))
+        status_selector = ft.Dropdown(
+            value=client.current_status or "",
+            options=status_options,
+            width=155,
+            dense=True,
+            filled=True,
+            fill_color=status_background,
+            text_style=ft.TextStyle(color=status_text_color),
+            text_size=12,
+            content_padding=ft.Padding(left=10, right=6, top=4, bottom=4),
+        )
+        # This installed Flet release reports Dropdown selections via
+        # on_select; TextField controls continue to use on_change.
+        status_selector.on_select = save_card_status
         if client.payment_amount is None:
             payment_summary = "Payment details have not been entered."
         else:
@@ -271,16 +322,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                                 spacing=4,
                                 expand=True,
                             ),
-                            ft.Container(
-                                content=ft.Text(
-                                    status,
-                                    size=11,
-                                    color="#2457C5",
-                                ),
-                                padding=8,
-                                bgcolor="#EAF0FF",
-                                border_radius=8,
-                            ),
+                            status_selector,
                         ],
                         vertical_alignment=(
                             ft.CrossAxisAlignment.CENTER
@@ -549,7 +591,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             status_date_field.value = date.today().isoformat()
             page.update()
 
-        status_field.on_change = update_status_date
+        status_field.on_select = update_status_date
 
         error_text = ft.Text("", color="#B91C1C", size=12)
 
@@ -1145,9 +1187,9 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         refresh_clients()
 
     search_field.on_change = apply_search_change
-    status_filter.on_change = apply_filter_change
-    sort_filter.on_change = apply_filter_change
-    sort_direction_filter.on_change = apply_filter_change
+    status_filter.on_select = apply_filter_change
+    sort_filter.on_select = apply_filter_change
+    sort_direction_filter.on_select = apply_filter_change
 
     header = ft.Row(
         controls=[

@@ -157,6 +157,23 @@ def get_client(client_id: int) -> Client | None:
         return session.get(Client, client_id)
 
 
+def update_client_status(client_id: int, status: str) -> None:
+    """Persist a card-level status change without resubmitting client details."""
+    normalized_status = (status or "").strip()
+    if normalized_status not in {"", "Active", "Inactive", "Pending"}:
+        raise ClientServiceError("Choose Active, Inactive, Pending, or Unspecified.")
+
+    with SessionLocal.begin() as session:
+        client = session.get(Client, client_id)
+        if client is None:
+            raise ClientServiceError("Client record not found.")
+
+        # Keep the status change date in step with the card action; SQLAlchemy
+        # also advances updated_at when this row is committed.
+        client.current_status = normalized_status or None
+        client.status_updated_date = date.today()
+
+
 def list_referrers() -> list[str]:
     """Return distinct referral names for the editable form suggestions."""
     with SessionLocal() as session:
