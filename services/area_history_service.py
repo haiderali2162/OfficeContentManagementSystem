@@ -3,7 +3,7 @@
 
 import json
 
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, delete
 
 from core.database import SessionLocal
 from core.models import AreaCalculationHistory
@@ -39,7 +39,7 @@ def save_calculation(
 def list_calculations(limit: int = 100) -> list[dict]:
     """Return the most recent calculations first."""
 
-    limit = max(1, min(int(limit), 1000))
+    limit = max(1, min(int(limit), 100000))
 
     with SessionLocal() as session:
         statement = (
@@ -94,3 +94,11 @@ def get_calculation(calculation_id: int) -> dict | None:
                 else ""
             ),
         }
+
+
+def clear_calculations() -> int:
+    """Delete calculator history and return the number of removed records."""
+    with SessionLocal() as session:
+        result = session.execute(delete(AreaCalculationHistory))
+        session.commit()
+        return int(result.rowcount or 0)
