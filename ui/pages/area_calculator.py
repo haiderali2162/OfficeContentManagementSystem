@@ -18,7 +18,6 @@ from core.area_engine import (
     AreaSettings,
     LandArea,
     average_area,
-    calculate_percentage_share,
     sum_areas,
     subtract_areas,
 )
@@ -88,7 +87,7 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
     # a numeric factor; area arithmetic writes a normalized K-M-F value to A.
     value_a = ft.TextField(
         label="A",
-        hint_text="Examples: 3, 3-10, or 3-10-120",
+        hint_text="Examples: 3-10-120, 12 kilas, or 3 acres",
         expand=True,
         autofocus=True,
     )
@@ -183,8 +182,16 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
         )
 
     def parse_area(raw_value: str, label: str, settings: AreaSettings) -> LandArea:
-        """Accept a compact K, K-M, or K-M-F land-area entry."""
+        """Accept K-M-F input or an amount explicitly labeled acres or kilas."""
         raw = (raw_value or "").strip()
+        unit_value = re.fullmatch(
+            r"(\d+(?:\.\d+)?)\s*(acres?|kilas?)", raw, flags=re.IGNORECASE
+        )
+        if unit_value:
+            amount, unit = unit_value.groups()
+            if unit.lower().startswith("acre"):
+                return LandArea.from_acres(amount, settings)
+            return LandArea.from_kila(amount, settings)
         parts = raw.split("-")
         if not raw or len(parts) not in {1, 2, 3}:
             raise AreaError(
@@ -208,6 +215,24 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
         if not value.is_finite() or value < 0:
             raise AreaError(f"{label} must be a finite, non-negative value.")
         return value
+
+    def parse_share(raw_value: str) -> Decimal:
+        """Convert a fraction (1/5) or percent (20) to percentage points."""
+        raw = (raw_value or "").strip()
+        fraction = re.fullmatch(r"(\d+)\s*/\s*(\d+)", raw)
+        if fraction:
+            numerator, denominator = (int(part) for part in fraction.groups())
+            if denominator == 0:
+                raise AreaError("Share denominator must be greater than zero.")
+            if numerator > denominator:
+                raise AreaError("The share cannot exceed the total area.")
+            return Decimal(numerator) * Decimal(100) / Decimal(denominator)
+        if raw.endswith("%"):
+            raw = raw[:-1].strip()
+        percentage = parse_number(raw, "B percentage")
+        if percentage > 100:
+            raise AreaError("Percentage must be between 0 and 100.")
+        return percentage
 
     def format_area_preview(raw_value: str, settings: AreaSettings) -> str:
         """Build live unit details for one syntactically complete K-M-F value."""
@@ -246,7 +271,7 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
                     if operation_dropdown.value == "Multiply"
                     else "B is a numeric divisor."
                     if operation_dropdown.value == "Divide"
-                    else "B is a percentage from 0 to 100."
+                    else "B can be a fraction such as 1/5 or a percentage."
                 )
             else:
                 preview_b.value = format_area_preview(
@@ -496,9 +521,6 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
             status_text.value = f"Imported and totaled {len(parsed)} values from {selected.name}."
             update_area_previews()
             refresh_history()
-            # Flet restores keyboard focus after the control update, allowing
-            # the next operand to be typed immediately for chained work.
-            value_b.focus()
         except Exception as exc:
             status_text.value = f"Could not import area values: {exc}"
         page.update()
@@ -543,8 +565,8 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
             value_b.label = "B (area: K, K-M, or K-M-F)"
             value_b.hint_text = "Examples: 2, 2-5, or 2-5-100"
         elif operation == "Percentage Share":
-            value_b.label = "B (percentage)"
-            value_b.hint_text = "Enter a percentage from 0 to 100"
+            value_b.label = "B (share or percentage)"
+            value_b.hint_text = "Enter a fraction such as 1/5 or a percentage"
         elif operation in {"Multiply", "Divide"}:
             value_b.label = "B (number)"
             value_b.hint_text = "Enter a multiplier or divisor"
@@ -559,7 +581,7 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
     value_a.on_change = update_area_previews
     value_b.on_change = update_area_previews
 
-    def calculate(e=None):
+    async def calculate(e=None):
         """Calculate using K-M-F areas and preserve area results in field A."""
         try:
             settings = make_settings()
@@ -576,7 +598,7 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
             }
             detail_lines = [
                 f"Operation: {operation}",
-                "Input format: K, K-M, or K-M-F",
+                "Input format: K, K-M, K-M-F, acres, or kilas",
                 f"Result display: {display_unit}",
                 f"Square feet per marla: {settings.square_feet_per_marla}",
                 "Acre: 8 kanals",
@@ -610,10 +632,16 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
                     result_area = average_area([area_a, area_b])
                     detail_lines.append(f"({first_raw} + {second_raw}) / 2")
                 elif operation == "Percentage Share":
-                    percentage = parse_number(second_raw, "B")
-                    result_area = calculate_percentage_share(area_a, percentage)
+                    percentage = parse_share(second_raw)
+                    # Preserve fractional square feet for exact acre/kila
+                    # shares (for example, 1/5 of 12 kilas is exactly 2.4).
+                    result_area = LandArea(
+                        area_a.square_feet * percentage / Decimal("100")
+                    )
                     detail_lines.append(
-                        f"{percentage}% of {first_raw} K-M-F"
+                        f"{second_raw} share of {first_raw} = "
+                        f"{_format_decimal(result_area.to_kila(settings))} kilas / "
+                        f"{_format_decimal(result_area.to_acres(settings))} acres"
                     )
                 else:
                     raise AreaError("Choose a supported operation.")
@@ -657,6 +685,9 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
             traceback.print_exc()
             status_text.value = f"Unexpected error: {exc}"
         page.update()
+        # Flet focus is async; request it after updating the cleared B field.
+        if value_b.visible:
+            await value_b.focus()
 
     def clear_calculator(e=None):
         """Clear operands and results without changing regional settings."""
@@ -690,8 +721,8 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
         controls=[
             ft.Text("Land Area Calculator", size=26, weight=ft.FontWeight.BOLD),
             ft.Text(
-                "Enter areas as K, K-M, or K-M-F. Convert a K-M-F area to acres "
-                "or kilas, or continue arithmetic with the result in A.",
+                "Enter K-M-F values or labeled amounts such as 12 kilas or 3 acres. "
+                "Convert areas, calculate shares, and continue arithmetic with A.",
                 color="#64748B",
             ),
             ft.Container(
@@ -737,9 +768,8 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
                             run_spacing=8,
                         ),
                         ft.Text(
-                            "Area values accept K, K-M, or K-M-F (for example "
-                            "2, 2-5, or 2-5-100). For multiplication, division, "
-                            "and percentage share, B is a number.",
+                            "Enter K-M-F values or labeled amounts such as 12 kilas or 3 acres. "
+                            "For multiplication/division B is numeric; shares accept fractions such as 1/5.",
                             size=12,
                             color="#64748B",
                         ),
