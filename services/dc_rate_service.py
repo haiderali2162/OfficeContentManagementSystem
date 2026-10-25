@@ -29,8 +29,13 @@ LOCATION_FIELDS = (
     "committee_town",
     "revenue_circle",
     "property_area",
+    "qanoongoi",
+    "patwar_circle",
     "mauza",
     "hadbast_number",
+    "square_no",
+    "kila_no",
+    "khasra_no",
     "locality",
     "notes",
 )
@@ -50,10 +55,20 @@ RATE_HEADERS = {
     "committee_town": "committee_town",
     "revenue_circle": "revenue_circle",
     "property_area": "property_area",
+    "qanoongoi": "qanoongoi",
+    "qanungoi": "qanoongoi",
+    "patwar_circle": "patwar_circle",
     "mauza": "mauza",
     "hadbast": "hadbast_number",
     "hadbast_number": "hadbast_number",
+    "square_no": "square_no",
+    "square_number": "square_no",
+    "kila_no": "kila_no",
+    "killa_no": "kila_no",
+    "khasra_no": "khasra_no",
+    "khasra_number": "khasra_no",
     "locality": "locality",
+    "location_description": "locality",
     "property_type": "property_type",
     "classification": "classification",
     "land_classification": "classification",
@@ -68,19 +83,18 @@ RATE_HEADERS = {
     "rate_unit": "rate_unit",
     "unit": "rate_unit",
     "effective_from": "effective_from",
-    "effective_to": "effective_to",
+    "published_year": "published_year",
+    "publish_year": "published_year",
+    "schedule_year": "published_year",
+    "year": "published_year",
     "source": "source_reference",
     "source_reference": "source_reference",
-    "source_date": "source_date",
-    "verification_status": "verification_status",
-    "verified_by": "verified_by",
 }
 REQUIRED_RATE_COLUMNS = {
     "location_name",
     "property_type",
     "rate_value",
     "rate_unit",
-    "effective_from",
 }
 
 
@@ -124,7 +138,7 @@ def _location_key(values: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
-    property_type = _text(values.get("property_type"))
+    property_type = _text(values.get("property_type") or values.get("classification"))
     if not property_type:
         raise DCRateServiceError("Property type is required.")
 
@@ -138,6 +152,13 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
     unit = (_text(values.get("rate_unit")) or "").lower()
     unit = unit.replace(" ", "_").replace("-", "_")
     aliases = {
+        "marla": "per_marla",
+        "kanal": "per_kanal",
+        "acre": "per_acre",
+        "kila": "per_kila",
+        "square_foot": "per_square_foot",
+        "square_yard": "per_square_yard",
+        "square_meter": "per_square_meter",
         "sqft": "per_square_foot",
         "square_feet": "per_square_foot",
         "per_sq_ft": "per_square_foot",
@@ -153,7 +174,22 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
             "Choose a supported rate unit: " + ", ".join(DC_RATE_UNITS) + "."
         )
 
-    start = _date(values.get("effective_from"), "Effective from", required=True)
+    raw_year = values.get("published_year")
+    try:
+        year = int(str(raw_year).strip()) if raw_year not in (None, "") else None
+    except (TypeError, ValueError):
+        raise DCRateServiceError("Published year must be a four-digit year.") from None
+    if year is not None and not 1900 <= year <= 2200:
+        raise DCRateServiceError("Published year must be between 1900 and 2200.")
+    start = _date(values.get("effective_from"), "Effective from")
+    if year is not None:
+        start = date(year, 1, 1)
+    if start is None:
+        # effective_from is retained as a required legacy storage column. A
+        # missing schedule year remains NULL so later valuation can flag it.
+        start = date.today()
+    elif year is None:
+        year = start.year
     end = _date(values.get("effective_to"), "Effective to")
     source_date = _date(values.get("source_date"), "Source date")
     if end and end < start:
@@ -180,6 +216,7 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
         "rate_value": amount,
         "rate_unit": unit,
         "effective_from": start,
+        "published_year": year,
         "effective_to": end,
         "source_reference": source,
         "source_date": source_date,
@@ -227,8 +264,13 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
         "committee_town": location.committee_town if location else None,
         "revenue_circle": location.revenue_circle if location else None,
         "property_area": location.property_area if location else None,
+        "qanoongoi": location.qanoongoi if location else None,
+        "patwar_circle": location.patwar_circle if location else None,
         "mauza": location.mauza if location else None,
         "hadbast_number": location.hadbast_number if location else None,
+        "square_no": location.square_no if location else None,
+        "kila_no": location.kila_no if location else None,
+        "khasra_no": location.khasra_no if location else None,
         "locality": location.locality if location else None,
         "property_type": rate.property_type,
         "schedule_type": rate.schedule_type,
@@ -237,6 +279,7 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
         "rate_value": rate.rate_value,
         "rate_unit": rate.rate_unit,
         "effective_from": rate.effective_from,
+        "published_year": rate.published_year,
         "effective_to": rate.effective_to,
         "source_reference": rate.source_reference,
         "source_date": rate.source_date,
@@ -246,6 +289,88 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
         "created_at": rate.created_at,
         "updated_at": rate.updated_at,
     }
+
+
+SCHEDULE_EXPORT_COLUMNS = (
+    ("schedule_type", "Schedule"),
+    ("district", "District"),
+    ("tehsil", "Tehsil"),
+    ("land_type", "Rural or urban"),
+    ("committee_town", "Town / city"),
+    ("revenue_circle", "Revenue circle"),
+    ("qanoongoi", "Qanoongoi"),
+    ("patwar_circle", "Patwar circle"),
+    ("mauza", "Mauza"),
+    ("square_no", "Square no"),
+    ("kila_no", "Kila no"),
+    ("khasra_no", "Khasra no"),
+    ("floor", "Floor"),
+    ("property_area", "Property area"),
+    ("location_name", "Location"),
+    ("classification", "Land classification"),
+    ("rate_value", "Schedule rate"),
+    ("rate_unit", "Unit"),
+    ("published_year", "Published year"),
+    ("source_reference", "Schedule reference"),
+)
+
+
+def export_schedule_records(
+    records: list[dict[str, Any]], file_format: str, fields: list[str] | None = None
+) -> bytes:
+    """Serialize the selected schedule dimensions to CSV, XLSX, or ODS bytes."""
+    columns_by_key = dict(SCHEDULE_EXPORT_COLUMNS)
+    selected = fields or [key for key, _label in SCHEDULE_EXPORT_COLUMNS]
+    unknown = set(selected) - columns_by_key.keys()
+    if unknown:
+        raise DCRateServiceError("Unsupported export field(s): " + ", ".join(sorted(unknown)))
+    labels = [columns_by_key[key] for key in selected]
+
+    def cell(record: dict[str, Any], key: str) -> str:
+        value = record.get(key)
+        if value is None:
+            return ""
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+    rows = [[cell(record, key) for key in selected] for record in records]
+    output = BytesIO()
+    if file_format == "csv":
+        text_output = StringIO(newline="")
+        writer = csv.writer(text_output)
+        writer.writerow(labels)
+        writer.writerows(rows)
+        return text_output.getvalue().encode("utf-8-sig")
+    if file_format == "xlsx":
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Valuation Schedules"
+        sheet.append(labels)
+        for row in rows:
+            sheet.append(row)
+        workbook.save(output)
+        workbook.close()
+        return output.getvalue()
+    if file_format == "ods":
+        try:
+            from odf.opendocument import OpenDocumentSpreadsheet
+            from odf.table import Table, TableCell, TableRow
+            from odf.text import P
+            document = OpenDocumentSpreadsheet()
+            sheet = Table(name="Valuation Schedules")
+            for values in [labels, *rows]:
+                row = TableRow()
+                for value in values:
+                    cell_control = TableCell()
+                    if value:
+                        cell_control.addElement(P(text=value))
+                    row.addElement(cell_control)
+                sheet.addElement(row)
+            document.spreadsheet.addElement(sheet)
+            document.write(output)
+            return output.getvalue()
+        except Exception as exc:
+            raise DCRateServiceError(f"Could not create ODS export: {exc}") from exc
+    raise DCRateServiceError("Choose CSV, XLSX, or ODS for export.")
 
 
 def list_locations() -> list[dict[str, Any]]:
@@ -369,6 +494,7 @@ def list_dc_rates(
     rate_unit: str | None = None,
     verification_status: str | None = None,
     effective_on: date | None = None,
+    published_year: int | None = None,
 ) -> list[dict[str, Any]]:
     statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
     if schedule_type in {"dc", "fbr"}:
@@ -386,6 +512,8 @@ def list_dc_rates(
             DCValuationRate.effective_from <= effective_on,
             or_(DCValuationRate.effective_to.is_(None), DCValuationRate.effective_to >= effective_on),
         )
+    if published_year is not None:
+        statement = statement.where(DCValuationRate.published_year == published_year)
     search = search.strip()
     if search:
         pattern = f"%{search}%"
@@ -406,8 +534,13 @@ def list_dc_rates(
                 PropertyLocation.committee_town.ilike(pattern),
                 PropertyLocation.revenue_circle.ilike(pattern),
                 PropertyLocation.property_area.ilike(pattern),
+                PropertyLocation.qanoongoi.ilike(pattern),
+                PropertyLocation.patwar_circle.ilike(pattern),
                 PropertyLocation.mauza.ilike(pattern),
                 PropertyLocation.hadbast_number.ilike(pattern),
+                PropertyLocation.square_no.ilike(pattern),
+                PropertyLocation.kila_no.ilike(pattern),
+                PropertyLocation.khasra_no.ilike(pattern),
             )
         )
     statement = statement.order_by(
@@ -507,6 +640,8 @@ def preview_mapped_schedule(
         elif "locality" in mapping:
             mapping["location_name"] = mapping["locality"]
     missing = REQUIRED_RATE_COLUMNS - mapping.keys()
+    if "classification" in mapping:
+        missing.discard("property_type")
     if missing:
         raise DCRateServiceError("Map required columns: " + ", ".join(sorted(missing)))
     output = BytesIO()
@@ -556,6 +691,8 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
                 + ", ".join(sorted(set(duplicate_headers)))
             )
         missing = REQUIRED_RATE_COLUMNS - columns.keys()
+        if "classification" in columns:
+            missing.discard("property_type")
         if missing:
             raise DCRateServiceError(
                 "Missing required columns: " + ", ".join(sorted(missing))
@@ -583,8 +720,13 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
                     "committee_town": raw.get("committee_town"),
                     "revenue_circle": raw.get("revenue_circle"),
                     "property_area": raw.get("property_area"),
+                    "qanoongoi": raw.get("qanoongoi"),
+                    "patwar_circle": raw.get("patwar_circle"),
                     "mauza": raw.get("mauza"),
                     "hadbast_number": raw.get("hadbast_number"),
+                    "square_no": raw.get("square_no"),
+                    "kila_no": raw.get("kila_no"),
+                    "khasra_no": raw.get("khasra_no"),
                     "locality": raw.get("locality"),
                 })
                 rate = _rate_data(raw)

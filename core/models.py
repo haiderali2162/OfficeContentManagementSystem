@@ -279,6 +279,11 @@ class PropertyLocation(Base):
     committee_town: Mapped[Optional[str]] = mapped_column(String(200), index=True)
     revenue_circle: Mapped[Optional[str]] = mapped_column(String(200), index=True)
     property_area: Mapped[Optional[str]] = mapped_column(String(200), index=True)
+    qanoongoi: Mapped[Optional[str]] = mapped_column(String(200), index=True)
+    patwar_circle: Mapped[Optional[str]] = mapped_column(String(200), index=True)
+    square_no: Mapped[Optional[str]] = mapped_column(String(80), index=True)
+    kila_no: Mapped[Optional[str]] = mapped_column(String(80), index=True)
+    khasra_no: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     mauza: Mapped[Optional[str]] = mapped_column(String(200), index=True)
     hadbast_number: Mapped[Optional[str]] = mapped_column(String(50), index=True)
     locality: Mapped[Optional[str]] = mapped_column(String(200))
@@ -348,6 +353,9 @@ class DCValuationRate(Base):
     rate_value: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     rate_unit: Mapped[str] = mapped_column(String(32), nullable=False)
     effective_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    # Year printed on the schedule; effective_from is retained for existing
+    # valuation queries and is normalized to January 1 of this year.
+    published_year: Mapped[Optional[int]] = mapped_column(Integer, index=True)
     effective_to: Mapped[Optional[date]] = mapped_column(Date, index=True)
     source_reference: Mapped[Optional[str]] = mapped_column(Text)
     source_date: Mapped[Optional[date]] = mapped_column(Date)

@@ -44,7 +44,7 @@ def _rate_record():
         "hadbast_number": "123",
         "locality": "Urban",
         "property_type": "Residential",
-        "classification": "Urban",
+        "classification": "Residential",
         "rate_value": 1,
         "rate_unit": "per_marla",
         "effective_from": date(2025, 7, 1),
@@ -83,17 +83,16 @@ def test_add_button_event_is_not_used_as_rate_id(monkeypatch):
         control
         for control in dialog_controls
         if isinstance(control, ft.TextField)
-        and control.label == "Source / schedule reference"
-    )
-    verifier_field = next(
-        control
-        for control in dialog_controls
-        if isinstance(control, ft.TextField)
-        and str(control.label).startswith("Verified by")
+        and control.label == "Schedule / notification reference (optional)"
     )
     assert source_field.multiline is False
     assert source_field.expand is None
-    assert verifier_field.visible is False
+    labels = {getattr(control, "label", None) for control in dialog_controls}
+    assert "Published year (optional)" in labels
+    assert "Effective to (optional)" not in labels
+    assert "Source date (optional)" not in labels
+    assert "Verification status" not in labels
+    assert not any(str(label).startswith("Verified by") for label in labels if label)
     # Expanded direct children inside a dialog's vertical Column can consume
     # the remaining height and render as a large empty gray block in Flet.
     assert all(control.expand is None for control in dialog.content.controls)
@@ -123,9 +122,9 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
     fields = [control for control in _walk(dialog.content) if isinstance(control, (ft.TextField, ft.Dropdown))]
     by_label = {control.label: control for control in fields}
     by_label["Property location"].value = "3"
-    by_label["Property type / land classification"].value = "Residential"
-    by_label["DC / FBR schedule rate"].value = "12500"
-    by_label["Effective from (YYYY-MM-DD)"].value = "2027-01-01"
+    by_label["Land classification"].value = "Residential"
+    by_label["DC / FBR schedule value"].value = "12500"
+    by_label["Published year (optional)"].value = "2027"
     dialog.actions[-1].on_click(object())
 
     assert len(saved) == 2
@@ -137,8 +136,7 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
     assert last_filters["schedule_type"] is None
     assert last_filters["location_id"] is None
     assert last_filters["rate_unit"] is None
-    assert last_filters["verification_status"] is None
-    assert last_filters["effective_on"] is None
+    assert last_filters["published_year"] is None
 
 
 def test_edit_button_passes_the_rate_id_explicitly(monkeypatch):
@@ -172,3 +170,35 @@ def test_rate_card_shows_rate_and_location_text(monkeypatch):
     assert any("Test Mauza" in value and "DC schedule" in value for value in text_values)
     assert any("Rate: 12345.00" in value for value in text_values)
     assert any("Residential" in value for value in text_values)
+
+
+def test_location_form_switches_rural_and_urban_fields(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    root.controls[2].controls[2].on_click(object())
+    dialog = page.dialogs[-1]
+    controls = list(_walk(dialog.content))
+    land_type = next(
+        control for control in controls
+        if isinstance(control, ft.RadioGroup)
+    )
+    rural = next(
+        control for control in controls
+        if isinstance(control, ft.Column) and control.controls
+        and isinstance(control.controls[0], ft.Text)
+        and control.controls[0].value == "Rural schedule details"
+    )
+    urban = next(
+        control for control in controls
+        if isinstance(control, ft.Column) and control.controls
+        and isinstance(control.controls[0], ft.Text)
+        and control.controls[0].value == "Urban schedule details"
+    )
+    assert urban.visible is True
+    assert rural.visible is False
+    land_type.value = "rural"
+    land_type.on_change(object())
+    assert rural.visible is True
+    assert urban.visible is False

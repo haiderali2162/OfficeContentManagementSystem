@@ -56,10 +56,16 @@ def migrate_valuation_columns() -> None:
         "committee_town": "VARCHAR(200)",
         "revenue_circle": "VARCHAR(200)",
         "property_area": "VARCHAR(200)",
+        "qanoongoi": "VARCHAR(200)",
+        "patwar_circle": "VARCHAR(200)",
+        "square_no": "VARCHAR(80)",
+        "kila_no": "VARCHAR(80)",
+        "khasra_no": "VARCHAR(100)",
     }
     rate_additions = {
         "schedule_type": "VARCHAR(10) NOT NULL DEFAULT 'dc'",
         "floor": "VARCHAR(100)",
+        "published_year": "INTEGER",
     }
     with engine.begin() as connection:
         if "property_locations" in tables:
@@ -76,6 +82,12 @@ def migrate_valuation_columns() -> None:
                     connection.execute(text(
                         f'ALTER TABLE dc_valuation_rates ADD COLUMN "{name}" {sql_type}'
                     ))
+            # Keep old schedule rows useful in the new year-based editor.
+            connection.execute(text(
+                "UPDATE dc_valuation_rates SET published_year = "
+                "CAST(strftime('%Y', effective_from) AS INTEGER) "
+                "WHERE published_year IS NULL"
+            ))
 
 
 def migrate_client_columns() -> None:

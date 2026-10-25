@@ -171,6 +171,20 @@ def test_verified_rate_requires_source_and_verifier(rate_database):
         )
 
 
+def test_schedule_year_and_reference_are_optional(rate_database):
+    location_id, _ = dc_rate_service.create_location(**_location_values())
+    rate_id = dc_rate_service.create_dc_rate(
+        location_id=location_id,
+        **_rate_values(published_year="", effective_from="", source_reference=""),
+    )
+    record = dc_rate_service.get_dc_rate(rate_id)
+    assert record["published_year"] is None
+    assert record["source_reference"] is None
+    # The legacy effective_from column remains populated while the actual
+    # schedule publication year is honestly left unspecified.
+    assert record["effective_from"] == date.today()
+
+
 def test_excel_preview_reports_duplicates_invalid_rows_and_missing_headers(rate_database):
     location_id, _ = dc_rate_service.create_location(
         **_location_values(
@@ -251,9 +265,9 @@ def test_dc_and_fbr_records_are_separate_schedules(rate_database):
 
 def test_csv_column_mapping_imports_schedule_dimensions(rate_database):
     payload = (
-        "District,Tehsil,Rural or Urban,Committee/Town,Revenue Circle,Floor,"
-        "Property Area,Mauza,Land Classification,Location,Rate,Rate Unit,Effective From\n"
-        "Example District,Example Tehsil,Urban,Town A,Circle 1,Ground,Area 1,Mauza 1,Residential,Main Road,15000,per_marla,2025-07-01\n"
+        "District,Tehsil,Rural or Urban,Qanoongoi,Patwar Circle,Committee/Town,Revenue Circle,Floor,"
+        "Property Area,Mauza,Square No,Kila No,Khasra No,Land Classification,Location,Rate,Rate Unit,Published Year\n"
+        "Example District,Example Tehsil,Urban,Qanoongoi 1,,Town A,Circle 1,Ground,Area 1,Mauza 1,12,3,K-12,Residential,Main Road,15000,per_marla,2025\n"
     ).encode("utf-8")
     headers, rows = dc_rate_service.read_schedule_spreadsheet(payload, "rates.csv")
     mapping = dc_rate_service.suggested_column_mapping(headers)
@@ -263,11 +277,40 @@ def test_csv_column_mapping_imports_schedule_dimensions(rate_database):
     record = preview["valid_records"][0]
     assert record["schedule_type"] == "fbr"
     assert record["location"]["revenue_circle"] == "Circle 1"
+    assert record["published_year"] == 2025
+    assert record["location"]["qanoongoi"] == "Qanoongoi 1"
+    assert record["location"]["square_no"] == "12"
     result = dc_rate_service.import_dc_rate_records(preview["valid_records"])
     assert result["imported_count"] == 1
     saved = dc_rate_service.list_dc_rates(schedule_type="fbr")[0]
     assert saved["committee_town"] == "Town A"
     assert saved["floor"] == "Ground"
+
+
+def test_schedule_export_supports_csv_xlsx_and_ods(rate_database):
+    location_id, _ = dc_rate_service.create_location(**_location_values(
+        land_type="rural", qanoongoi="Qanoongoi 2", patwar_circle="PC 4",
+        square_no="9", kila_no="17", khasra_no="88",
+    ))
+    dc_rate_service.create_dc_rate(
+        location_id=location_id,
+        **_rate_values(schedule_type="dc", published_year="2025", classification="Agricultural"),
+    )
+    record = dc_rate_service.list_dc_rates()[0]
+    for extension in ("csv", "xlsx", "ods"):
+        payload = dc_rate_service.export_schedule_records([record], extension)
+        assert payload
+        if extension == "csv":
+            assert "Qanoongoi" in payload.decode("utf-8-sig")
+            assert "2025" in payload.decode("utf-8-sig")
+        elif extension == "xlsx":
+            headers, rows = dc_rate_service.read_schedule_spreadsheet(payload, "export.xlsx")
+            assert "Qanoongoi" in headers
+            assert "2025" in rows[0]
+        else:
+            headers, rows = dc_rate_service.read_schedule_spreadsheet(payload, "export.ods")
+            assert "Qanoongoi" in headers
+            assert "2025" in rows[0]
 
 
 def test_ods_schedule_file_is_read_for_column_mapping():
@@ -300,7 +343,8 @@ def test_additive_valuation_migration_preserves_legacy_location(tmp_path, monkey
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE property_locations (id INTEGER PRIMARY KEY, name VARCHAR(200) NOT NULL)"))
         connection.execute(text("INSERT INTO property_locations (id, name) VALUES (1, 'Old Mauza')"))
-        connection.execute(text("CREATE TABLE dc_valuation_rates (id INTEGER PRIMARY KEY, property_type VARCHAR(100) NOT NULL)"))
+        connection.execute(text("CREATE TABLE dc_valuation_rates (id INTEGER PRIMARY KEY, property_type VARCHAR(100) NOT NULL, effective_from DATE)"))
+        connection.execute(text("INSERT INTO dc_valuation_rates (id, property_type, effective_from) VALUES (1, 'Residential', '2024-05-02')"))
     monkeypatch.setattr(database, "engine", engine)
     database.migrate_valuation_columns()
     with engine.connect() as connection:
@@ -308,5 +352,7 @@ def test_additive_valuation_migration_preserves_legacy_location(tmp_path, monkey
         schedule_column = next(c for c in inspect(engine).get_columns("dc_valuation_rates") if c["name"] == "schedule_type")
         assert location == ("Old Mauza", None)
         assert schedule_column["default"] == "'dc'"
+        year = connection.execute(text("SELECT published_year FROM dc_valuation_rates WHERE id=1")).scalar_one()
+        assert year == 2024
     engine.dispose()
 
