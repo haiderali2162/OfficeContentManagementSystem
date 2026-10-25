@@ -38,12 +38,44 @@ SessionLocal = sessionmaker(
 
 
 def initialize_database() -> None:
-    """Create tables and add newer client/asset columns without data loss."""
-    # Import models so SQLAlchemy registers their tables.
+    """Create missing tables, then apply additive legacy client/asset changes."""
+    # Import every model so create_all can register new module tables. It only
+    # creates missing tables; it does not drop or rewrite existing user data.
     import core.models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
     migrate_client_columns()
+    migrate_valuation_columns()
+
+
+def migrate_valuation_columns() -> None:
+    """Add schedule dimensions to already-created valuation tables safely."""
+    tables = set(inspect(engine).get_table_names())
+    location_additions = {
+        "land_type": "VARCHAR(20)",
+        "committee_town": "VARCHAR(200)",
+        "revenue_circle": "VARCHAR(200)",
+        "property_area": "VARCHAR(200)",
+    }
+    rate_additions = {
+        "schedule_type": "VARCHAR(10) NOT NULL DEFAULT 'dc'",
+        "floor": "VARCHAR(100)",
+    }
+    with engine.begin() as connection:
+        if "property_locations" in tables:
+            present = {c["name"] for c in inspect(engine).get_columns("property_locations")}
+            for name, sql_type in location_additions.items():
+                if name not in present:
+                    connection.execute(text(
+                        f'ALTER TABLE property_locations ADD COLUMN "{name}" {sql_type}'
+                    ))
+        if "dc_valuation_rates" in tables:
+            present = {c["name"] for c in inspect(engine).get_columns("dc_valuation_rates")}
+            for name, sql_type in rate_additions.items():
+                if name not in present:
+                    connection.execute(text(
+                        f'ALTER TABLE dc_valuation_rates ADD COLUMN "{name}" {sql_type}'
+                    ))
 
 
 def migrate_client_columns() -> None:

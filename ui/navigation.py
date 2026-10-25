@@ -35,6 +35,7 @@ def build_navigation() -> list[NavigationItem]:
     from ui.pages.dashboard import build_dashboard
     from ui.pages.placeholder import build_placeholder
     from ui.pages.clients import build_clients_page
+    from ui.pages.dc_rates import build_dc_rates_page
 
     def placeholder(title: str, description: str):
         return lambda page: build_placeholder(title, description)
@@ -76,10 +77,7 @@ def build_navigation() -> list[NavigationItem]:
             title="Valuation & Taxes",
             description="DC rates, taxes, and deed fees",
             icon=get_icon("ACCOUNT_BALANCE"),
-            page_builder=placeholder(
-                "Valuation & Taxes",
-                "Valuation and fee rules will be implemented later.",
-            ),
+            page_builder=build_dc_rates_page,
         ),
         NavigationItem(
             key="naqsha",
