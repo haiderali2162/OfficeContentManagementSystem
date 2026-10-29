@@ -466,6 +466,51 @@ class TaxFeeRule(Base):
     )
 
 
+class RegistryFeeFormula(Base):
+    """Persisted user-defined registry fee formula; unverified by default."""
+
+    __tablename__ = "registry_fee_formulas"
+    __table_args__ = (
+        CheckConstraint(
+            "verification_status IN ('unverified', 'verified')",
+            name="ck_registry_formula_verification_status",
+        ),
+        CheckConstraint(
+            "effective_to IS NULL OR effective_to >= effective_from",
+            name="ck_registry_formula_effective_dates",
+        ),
+        Index("ix_registry_formula_category", "category", "effective_from"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    category: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    jurisdiction: Mapped[str] = mapped_column(
+        String(160), default="Punjab", nullable=False, index=True
+    )
+    formula_expression: Mapped[str] = mapped_column(Text, nullable=False)
+    payer: Mapped[Optional[str]] = mapped_column(String(80))
+    currency_code: Mapped[str] = mapped_column(
+        String(3), default="PKR", nullable=False
+    )
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    effective_to: Mapped[Optional[date]] = mapped_column(Date, index=True)
+    eligibility_conditions_json: Mapped[Optional[str]] = mapped_column(Text)
+    source_reference: Mapped[Optional[str]] = mapped_column(Text)
+    source_date: Mapped[Optional[date]] = mapped_column(Date)
+    verification_status: Mapped[str] = mapped_column(
+        String(20), default="unverified", nullable=False, index=True
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    verified_by: Mapped[Optional[str]] = mapped_column(String(150))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class ValuationEstimate(Base):
     """Persisted estimate inputs and result snapshots for later review."""
 

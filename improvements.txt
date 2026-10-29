@@ -1,0 +1,10 @@
+on the "valuation & taxes" page on the "calculate" tab
+1. make ui responsive.
+2. there are too many input fields options:
+	i: property location and mauza is required.
+	ii: client is only required for saving
+	iii: transection date is not important just auto save the current date.
+	iv: remove these fields "rule jurisdiction, plots count, share numerator, share denominator, buyer exemption, seller exemption".
+	v: instead of declared consideration, i need registry written value to be asked also the building material value in case the property is constructed.
+	vi: also ask for square no, killa no and in case of urban it may or may not require khasra number. the fees will be calculated on the basis of mauza, square no, kila no and may be khasra no. in case if there is fbr in any mauza then only the stamp and committee fee will be calculated on dc rate but fbr fees will be calculated on fbr schedule.
+	vi: next thing i need to save permanently about how to calculate total fees on the registry. need custom formula area x some percentage + 2000 etc also allow to use brackets for exect calculation.

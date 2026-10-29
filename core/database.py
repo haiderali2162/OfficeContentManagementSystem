@@ -48,10 +48,16 @@ def initialize_database() -> None:
     migrate_valuation_columns()
 
 
-def migrate_valuation_columns() -> None:
+def migrate_valuation_columns(database_engine=None) -> None:
     """Add schedule dimensions to already-created valuation tables safely."""
-    tables = set(inspect(engine).get_table_names())
+    # An engine argument also lets migration tests use a temporary SQLite file;
+    # normal application startup continues to use the configured office DB.
+    database_engine = database_engine or engine
+    tables = set(inspect(database_engine).get_table_names())
     location_additions = {
+        # Mauza is used by the calculator and formula conditions. Older
+        # location tables may predate the structured schedule fields.
+        "mauza": "VARCHAR(200)",
         "land_type": "VARCHAR(20)",
         "committee_town": "VARCHAR(200)",
         "revenue_circle": "VARCHAR(200)",
@@ -67,16 +73,16 @@ def migrate_valuation_columns() -> None:
         "floor": "VARCHAR(100)",
         "published_year": "INTEGER",
     }
-    with engine.begin() as connection:
+    with database_engine.begin() as connection:
         if "property_locations" in tables:
-            present = {c["name"] for c in inspect(engine).get_columns("property_locations")}
+            present = {c["name"] for c in inspect(database_engine).get_columns("property_locations")}
             for name, sql_type in location_additions.items():
                 if name not in present:
                     connection.execute(text(
                         f'ALTER TABLE property_locations ADD COLUMN "{name}" {sql_type}'
                     ))
         if "dc_valuation_rates" in tables:
-            present = {c["name"] for c in inspect(engine).get_columns("dc_valuation_rates")}
+            present = {c["name"] for c in inspect(database_engine).get_columns("dc_valuation_rates")}
             for name, sql_type in rate_additions.items():
                 if name not in present:
                     connection.execute(text(
