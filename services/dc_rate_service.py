@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 import csv
+import re
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
@@ -22,6 +23,7 @@ class DCRateServiceError(ValueError):
 
 LOCATION_FIELDS = (
     "name",
+    "serial_no",
     "province",
     "district",
     "tehsil",
@@ -76,10 +78,20 @@ RATE_HEADERS = {
     "schedule_type": "schedule_type",
     "schedule": "schedule_type",
     "dc_schedule": "rate_value",
+    "dc_rate": "rate_value",
     "fbr_schedule": "rate_value",
     "schedule_reference": "source_reference",
     "rate": "rate_value",
     "rate_value": "rate_value",
+    "structure_rate": "structure_rate",
+    "per_marla_valuation": "per_marla_value",
+    "per_marla_value": "per_marla_value",
+    "value_of_property_per_square_ft_in_rs": "rate_value",
+    "value_of_property_per_square_foot_in_rs": "rate_value",
+    "value_per_square_ft": "rate_value",
+    "square_no_location": "square_no",
+    "location_square_no": "square_no",
+    "serial_no": "serial_no",
     "rate_unit": "rate_unit",
     "unit": "rate_unit",
     "effective_from": "effective_from",
@@ -106,6 +118,98 @@ def _text(value: Any) -> str | None:
     return normalized or None
 
 
+def _reference_values(value: Any) -> list[str]:
+    """Expand square/Kila/Khasra lists and inclusive numeric ranges to tokens."""
+    normalized = _text(value)
+    if not normalized:
+        return []
+    tokens: list[str] = []
+    for segment in re.split(r"[,;]", normalized):
+        segment = segment.strip()
+        if not segment:
+            continue
+        interval = re.fullmatch(r"(\d+)\s*-\s*(\d+)", segment)
+        if interval:
+            # Published schedules sometimes write the larger endpoint first;
+            # treat either order as the same inclusive range.
+            start, end = sorted(int(part) for part in interval.groups())
+            if end - start > 5000:
+                raise DCRateServiceError("A square, Kila, or Khasra range cannot exceed 5,001 values.")
+            tokens.extend(str(number) for number in range(start, end + 1))
+        elif segment.isdigit():
+            # Canonical integer tokens allow a user to search 2 and match an
+            # imported range containing 2 without matching 12 or 20.
+            tokens.append(str(int(segment)))
+        else:
+            tokens.append(segment)
+    return list(dict.fromkeys(tokens))
+
+
+def _normalize_reference(value: Any) -> str | None:
+    tokens = _reference_values(value)
+    return ", ".join(tokens) if tokens else None
+
+
+def _normalize_rate_unit(value: Any) -> str:
+    """Normalize common schedule wording to one of the stored explicit units."""
+    raw = _text(value)
+    if not raw:
+        return ""
+    # Ignore parenthetical notes such as a stated marla convention, plus
+    # currency/rate words that do not change the area unit.
+    normalized = re.sub(r"\([^)]*\)", " ", raw.casefold())
+    tokens = re.findall(r"[a-z]+", normalized)
+    tokens = [token for token in tokens if token not in {
+        "per", "rate", "value", "valuation", "rs", "rupee", "rupees", "in", "of", "the",
+    }]
+    token_set = set(tokens)
+    if "square" in token_set or "sq" in token_set:
+        if token_set.intersection({"foot", "feet", "ft"}):
+            return "per_square_foot"
+        if token_set.intersection({"yard", "yards", "yd"}):
+            return "per_square_yard"
+        if token_set.intersection({"meter", "meters", "metre", "metres", "m"}):
+            return "per_square_meter"
+    if token_set.intersection({"marla", "marlas"}):
+        return "per_marla"
+    if token_set.intersection({"kanal", "kanals"}):
+        return "per_kanal"
+    if token_set.intersection({"kila", "kilas", "killa", "killas"}):
+        return "per_kila"
+    if token_set.intersection({"acre", "acres"}):
+        return "per_acre"
+    if token_set.intersection({"plot", "plots"}):
+        return "per_plot"
+    compact = re.sub(r"[^a-z0-9]+", "_", raw.casefold()).strip("_")
+    aliases = {
+        "sqft": "per_square_foot", "sq_ft": "per_square_foot",
+        "square_feet": "per_square_foot", "square_foot": "per_square_foot",
+        "sqyd": "per_square_yard", "sq_yd": "per_square_yard",
+        "square_yards": "per_square_yard", "square_yard": "per_square_yard",
+        "sqm": "per_square_meter", "sq_m": "per_square_meter",
+        "square_meters": "per_square_meter", "square_meter": "per_square_meter",
+        "marla": "per_marla", "kanal": "per_kanal", "kila": "per_kila",
+        "killa": "per_kila", "acre": "per_acre", "plot": "per_plot",
+    }
+    return aliases.get(compact, compact)
+
+
+def _import_fix_suggestion(message: str, kind: str) -> str:
+    """Return a concise action the reviewer can take for an import issue."""
+    lower = message.casefold()
+    if "rate unit" in lower or "supported rate unit" in lower:
+        return "Use a recognized unit such as 'per kanal', 'per marla', 'per acre', or 'per square foot'; the importer accepts common wording variants."
+    if "range" in lower:
+        return "Use an ascending range or split an exceptionally large range into smaller ranges."
+    if "blank" in lower or "required" in lower:
+        return "Fill the required source cell or map the correct spreadsheet column. Optional fields may remain blank."
+    if "conflict" in lower or "duplicate" in lower or kind.startswith("duplicate"):
+        return "Review the existing location, class, unit, and effective period; correct the source row if this is a distinct rate."
+    if "decimal" in lower or "amount" in lower or "numeric" in lower:
+        return "Enter a non-negative numeric value without currency text or thousands separators."
+    return "Check the mapped columns and correct this source row, then preview the file again."
+
+
 def _date(value: Any, label: str, *, required: bool = False) -> date | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         if required:
@@ -127,6 +231,10 @@ def _location_data(values: dict[str, Any]) -> dict[str, str | None]:
         raise DCRateServiceError("Location name is required.")
     location = {field: _text(values.get(field)) for field in LOCATION_FIELDS}
     location["name"] = name
+    # The structured location fields are scalar database columns. Store ranges
+    # as a canonical comma-separated list of individual identifiers.
+    for field in ("square_no", "kila_no", "khasra_no"):
+        location[field] = _normalize_reference(values.get(field))
     return location
 
 
@@ -149,29 +257,27 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
     if not amount.is_finite() or amount < 0:
         raise DCRateServiceError("Rate must be a finite, non-negative amount.")
 
-    unit = (_text(values.get("rate_unit")) or "").lower()
-    unit = unit.replace(" ", "_").replace("-", "_")
-    aliases = {
-        "marla": "per_marla",
-        "kanal": "per_kanal",
-        "acre": "per_acre",
-        "kila": "per_kila",
-        "square_foot": "per_square_foot",
-        "square_yard": "per_square_yard",
-        "square_meter": "per_square_meter",
-        "sqft": "per_square_foot",
-        "square_feet": "per_square_foot",
-        "per_sq_ft": "per_square_foot",
-        "sqyd": "per_square_yard",
-        "square_yards": "per_square_yard",
-        "per_sq_yd": "per_square_yard",
-        "sqm": "per_square_meter",
-        "square_meters": "per_square_meter",
-    }
-    unit = aliases.get(unit, unit)
+    def optional_amount(key: str, label: str) -> Decimal | None:
+        raw = values.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            result = Decimal(str(raw).strip())
+        except (InvalidOperation, ValueError, TypeError):
+            raise DCRateServiceError(f"{label} must be a valid decimal number.") from None
+        if not result.is_finite() or result < 0:
+            raise DCRateServiceError(f"{label} must be a finite, non-negative amount.")
+        return result
+
+    structure_rate = optional_amount("structure_rate", "Structure rate")
+    per_marla_value = optional_amount("per_marla_value", "Per marla valuation")
+
+    raw_unit = _text(values.get("rate_unit")) or ""
+    unit = _normalize_rate_unit(raw_unit)
     if unit not in DC_RATE_UNITS:
         raise DCRateServiceError(
-            "Choose a supported rate unit: " + ", ".join(DC_RATE_UNITS) + "."
+            f"Rate unit '{raw_unit or '(blank)'}' is not recognized. Choose a supported unit: "
+            + ", ".join(DC_RATE_UNITS) + "."
         )
 
     raw_year = values.get("published_year")
@@ -199,6 +305,13 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
     schedule_type = (_text(values.get("schedule_type")) or "dc").lower()
     if schedule_type not in {"dc", "fbr"}:
         raise DCRateServiceError("Schedule must be DC or FBR.")
+    if schedule_type == "fbr":
+        # FBR schedule imports use a per-square-foot amount. The optional
+        # per-marla amount can be retained as published or derived using the
+        # specific 272 sq ft convention requested for this import template.
+        unit = "per_square_foot"
+        if per_marla_value is None:
+            per_marla_value = amount * Decimal(272)
     if status not in {"unverified", "verified"}:
         raise DCRateServiceError("Verification status must be Unverified or Verified.")
     source = _text(values.get("source_reference"))
@@ -215,6 +328,8 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
         "floor": _text(values.get("floor")),
         "rate_value": amount,
         "rate_unit": unit,
+        "structure_rate": structure_rate,
+        "per_marla_value": per_marla_value,
         "effective_from": start,
         "published_year": year,
         "effective_to": end,
@@ -261,6 +376,7 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
         "district": location.district if location else None,
         "tehsil": location.tehsil if location else None,
         "land_type": location.land_type if location else None,
+        "serial_no": location.serial_no if location else None,
         "committee_town": location.committee_town if location else None,
         "revenue_circle": location.revenue_circle if location else None,
         "property_area": location.property_area if location else None,
@@ -278,6 +394,8 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
         "floor": rate.floor,
         "rate_value": rate.rate_value,
         "rate_unit": rate.rate_unit,
+        "structure_rate": rate.structure_rate,
+        "per_marla_value": rate.per_marla_value,
         "effective_from": rate.effective_from,
         "published_year": rate.published_year,
         "effective_to": rate.effective_to,
@@ -293,6 +411,7 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
 
 SCHEDULE_EXPORT_COLUMNS = (
     ("schedule_type", "Schedule"),
+    ("serial_no", "Serial no."),
     ("district", "District"),
     ("tehsil", "Tehsil"),
     ("land_type", "Rural or urban"),
@@ -310,6 +429,8 @@ SCHEDULE_EXPORT_COLUMNS = (
     ("classification", "Land classification"),
     ("rate_value", "Schedule rate"),
     ("rate_unit", "Unit"),
+    ("structure_rate", "Structure rate"),
+    ("per_marla_value", "Per marla valuation"),
     ("published_year", "Published year"),
     ("source_reference", "Schedule reference"),
 )
@@ -495,8 +616,15 @@ def list_dc_rates(
     verification_status: str | None = None,
     effective_on: date | None = None,
     published_year: int | None = None,
+    mauza: str = "",
+    square_no: str = "",
+    kila_no: str = "",
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
+    search = search.strip()
+    if mauza.strip() or (search and not search.isdigit()):
+        statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
     if location_id is not None:
@@ -514,45 +642,94 @@ def list_dc_rates(
         )
     if published_year is not None:
         statement = statement.where(DCValuationRate.published_year == published_year)
-    search = search.strip()
-    if search:
-        pattern = f"%{search}%"
-        statement = statement.join(
-            PropertyLocation, DCValuationRate.location_id == PropertyLocation.id,
-            isouter=True,
-        ).where(
-            or_(
-                DCValuationRate.property_type.ilike(pattern),
-                DCValuationRate.classification.ilike(pattern),
-                DCValuationRate.floor.ilike(pattern),
-                DCValuationRate.schedule_type.ilike(pattern),
-                DCValuationRate.source_reference.ilike(pattern),
-                PropertyLocation.name.ilike(pattern),
-                PropertyLocation.district.ilike(pattern),
-                PropertyLocation.tehsil.ilike(pattern),
-                PropertyLocation.land_type.ilike(pattern),
-                PropertyLocation.committee_town.ilike(pattern),
-                PropertyLocation.revenue_circle.ilike(pattern),
-                PropertyLocation.property_area.ilike(pattern),
-                PropertyLocation.qanoongoi.ilike(pattern),
-                PropertyLocation.patwar_circle.ilike(pattern),
-                PropertyLocation.mauza.ilike(pattern),
-                PropertyLocation.hadbast_number.ilike(pattern),
-                PropertyLocation.square_no.ilike(pattern),
-                PropertyLocation.kila_no.ilike(pattern),
-                PropertyLocation.khasra_no.ilike(pattern),
-            )
+    if mauza.strip():
+        statement = statement.where(
+            PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
         )
+    # Cadastral fields are stored as token lists; query candidates in SQLite,
+    # then validate whole tokens below so (for example) 2 does not match 12.
+    for field_name, term in (("square_no", square_no), ("kila_no", kila_no)):
+        if term.strip():
+            field = getattr(PropertyLocation, field_name)
+            statement = statement.where(field.ilike(f"%{term.strip()}%"))
+    if search and not search.isdigit():
+        searchable_rate_fields = (
+            DCValuationRate.property_type, DCValuationRate.classification,
+            DCValuationRate.floor, DCValuationRate.schedule_type,
+            DCValuationRate.source_reference,
+        )
+        searchable_location_fields = (
+            PropertyLocation.name, PropertyLocation.district, PropertyLocation.tehsil,
+            PropertyLocation.land_type, PropertyLocation.committee_town,
+            PropertyLocation.revenue_circle, PropertyLocation.property_area,
+            PropertyLocation.qanoongoi, PropertyLocation.patwar_circle,
+            PropertyLocation.mauza, PropertyLocation.hadbast_number,
+            PropertyLocation.serial_no, PropertyLocation.locality,
+        )
+        statement = statement.where(or_(
+            *(field.ilike(f"%{search}%") for field in searchable_rate_fields),
+            *(field.ilike(f"%{search}%") for field in searchable_location_fields),
+            PropertyLocation.square_no.ilike(f"%{search}%"),
+            PropertyLocation.kila_no.ilike(f"%{search}%"),
+            PropertyLocation.khasra_no.ilike(f"%{search}%"),
+        ))
     statement = statement.order_by(
         DCValuationRate.effective_from.desc(), DCValuationRate.id.desc()
     )
     with SessionLocal() as session:
-        return [_record_dict(row) for row in session.scalars(statement).unique().all()]
+        if limit is not None and not search.strip():
+            statement = statement.limit(max(1, limit))
+        rows = session.scalars(statement).unique().all()
+        if not search and not square_no.strip() and not kila_no.strip():
+            return [_record_dict(row) for row in rows]
+
+        search_key = search.casefold()
+        reference_fields = ("square_no", "kila_no", "khasra_no")
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            record = _record_dict(row)
+            try:
+                square_match = not square_no.strip() or bool(set(_reference_values(square_no)).intersection(
+                    _reference_values(record.get("square_no"))
+                ))
+                kila_match = not kila_no.strip() or bool(set(_reference_values(kila_no)).intersection(
+                    _reference_values(record.get("kila_no"))
+                ))
+            except DCRateServiceError:
+                square_match = kila_match = False
+            if not square_match or not kila_match:
+                continue
+            # Ordinary fields retain the existing case-insensitive substring
+            # search. Cadastral identifiers match complete expanded tokens,
+            # including values represented as ranges in older database rows.
+            text_values = [
+                record.get(field) for field in (
+                    "property_type", "classification", "floor", "schedule_type",
+                    "source_reference", "location_name", "district", "tehsil",
+                    "land_type", "committee_town", "revenue_circle", "property_area",
+                    "qanoongoi", "patwar_circle", "mauza", "hadbast_number", "serial_no",
+                    "locality",
+                )
+            ]
+            if search_key and any(search_key in str(value).casefold() for value in text_values if value):
+                matches.append(record)
+                continue
+            try:
+                requested_tokens = set(_reference_values(search))
+                found = any(
+                    requested_tokens.intersection(_reference_values(record.get(field)))
+                    for field in reference_fields
+                )
+            except DCRateServiceError:
+                found = False
+            if not search_key or found:
+                matches.append(record)
+        return matches
 
 
 def _header_key(value: Any) -> str:
-    return (str(value or "").strip().casefold().replace("/", "_")
-            .replace(" ", "_").replace("-", "_").replace("__", "_"))
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().casefold())
+    return normalized.strip("_")
 
 
 def read_schedule_spreadsheet(file_bytes: bytes, filename: str) -> tuple[list[str], list[list[Any]]]:
@@ -626,10 +803,17 @@ def suggested_column_mapping(headers: list[str]) -> dict[str, int]:
 def preview_mapped_schedule(
     headers: list[str], rows: list[list[Any]], mapping: dict[str, int], schedule_type: str
 ) -> dict[str, Any]:
-    """Normalize user-mapped columns, then reuse the validated import pipeline."""
-    if schedule_type not in {"dc", "fbr"}:
-        raise DCRateServiceError("Select either the DC or FBR schedule.")
+    """Normalize a rural/urban DC or FBR profile and validate it without writes."""
+    profiles = {"rural_dc": "rural", "urban_dc": "urban", "fbr": "urban"}
+    if schedule_type not in profiles:
+        raise DCRateServiceError("Select Rural DC, Urban DC, or FBR schedule.")
+    land_type = profiles[schedule_type]
+    normalized_schedule = "fbr" if schedule_type == "fbr" else "dc"
     mapping = dict(mapping)
+    # Schedule profile controls these fields; source-sheet columns with the
+    # same names cannot override the explicit radio selection.
+    mapping.pop("schedule_type", None)
+    mapping.pop("land_type", None)
     # In many published schedules the only class column is Land Classification.
     # It also supplies the broad property type when a separate column is absent.
     if "property_type" not in mapping and "classification" in mapping:
@@ -639,24 +823,77 @@ def preview_mapped_schedule(
             mapping["location_name"] = mapping["mauza"]
         elif "locality" in mapping:
             mapping["location_name"] = mapping["locality"]
-    missing = REQUIRED_RATE_COLUMNS - mapping.keys()
-    if "classification" in mapping:
-        missing.discard("property_type")
+    required_by_profile = {
+        "rural_dc": {"tehsil", "qanoongoi", "mauza", "classification", "locality", "rate_value", "rate_unit"},
+        "urban_dc": {"tehsil", "committee_town", "revenue_circle", "property_area", "classification", "locality", "rate_value", "rate_unit", "structure_rate"},
+        "fbr": {"revenue_circle", "property_area", "classification", "locality", "rate_value"},
+    }
+    missing = required_by_profile[schedule_type] - mapping.keys()
+    if schedule_type in {"rural_dc", "fbr"} and not {"square_no", "kila_no", "khasra_no"}.intersection(mapping):
+        missing.add("at least one of square_no, kila_no, or khasra_no")
     if missing:
-        raise DCRateServiceError("Map required columns: " + ", ".join(sorted(missing)))
+        raise DCRateServiceError("Map required columns for this schedule: " + ", ".join(sorted(missing)))
+    if "location_name" not in mapping:
+        if "mauza" in mapping:
+            mapping["location_name"] = mapping["mauza"]
+        elif "locality" in mapping:
+            mapping["location_name"] = mapping["locality"]
+    if "rate_unit" not in mapping:
+        # The FBR template defines this amount as value per square foot.
+        mapping["rate_unit"] = -1
+    # Report blank cells in required profile fields by original spreadsheet
+    # row number. Optional fields remain nullable and can be omitted.
+    row_issues = []
+    valid_rows = []
+    required_targets = required_by_profile[schedule_type]
+    for row_number, row in enumerate(rows, start=2):
+        empty = [
+            field for field in required_targets
+            if field in mapping
+            and (mapping[field] == -1 or mapping[field] >= len(row) or _text(row[mapping[field]]) is None)
+        ]
+        if schedule_type in {"rural_dc", "fbr"}:
+            def has_value(field: str) -> bool:
+                index = mapping.get(field)
+                return index is not None and index >= 0 and index < len(row) and _text(row[index]) is not None
+
+            # A Khasra-based record may legitimately omit square and Kila.
+            # Rural rows otherwise need both; FBR rows need a square number.
+            if has_value("khasra_no"):
+                empty = [field for field in empty if field not in {"square_no", "kila_no"}]
+            elif schedule_type == "rural_dc" and (not has_value("square_no") or not has_value("kila_no")):
+                empty.extend(field for field in ("square_no", "kila_no") if not has_value(field) and field not in empty)
+            elif schedule_type == "fbr" and not has_value("square_no"):
+                empty.append("square_no")
+        if empty:
+            row_issues.append({
+                "row": row_number,
+                "kind": "invalid",
+                "message": "Required value(s) are blank: " + ", ".join(sorted(empty)),
+                "source_values": ["" if value is None else str(value) for value in row],
+                "fix": "Fill the missing required value or select the correct spreadsheet column mapping.",
+            })
+        else:
+            valid_rows.append(row)
     output = BytesIO()
     workbook = Workbook()
     sheet = workbook.active
-    fields = list(mapping) + ["schedule_type"]
+    fields = list(mapping) + ["schedule_type", "land_type"]
     sheet.append(fields)
-    for row in rows:
+    for row in valid_rows:
         sheet.append([
-            *[row[index] if index < len(row) else None for index in mapping.values()],
-            schedule_type,
+            *[
+                "per_square_foot" if index == -1 else row[index] if index < len(row) else None
+                for index in mapping.values()
+            ],
+            normalized_schedule,
+            land_type,
         ])
     workbook.save(output)
     workbook.close()
     preview = preview_dc_rate_workbook(output.getvalue())
+    preview["issues"] = sorted([*row_issues, *preview["issues"]], key=lambda issue: issue["row"])
+    preview["rows_read"] = len(rows)
     return preview
 
 
@@ -713,6 +950,7 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
             try:
                 location = _location_data({
                     "name": raw.get("location_name"),
+                    "serial_no": raw.get("serial_no"),
                     "province": raw.get("province"),
                     "district": raw.get("district"),
                     "tehsil": raw.get("tehsil"),
@@ -750,14 +988,25 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
                         "row": excel_row,
                         "kind": "duplicate in workbook",
                         "message": f"Conflicting effective period with row {conflict_row} in this workbook.",
+                        "source_values": ["" if value is None else str(value) for value in values],
                     })
                     continue
                 seen.setdefault(scope, []).append(
                     (rate["effective_from"], rate["effective_to"], excel_row)
                 )
-                candidates.append({"row": excel_row, "location": location, **rate})
+                candidates.append({
+                    "row": excel_row,
+                    "location": location,
+                    "source_values": ["" if value is None else str(value) for value in values],
+                    **rate,
+                })
             except DCRateServiceError as exc:
-                issues.append({"row": excel_row, "kind": "invalid", "message": str(exc)})
+                issues.append({
+                    "row": excel_row,
+                    "kind": "invalid",
+                    "message": str(exc),
+                    "source_values": ["" if value is None else str(value) for value in values],
+                })
 
         with SessionLocal() as session:
             existing_keys: list[tuple[tuple[Any, ...], int]] = []
@@ -813,9 +1062,12 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
                         f"Conflicts with existing record #{conflict_id} for the "
                         "same location, property class, unit, and effective period."
                     ),
+                    "source_values": candidate.get("source_values", []),
                 })
                 continue
             new_candidates.append(candidate)
+        for issue in issues:
+            issue.setdefault("fix", _import_fix_suggestion(issue["message"], issue["kind"]))
         return {
             "valid_records": new_candidates,
             "issues": sorted(issues, key=lambda issue: issue["row"]),
@@ -826,38 +1078,88 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
 
 
 def import_dc_rate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Insert valid preview rows, skipping any duplicate found at commit time."""
-    imported_ids: list[int] = []
+    """Batch-insert previewed rows while checking conflicts again at commit.
+
+    The preview has already reported invalid input and existing conflicts. This
+    final check protects against records added between preview and import, but
+    builds location/rate indexes once instead of querying and flushing per row.
+    """
     issues: list[dict[str, Any]] = []
     with SessionLocal.begin() as session:
+        # Cache all known locations by their normalized identity so thousands
+        # of rows do not repeatedly scan/query the table.
+        location_by_key = {
+            _location_key({field: getattr(location, field) for field in LOCATION_FIELDS}): location
+            for location in session.scalars(select(PropertyLocation)).all()
+        }
+        prepared: list[tuple[dict[str, Any], dict[str, Any], tuple[str, ...], PropertyLocation]] = []
+        new_locations: list[PropertyLocation] = []
         for candidate in records:
             row = candidate["row"]
             location_values = _location_data(candidate["location"])
             rate_values = _rate_data(candidate)
-            location = next(
-                (
-                    existing
-                    for existing in session.scalars(select(PropertyLocation)).all()
-                    if _location_key(
-                        {field: getattr(existing, field) for field in LOCATION_FIELDS}
-                    ) == _location_key(location_values)
-                ),
-                None,
-            )
+            location_key = _location_key(location_values)
+            location = location_by_key.get(location_key)
             if location is None:
                 location = PropertyLocation(**location_values)
-                session.add(location)
-                session.flush()
-            duplicate = _duplicate_rate(session, rate_values, location.id)
-            if duplicate:
+                location_by_key[location_key] = location
+                new_locations.append(location)
+            prepared.append((candidate, rate_values, location_key, location))
+
+        if new_locations:
+            session.add_all(new_locations)
+            # One flush assigns IDs for all newly created locations.
+            session.flush()
+
+        # Index effective periods for each rate identity. This catches both
+        # concurrent inserts made after preview and duplicate rows in the
+        # submitted batch without a SQL query for every candidate.
+        location_by_id = {location.id: location for location in location_by_key.values()}
+        rate_periods: dict[tuple[Any, ...], list[tuple[date, date | None, int | None]]] = {}
+        for rate in session.scalars(select(DCValuationRate)).all():
+            location = location_by_id.get(rate.location_id)
+            if location is None:
+                continue
+            location_values = {field: getattr(location, field) for field in LOCATION_FIELDS}
+            rate_identity = _rate_identity({
+                "schedule_type": rate.schedule_type,
+                "property_type": rate.property_type,
+                "classification": rate.classification,
+                "floor": rate.floor,
+                "rate_unit": rate.rate_unit,
+                "effective_from": rate.effective_from,
+                "effective_to": rate.effective_to,
+            }, _location_key(location_values))
+            rate_periods.setdefault(rate_identity[:6], []).append(
+                (rate.effective_from, rate.effective_to, rate.id)
+            )
+
+        new_rates: list[DCValuationRate] = []
+        for candidate, rate_values, location_key, location in prepared:
+            rate_identity = _rate_identity(rate_values, location_key)
+            conflicts = [
+                existing_id
+                for start, end, existing_id in rate_periods.get(rate_identity[:6], [])
+                if _periods_overlap(start, end, rate_identity[6], rate_identity[7])
+            ]
+            if conflicts:
+                existing_id = conflicts[0]
+                conflict_description = (
+                    f"existing record #{existing_id}" if existing_id is not None
+                    else "another row in this import"
+                )
                 issues.append({
-                    "row": row,
+                    "row": candidate["row"],
                     "kind": "duplicate at import time",
-                    "message": f"Conflicts with existing record #{duplicate.id}; skipped.",
+                    "message": f"Conflicts with {conflict_description}; skipped.",
                 })
                 continue
             record = DCValuationRate(location_id=location.id, **rate_values)
-            session.add(record)
+            new_rates.append(record)
+            rate_periods.setdefault(rate_identity[:6], []).append(
+                (rate_identity[6], rate_identity[7], None)
+            )
+        if new_rates:
+            session.add_all(new_rates)
             session.flush()
-            imported_ids.append(record.id)
-    return {"imported_count": len(imported_ids), "issues": issues}
+    return {"imported_count": len(new_rates), "issues": issues}

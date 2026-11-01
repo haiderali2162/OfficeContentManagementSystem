@@ -55,6 +55,7 @@ def migrate_valuation_columns(database_engine=None) -> None:
     database_engine = database_engine or engine
     tables = set(inspect(database_engine).get_table_names())
     location_additions = {
+        "serial_no": "VARCHAR(80)",
         # Mauza is used by the calculator and formula conditions. Older
         # location tables may predate the structured schedule fields.
         "mauza": "VARCHAR(200)",
@@ -72,6 +73,8 @@ def migrate_valuation_columns(database_engine=None) -> None:
         "schedule_type": "VARCHAR(10) NOT NULL DEFAULT 'dc'",
         "floor": "VARCHAR(100)",
         "published_year": "INTEGER",
+        "structure_rate": "NUMERIC(20, 8)",
+        "per_marla_value": "NUMERIC(20, 8)",
     }
     with database_engine.begin() as connection:
         if "property_locations" in tables:

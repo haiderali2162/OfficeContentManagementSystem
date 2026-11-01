@@ -9,3 +9,4 @@ data/
 
 # Local generated implementation notes and plans.
 change-notes/
+build/

@@ -7,6 +7,7 @@ service so historical calculations remain reviewable when live rules change.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from decimal import Decimal
 import json
@@ -67,14 +68,10 @@ def _money(value: Any, currency: str = "PKR") -> str:
 
 def build_valuation_page(page: ft.Page) -> ft.Control:
     """Build the estimate workflow plus the existing rates and tax-rule pages."""
-    try:
-        locations = list_locations()
-        clients = list_client_choices()
-    except Exception as exc:
-        return ft.Column([
-            ft.Text("Property Valuation & Taxes", size=24, weight=ft.FontWeight.BOLD),
-            ft.Text(f"Could not load valuation choices: {exc}", color="#B91C1C"),
-        ])
+    # Populate these lists asynchronously after the lightweight control tree is
+    # attached; event handlers continue to use the same shared choice cache.
+    locations: list[dict[str, Any]] = []
+    clients: list[dict[str, Any]] = []
 
     status = ft.Text("", size=12, color="#475569")
     form_error = ft.Text("", color="#B91C1C", size=12)
@@ -234,10 +231,10 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
             ],
         ))
 
-    def refresh_history():
+    def refresh_history(records=None):
         history_list.controls.clear()
         try:
-            records = list_estimates()
+            records = list_estimates(limit=100) if records is None else records
             if not records:
                 history_list.controls.append(ft.Text("No saved estimates yet.", color="#64748B"))
             for record in records:
@@ -561,16 +558,16 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
         ], wrap=True, spacing=6),
         history_list,
     ], spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
-    refresh_history()
-    refresh_formulas()
+    history_list.controls.append(ft.Text("Loading estimate history…", color="#64748B"))
+    formula_list.controls.append(ft.Text("Loading saved formulas…", color="#64748B"))
 
     rule_status = ft.Text("", size=12, color="#475569")
     rules_list = ft.ListView(expand=True, spacing=6)
 
-    def refresh_rules():
+    def refresh_rules(rules=None):
         rules_list.controls.clear()
         try:
-            rules = list_tax_fee_rules()
+            rules = list_tax_fee_rules() if rules is None else rules
             if not rules:
                 rules_list.controls.append(ft.Text("No tax or fee rules yet. Add rules from verified sources or mark manually entered rules unverified.", color="#64748B"))
             for rule in rules:
@@ -685,11 +682,13 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
         ft.Row([ft.Button("Add rule", on_click=lambda _: open_rule_dialog()), ft.TextButton("Refresh", on_click=lambda _: refresh_rules()), rule_status], wrap=True),
         rules_list,
     ], expand=True)
-    refresh_rules()
+    rules_list.controls.append(ft.Text("Loading tax and fee rules…", color="#64748B"))
 
     # Keep existing DC/FBR maintenance available in the same page. Each tab
     # remains an independently built section with its own service callbacks.
-    rates_page = __import__("ui.pages.dc_rates", fromlist=["build_dc_rates_page"]).build_dc_rates_page(page)
+    rates_page = __import__("ui.pages.dc_rates", fromlist=["build_dc_rates_page"]).build_dc_rates_page(
+        page, defer_initial_load=True
+    )
     tabs = ft.Tabs(
         content=ft.Column([
             ft.TabBar(tabs=[ft.Tab(label="Calculate"), ft.Tab(label="Tax / fee rules"), ft.Tab(label="DC / FBR rates")]),
@@ -699,8 +698,52 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
         selected_index=0,
         expand=True,
     )
-    return ft.Column([
+    root = ft.Column([
         ft.Text("Property Valuation & Taxes", size=25, weight=ft.FontWeight.BOLD),
         ft.Text("Calculate an explainable estimate, manage configurable charges, and maintain valuation schedules.", color="#64748B"),
         tabs,
     ], spacing=8, expand=True)
+
+    async def load_initial_data():
+        """Fetch page data on worker threads so navigation stays responsive."""
+        try:
+            loaded_locations, loaded_clients, estimates, rules, formulas = await asyncio.gather(
+                asyncio.to_thread(list_locations),
+                asyncio.to_thread(list_client_choices),
+                asyncio.to_thread(list_estimates, limit=100),
+                asyncio.to_thread(list_tax_fee_rules),
+                asyncio.to_thread(list_registry_fee_formulas),
+            )
+            locations.extend(loaded_locations)
+            clients.extend(loaded_clients)
+            location.options = [ft.dropdown.Option(str(item["id"]), " · ".join(
+                str(value) for value in (item.get("name"), item.get("district"), item.get("tehsil"), item.get("land_type")) if value
+            )) for item in locations]
+            client.options = [ft.dropdown.Option("none", "No client linked"), *[
+                ft.dropdown.Option(str(item["id"]), item["name"]) for item in clients
+            ]]
+            refresh_history(estimates)
+            refresh_rules(rules)
+            refresh_formulas_with_records(formulas)
+            page.update()
+        except Exception as exc:
+            status.value = f"Could not load valuation data: {exc}"
+            page.update()
+
+    def refresh_formulas_with_records(formulas):
+        """Render the already fetched formula rows without another DB read."""
+        formula_list.controls.clear()
+        if not formulas:
+            formula_list.controls.append(ft.Text("No registry fee formulas saved.", color="#64748B"))
+        for formula in formulas:
+            formula_list.controls.append(ft.Row([
+                ft.Column([
+                    ft.Text(f"{formula['name']} · {formula['category']}", weight=ft.FontWeight.BOLD),
+                    ft.Text(f"{formula['formula_expression']} · {formula['verification_status']}", size=12),
+                ], expand=True, spacing=2),
+                ft.TextButton("Edit", on_click=lambda _, row=formula: open_formula_dialog(row)),
+            ], wrap=True))
+
+    if hasattr(page, "run_task"):
+        page.run_task(load_initial_data)
+    return root

@@ -1,6 +1,8 @@
 """UI callback regression tests for DC-rate page actions."""
 
 from datetime import date
+import asyncio
+from types import SimpleNamespace
 
 import flet as ft
 
@@ -21,6 +23,10 @@ class FakePage:
     def pop_dialog(self):
         if self.dialogs:
             self.dialogs.pop()
+
+    def run_task(self, handler):
+        # Keep the task coroutine for an explicit assertion/run in the test.
+        self.background_task = handler()
 
 
 def _walk(control):
@@ -131,12 +137,26 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
     assert len(page.dialogs) == 0
     list_view = next(control for control in _walk(root) if isinstance(control, ft.ListView))
     assert len([control for control in list_view.controls if isinstance(control, ft.Container)]) == 2
-    assert "2 rate record" in root.controls[5].controls[0].value
+    assert any("2 rate record" in (control.value or "") for control in _walk(root)
+               if isinstance(control, ft.Text))
     assert last_filters["search"] == ""
     assert last_filters["schedule_type"] is None
     assert last_filters["location_id"] is None
     assert last_filters["rate_unit"] is None
     assert last_filters["published_year"] is None
+
+
+def test_large_location_set_keeps_quick_filter_bounded(monkeypatch):
+    locations = [{"id": row, "name": f"Mauza {row}"} for row in range(1, 601)]
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: locations)
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    root = dc_rates.build_dc_rates_page(FakePage())
+
+    location_filter = next(control for control in _walk(root)
+                           if isinstance(control, ft.Dropdown) and control.label == "Location")
+    assert len(location_filter.options) == 501  # all-locations option plus first 500
+    assert any("search covers all locations" in (control.value or "")
+               for control in _walk(root) if isinstance(control, ft.Text))
 
 
 def test_edit_button_passes_the_rate_id_explicitly(monkeypatch):
@@ -172,6 +192,19 @@ def test_rate_card_shows_rate_and_location_text(monkeypatch):
     assert any("Residential" in value for value in text_values)
 
 
+def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    root = dc_rates.build_dc_rates_page(FakePage())
+    controls = list(_walk(root))
+    labels = {control.label for control in controls if isinstance(control, (ft.TextField, ft.Dropdown))}
+    assert {"Mauza", "Square no.", "Kila no.", "Rate unit", "Schedule"} <= labels
+    extended = next(control for control in controls if isinstance(control, ft.ResponsiveRow)
+                    and any(isinstance(child.content, ft.TextField) and child.content.label == "Search location, property, classification, or source"
+                            for child in control.controls if isinstance(child, ft.Container)))
+    assert extended.visible is False
+
+
 def test_location_form_switches_rural_and_urban_fields(monkeypatch):
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
@@ -202,3 +235,95 @@ def test_location_form_switches_rural_and_urban_fields(monkeypatch):
     land_type.on_change(object())
     assert rural.visible is True
     assert urban.visible is False
+
+
+def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypatch):
+    class FakePicker:
+        async def pick_files(self, **_kwargs):
+            return [SimpleNamespace(bytes=b"test", path=None, name="schedule.csv")]
+
+    monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "read_schedule_spreadsheet", lambda *_: (
+        ["District", "Tehsil", "Mauza", "Location", "Rate"], []
+    ))
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+
+    asyncio.run(root.controls[2].controls[3].on_click())
+    dialog = page.dialogs[-1]
+    radio = next(control for control in _walk(dialog.content) if isinstance(control, ft.RadioGroup))
+    labels = {control.label for control in _walk(dialog.content) if isinstance(control, ft.Dropdown)}
+    assert "Mauza" in labels
+    assert "Qanoongoi" in labels
+    assert "Khasra no. (optional)" in labels
+    assert "Structure rate" not in labels
+
+    radio.value = "urban_dc"
+    radio.on_change(None)
+    labels = {control.label for control in _walk(dialog.content) if isinstance(control, ft.Dropdown)}
+    assert "Town" in labels
+    assert "Structure rate" in labels
+    assert "Mauza" not in labels
+
+    radio.value = "fbr"
+    radio.on_change(None)
+    labels = {control.label for control in _walk(dialog.content) if isinstance(control, ft.Dropdown)}
+    assert "Value per square foot (Rs.)" in labels
+    assert any(label.startswith("Per marla valuation") for label in labels)
+    assert "Kila no. (optional)" in labels
+    assert "Khasra no. (optional)" in labels
+    assert "Unit" not in labels
+
+
+def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypatch):
+    class FakePicker:
+        async def pick_files(self, **_kwargs):
+            return [SimpleNamespace(bytes=b"test", path=None, name="bulk.csv")]
+
+    monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "read_schedule_spreadsheet", lambda *_: (
+        ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location", "Square No", "Kila No", "DC Rate", "Unit"],
+        [["Tehsil", "Qanoongoi", "Mauza", "Agricultural", "Farm", "1", "2", "100", "per kanal"]],
+    ))
+    candidate = {
+        "row": 2,
+        "location": {"name": "Mauza"},
+        "property_type": "Agricultural",
+        "classification": "Agricultural",
+        "rate_value": 100,
+        "rate_unit": "per_kanal",
+    }
+    monkeypatch.setattr(dc_rates, "preview_mapped_schedule", lambda *_: {
+        "valid_records": [candidate], "issues": [], "rows_read": 1,
+    })
+    imported = []
+    monkeypatch.setattr(dc_rates, "import_dc_rate_records", lambda records: (
+        imported.extend(records) or {"imported_count": len(records), "issues": []}
+    ))
+
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    asyncio.run(root.controls[2].controls[3].on_click())
+    mapping_dialog = page.dialogs[-1]
+    mapping_dialog.actions[-1].on_click(None)
+    review_dialog = page.dialogs[-1]
+    year_field = next(control for control in _walk(review_dialog.content)
+                      if isinstance(control, ft.TextField)
+                      and control.label == "Published year for this import (optional)")
+    year_field.value = "2028"
+    review_dialog.actions[-1].on_click(None)
+
+    status_text = next(control for control in _walk(root)
+                       if isinstance(control, ft.Text) and "running in the background" in (control.value or ""))
+    assert imported == []
+    assert "running in the background" in status_text.value
+
+    asyncio.run(page.background_task)
+
+    assert imported[0]["published_year"] == 2028
+    assert imported[0]["effective_from"] == date(2028, 1, 1)
+    assert "Imported 1 Rural DC rate(s)" in status_text.value

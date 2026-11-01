@@ -270,6 +270,7 @@ class PropertyLocation(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    serial_no: Mapped[Optional[str]] = mapped_column(String(80), index=True)
     province: Mapped[Optional[str]] = mapped_column(String(120))
     district: Mapped[Optional[str]] = mapped_column(String(120), index=True)
     tehsil: Mapped[Optional[str]] = mapped_column(String(120), index=True)
@@ -351,6 +352,11 @@ class DCValuationRate(Base):
     classification: Mapped[Optional[str]] = mapped_column(String(120), index=True)
     floor: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     rate_value: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    # Some schedules publish additional structure and per-marla amounts
+    # alongside the primary rate/unit. Keep these values without conflating
+    # them with the rate used by the valuation engine.
+    structure_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    per_marla_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     rate_unit: Mapped[str] = mapped_column(String(32), nullable=False)
     effective_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     # Year printed on the schedule; effective_from is retained for existing

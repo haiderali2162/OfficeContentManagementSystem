@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from pathlib import Path
 
@@ -41,7 +42,7 @@ def _format_date(value: date | None, *, empty: str = "Not supplied") -> str:
     return value.isoformat() if value else empty
 
 
-def build_dc_rates_page(page: ft.Page) -> ft.Control:
+def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> ft.Control:
     """Build rate controls and connect UI events to the rate service."""
     file_picker = ft.FilePicker()
     existing_picker = next(
@@ -52,7 +53,14 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
         page.services.append(file_picker)
     else:
         file_picker = existing_picker
+    import_in_progress = False
+    visible_rate_limit = 200
+    visible_location_limit = 500
+    location_picker_truncated = False
 
+    mauza_filter = ft.TextField(label="Mauza", width=190)
+    square_filter = ft.TextField(label="Square no.", width=130)
+    kila_filter = ft.TextField(label="Kila no.", width=130)
     search_field = ft.TextField(
         label="Search location, property, classification, or source",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
@@ -78,9 +86,9 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
     )
     schedule_filter = ft.Dropdown(
         label="Schedule", width=145, value="all",
-        options=[ft.dropdown.Option("all", "DC + FBR"),
-                 ft.dropdown.Option("dc", "DC schedule"),
-                 ft.dropdown.Option("fbr", "FBR schedule")],
+        options=[ft.dropdown.Option("dc", "DC"),
+                 ft.dropdown.Option("fbr", "FBR"),
+                 ft.dropdown.Option("all", "Both")],
     )
     published_year_filter = ft.TextField(
         label="Published year (optional)",
@@ -94,9 +102,12 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
     def close_dialog():
         page.pop_dialog()
 
-    def refresh_locations():
+    def refresh_locations(locations=None):
         """Reload location choices used by the filter and rate editor."""
-        locations = list_locations()
+        nonlocal location_picker_truncated
+        locations = list_locations() if locations is None else locations
+        visible_locations = locations[:visible_location_limit]
+        location_picker_truncated = len(locations) > visible_location_limit
         location_filter.options = [
             ft.dropdown.Option("all", "All locations"),
             *[
@@ -116,7 +127,7 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
                         if part
                     ),
                 )
-                for location in locations
+                for location in visible_locations
             ],
         ]
         if location_filter.value != "all" and not any(
@@ -125,7 +136,7 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
             location_filter.value = "all"
         return locations
 
-    def refresh_rates(e=None, *, update_page: bool = True):
+    def refresh_rates(e=None, *, update_page: bool = True, records=None):
         """Apply all visible filters and replace the scrollable rate cards."""
         rate_list.controls.clear()
         try:
@@ -134,16 +145,20 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
             if published_year is not None and not 1900 <= published_year <= 2200:
                 raise ValueError("Published year must be between 1900 and 2200.")
             selected_location = location_filter.value or "all"
-            records = list_dc_rates(
-                search=search_field.value or "",
-                schedule_type=(schedule_filter.value if schedule_filter.value != "all" else None),
-                location_id=(
-                    int(selected_location) if selected_location != "all" else None
-                ),
-                rate_unit=(unit_filter.value if unit_filter.value != "all" else None),
-                published_year=published_year,
+            if records is None:
+                records = list_dc_rates(
+                    search=search_field.value or "", mauza=mauza_filter.value or "",
+                    square_no=square_filter.value or "", kila_no=kila_filter.value or "",
+                    schedule_type=schedule_filter.value if schedule_filter.value != "all" else None,
+                    location_id=int(selected_location) if selected_location != "all" else None,
+                    rate_unit=unit_filter.value if unit_filter.value != "all" else None,
+                    published_year=published_year, limit=visible_rate_limit,
+                )
+            displayed_records = records[:visible_rate_limit]
+            result_count.value = (
+                f"Showing {len(displayed_records)} of {len(records)} matching rate record(s)"
+                if len(records) > visible_rate_limit else f"{len(records)} rate record(s)"
             )
-            result_count.value = f"{len(records)} rate record(s)"
             status_text.value = ""
             if not records:
                 rate_list.controls.append(
@@ -164,8 +179,18 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
                         ),
                     )
                 )
-            for record in records:
+            for record in displayed_records:
                 add_rate_card(record)
+            if len(records) > visible_rate_limit:
+                status_text.value = (
+                    f"Showing the latest {visible_rate_limit} matching records. "
+                    "Use search or filters to narrow the list."
+                )
+            if location_picker_truncated:
+                result_count.value += (
+                    f" · location quick-filter shows {visible_location_limit}; "
+                    "search covers all locations"
+                )
         except ValueError as exc:
             result_count.value = ""
             status_text.value = f"Check the published year: {exc}"
@@ -544,6 +569,9 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
                 unit_filter.value = "all"
                 published_year_filter.value = ""
                 search_field.value = ""
+                mauza_filter.value = ""
+                square_filter.value = ""
+                kila_filter.value = ""
                 refresh_rates()
                 status_text.value = f"{schedule_field.value.upper()} rate saved and shown below."
                 page.update()
@@ -604,67 +632,201 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
             if payload is None:
                 raise DCRateServiceError("Could not read the selected spreadsheet.")
             headers, rows = read_schedule_spreadsheet(payload, selected.name)
-            targets = {
-                "district": "District", "tehsil": "Tehsil", "land_type": "Rural or urban",
-                "qanoongoi": "Qanoongoi", "patwar_circle": "Patwar circle (optional)",
-                "committee_town": "Town / city", "revenue_circle": "Revenue circle",
-                "floor": "Floor", "property_area": "Property area", "mauza": "Mauza",
-                "square_no": "Square no", "kila_no": "Kila no", "khasra_no": "Khasra no (optional)",
-                "classification": "Land classification", "locality": "Location",
-                "rate_value": "Schedule value (required)",
-                "rate_unit": "Unit (required)",
-            }
             guesses = suggested_column_mapping(headers)
-            selects = {}
             source_options = [ft.dropdown.Option("", "Skip this field")] + [
                 ft.dropdown.Option(str(i), header or f"Column {i + 1}")
                 for i, header in enumerate(headers)
             ]
-            for target, label in targets.items():
-                selects[target] = ft.Dropdown(
-                    label=label,
-                    value=str(guesses[target]) if target in guesses else "",
-                    options=source_options,
-                    width=300,
+            profile_fields = {
+                "rural_dc": [
+                    ("serial_no", "Serial no. (optional)"), ("district", "District (optional)"),
+                    ("tehsil", "Tehsil"), ("qanoongoi", "Qanoongoi"), ("mauza", "Mauza"),
+                    ("classification", "Classification"), ("locality", "Location"),
+                    ("square_no", "Square no. (optional when Khasra is supplied)"),
+                    ("kila_no", "Kila no. (optional when Khasra is supplied)"),
+                    ("khasra_no", "Khasra no. (optional)"),
+                    ("rate_value", "DC rate"), ("rate_unit", "Unit"),
+                ],
+                "urban_dc": [
+                    ("district", "District (optional)"), ("tehsil", "Tehsil"),
+                    ("qanoongoi", "Qanoongoi (optional)"), ("committee_town", "Town"),
+                    ("revenue_circle", "Revenue circle"), ("property_area", "Property area"),
+                    ("classification", "Classification"), ("locality", "Location"),
+                    ("square_no", "Square no. (optional)"), ("kila_no", "Kila no. (optional)"),
+                    ("khasra_no", "Khasra no. (optional)"), ("rate_value", "DC rate"),
+                    ("rate_unit", "Unit"), ("structure_rate", "Structure rate"),
+                ],
+                "fbr": [
+                    ("district", "District (optional)"), ("tehsil", "Tehsil (optional)"),
+                    ("serial_no", "Serial no. (optional)"), ("revenue_circle", "Revenue circle"),
+                    ("property_area", "Property area"), ("classification", "Classification"),
+                    ("locality", "Location"), ("square_no", "Location (Square No.)"),
+                    ("kila_no", "Kila no. (optional)"), ("khasra_no", "Khasra no. (optional)"),
+                    ("rate_value", "Value per square foot (Rs.)"),
+                    ("per_marla_value", "Per marla valuation (optional; defaults to square-foot value × 272)"),
+                ],
+            }
+            selects = {}
+            mapping_controls = ft.ResponsiveRow(run_spacing=4)
+
+            def rebuild_mapping(_=None):
+                """Display only fields supported by the selected schedule profile."""
+                profile = schedule.value or "rural_dc"
+                selects.clear()
+                controls = []
+                for target, label in profile_fields[profile]:
+                    control = ft.Dropdown(
+                        label=label,
+                        value=str(guesses[target]) if target in guesses else "",
+                        options=source_options,
+                    )
+                    selects[target] = control
+                    controls.append(ft.Container(control, col={"xs": 12, "md": 6}))
+                mapping_controls.controls = controls
+                page.update()
+
+            schedule = ft.RadioGroup(
+                value="rural_dc",
+                content=ft.Row([
+                    ft.Radio(value="rural_dc", label="Rural DC"),
+                    ft.Radio(value="urban_dc", label="Urban DC"),
+                    ft.Radio(value="fbr", label="FBR schedule"),
+                ], wrap=True, spacing=12),
+                on_change=rebuild_mapping,
+            )
+
+            def schedule_name() -> str:
+                return {"rural_dc": "Rural DC", "urban_dc": "Urban DC", "fbr": "FBR"}.get(
+                    schedule.value or "", "selected schedule"
                 )
-            schedule = ft.Dropdown(label="Schedule type", value="dc", width=260, options=[
-                ft.dropdown.Option("dc", "DC schedule"), ft.dropdown.Option("fbr", "FBR schedule")])
 
             def show_review(preview):
                 candidates, issues = preview["valid_records"], preview["issues"]
+                import_year = ft.TextField(
+                    label="Published year for this import (optional)",
+                    hint_text="Example: 2026. Leave blank to use each row's date/year.",
+                    width=300,
+                )
                 issue_controls = [ft.Text(
                     f"Row {issue['row']} — {issue['kind']}: {issue['message']}", selectable=True,
                     color="#B91C1C" if issue["kind"].startswith("invalid") else "#B45309")
                     for issue in issues[:100]]
                 if not issue_controls:
                     issue_controls.append(ft.Text("No invalid or duplicate rows found."))
+                # Replace the compact issue labels with a scrollable review:
+                # valid records can still be imported, while every skipped row
+                # shows its source values, reason, and a concrete correction.
+                issue_controls.clear()
+                for issue in issues:
+                    invalid = issue["kind"].startswith("invalid")
+                    issue_controls.append(ft.Container(
+                        padding=8,
+                        bgcolor="#FEF2F2" if invalid else "#FFFBEB",
+                        border=ft.Border.all(1, "#FECACA" if invalid else "#FDE68A"),
+                        border_radius=6,
+                        content=ft.Column([
+                            ft.Text(f"Row {issue['row']} · {issue['kind']}: {issue['message']}",
+                                    selectable=True, color="#B91C1C" if invalid else "#B45309",
+                                    weight=ft.FontWeight.BOLD),
+                            ft.Text("Source values: " + " | ".join(issue.get("source_values", [])),
+                                    selectable=True, size=11, color="#7F1D1D" if invalid else "#78350F"),
+                            ft.Text("Suggested fix: " + issue.get("fix", "Review and correct this source row."),
+                                    selectable=True, size=12, color="#991B1B" if invalid else "#92400E"),
+                        ], spacing=3),
+                    ))
+                if not issue_controls:
+                    issue_controls.append(ft.Text("No invalid or duplicate rows found.", color="#166534"))
+                valid_preview = ft.ListView(controls=[ft.Text(
+                    f"Row {record['row']}: {record['location'].get('name')} · "
+                    f"{record['classification'] or record['property_type']} · "
+                    f"{record['rate_value']} {record['rate_unit']}",
+                    size=12, color="#334155",
+                ) for record in candidates[:50]], height=130, spacing=3)
+                if not candidates:
+                    valid_preview.controls.append(ft.Text("No valid rows are ready to import.", color="#64748B"))
+                elif len(candidates) > 50:
+                    valid_preview.controls.append(ft.Text(f"…and {len(candidates) - 50} more valid rows.", size=11, color="#64748B"))
+                issue_preview = ft.ListView(controls=issue_controls, height=230, spacing=5)
                 content = ft.Column(controls=[
-                    ft.Text(f"File: {selected.name}\nSchedule: {schedule.value.upper()}\n"
-                            f"Ready: {len(candidates)} unique rate(s). Existing rates will not be overwritten.",
-                            selectable=True), ft.Divider(), *issue_controls],
+                    ft.Text(f"File: {selected.name}\nSchedule: {schedule_name()}\n"
+                            f"Rows read: {preview['rows_read']} · Ready to import: {len(candidates)} · "
+                            f"Rows needing review: {len(issues)}. Existing rates will not be overwritten. "
+                            "Valid rows can be imported while issue rows remain skipped.",
+                            selectable=True),
+                    import_year,
+                    ft.Text("Valid row preview", weight=ft.FontWeight.BOLD), valid_preview,
+                    ft.Text("Rows needing attention", weight=ft.FontWeight.BOLD), issue_preview],
                     width=680, tight=True, scroll=ft.ScrollMode.AUTO)
 
                 def commit_import(_):
-                    close_dialog()
-                    try:
-                        outcome = import_dc_rate_records(candidates)
-                        refresh_locations()
-                        schedule_filter.value = "all"
-                        location_filter.value = "all"
-                        unit_filter.value = "all"
-                        published_year_filter.value = ""
-                        search_field.value = ""
-                        refresh_rates()
-                        status_text.value = f"Imported {outcome['imported_count']} {schedule.value.upper()} rate(s) from {selected.name}."
-                        if outcome["issues"]:
-                            status_text.value += f" {len(outcome['issues'])} import-time conflicts were skipped."
+                    nonlocal import_in_progress
+                    if import_in_progress:
+                        status_text.value = "A schedule import is already running. Please wait for it to finish."
                         page.update()
+                        return
+                    year_text = (import_year.value or "").strip()
+                    if year_text:
+                        try:
+                            year_value = int(year_text)
+                            if not 1900 <= year_value <= 2200:
+                                raise ValueError
+                        except ValueError:
+                            status_text.value = "Published year must be a four-digit year from 1900 to 2200."
+                            page.update()
+                            return
+                        import_records = [
+                            {**record, "published_year": year_value,
+                             "effective_from": date(year_value, 1, 1)}
+                            for record in candidates
+                        ]
+                    else:
+                        import_records = candidates
+                    import_in_progress = True
+                    close_dialog()
+                    status_text.value = (
+                        f"Import running in the background: {len(candidates):,} valid "
+                        f"{schedule_name()} rate(s). The page remains responsive."
+                    )
+                    page.update()
+
+                    async def run_import_in_background():
+                        nonlocal import_in_progress
+                        try:
+                            # Database writes happen on a worker thread so a
+                            # large schedule does not block Flet's UI event loop.
+                            outcome = await asyncio.to_thread(import_dc_rate_records, import_records)
+                            refresh_locations()
+                            schedule_filter.value = "all"
+                            location_filter.value = "all"
+                            unit_filter.value = "all"
+                            published_year_filter.value = ""
+                            search_field.value = ""
+                            mauza_filter.value = ""
+                            square_filter.value = ""
+                            kila_filter.value = ""
+                            refresh_rates()
+                            status_text.value = (
+                                f"Imported {outcome['imported_count']:,} {schedule_name()} "
+                                f"rate(s) from {selected.name}."
+                            )
+                            skipped = len(issues) + len(outcome["issues"])
+                            if skipped:
+                                status_text.value += f" {skipped:,} invalid or conflicting row(s) were skipped."
+                        except Exception as exc:
+                            status_text.value = f"Schedule import failed: {exc}"
+                        finally:
+                            import_in_progress = False
+                            page.update()
+
+                    try:
+                        page.run_task(run_import_in_background)
                     except Exception as exc:
-                        status_text.value = f"Import failed; no rates were committed: {exc}"
+                        import_in_progress = False
+                        status_text.value = f"Could not start the background import: {exc}"
                         page.update()
                 page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text("Review schedule import"),
                     content=content, actions=[ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
-                    ft.Button(f"Import {len(candidates)} rate(s)", on_click=commit_import, disabled=not candidates)]))
+                    ft.Button(f"Import {len(candidates)} valid rate(s)", on_click=commit_import, disabled=not candidates)]))
                 page.update()
 
             def preview_mapping(_):
@@ -680,10 +842,11 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
 
             mapping_error = ft.Text("", color="#B91C1C", size=12)
             page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text(f"Map columns — {selected.name}"),
-                content=ft.Column(controls=[schedule, *selects.values(), mapping_error], width=680,
+                content=ft.Column(controls=[ft.Text("Schedule type"), schedule, mapping_controls, mapping_error], width=680,
                                   tight=True, scroll=ft.ScrollMode.AUTO),
                 actions=[ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
                          ft.Button("Preview rows", on_click=preview_mapping)]))
+            rebuild_mapping()
             page.update()
         except Exception as exc:
             status_text.value = f"Could not open schedule spreadsheet: {exc}"
@@ -724,6 +887,9 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
         return export_schedule
 
     search_field.on_change = refresh_rates
+    mauza_filter.on_change = refresh_rates
+    square_filter.on_change = refresh_rates
+    kila_filter.on_change = refresh_rates
     schedule_filter.on_select = refresh_rates
     location_filter.on_select = refresh_rates
     unit_filter.on_select = refresh_rates
@@ -748,24 +914,35 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
         spacing=6,
         run_spacing=6,
     )
-    filters = ft.Row(
-        controls=[
-            search_field,
-            schedule_filter,
-            location_filter,
-            unit_filter,
-            published_year_filter,
-        ],
-        wrap=True,
-        spacing=6,
-        run_spacing=6,
-    )
-    refresh_locations()
+    filters = ft.ResponsiveRow([
+        ft.Container(mauza_filter, col={"xs": 12, "sm": 6, "md": 3}),
+        ft.Container(square_filter, col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(kila_filter, col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(unit_filter, col={"xs": 12, "sm": 6, "md": 2}),
+        ft.Container(schedule_filter, col={"xs": 12, "sm": 6, "md": 2}),
+    ], run_spacing=4)
+    extended_filters = ft.ResponsiveRow([
+        ft.Container(search_field, col={"xs": 12, "md": 4}),
+        ft.Container(location_filter, col={"xs": 12, "md": 4}),
+        ft.Container(published_year_filter, col={"xs": 12, "md": 4}),
+    ], visible=False, run_spacing=4)
+
+    def toggle_extended_filters(_):
+        extended_filters.visible = not extended_filters.visible
+        extended_filter_button.text = "Hide extended filters" if extended_filters.visible else "Extended filters"
+        page.update()
+
+    extended_filter_button = ft.TextButton("Extended filters", on_click=toggle_extended_filters)
+    if not defer_initial_load:
+        refresh_locations()
     # AppShell attaches this page after its builder returns; avoid sending an
     # update while the initial control tree is not mounted yet.
-    refresh_rates(update_page=False)
+    if not defer_initial_load:
+        refresh_rates(update_page=False)
+    else:
+        rate_list.controls.append(ft.Text("Loading valuation schedules…", color="#64748B"))
 
-    return ft.Column(
+    root = ft.Column(
         controls=[
             ft.Text("DC Valuation Rates", size=25, weight=ft.FontWeight.BOLD),
             ft.Text(
@@ -779,9 +956,33 @@ def build_dc_rates_page(page: ft.Page) -> ft.Control:
                 color="#64748B",
             ),
             filters,
+            extended_filter_button,
+            extended_filters,
             ft.Row([result_count, status_text], wrap=True, spacing=12),
             rate_list,
         ],
         spacing=8,
         expand=True,
     )
+    if defer_initial_load:
+        async def load_initial_data():
+            """Populate the first bounded view without blocking page navigation."""
+            try:
+                locations, records = await asyncio.gather(
+                    asyncio.to_thread(list_locations),
+                    asyncio.to_thread(list_dc_rates, limit=visible_rate_limit),
+                )
+                refresh_locations(locations)
+                refresh_rates(update_page=False, records=records)
+                page.update()
+            except Exception as exc:
+                status_text.value = f"Could not load valuation schedules: {exc}"
+                page.update()
+        if hasattr(page, "run_task"):
+            page.run_task(load_initial_data)
+        else:
+            # Minimal test/page adapters may not expose Flet's task scheduler.
+            # Keep their construction side-effect free and render on demand.
+            rate_list.controls.clear()
+            rate_list.controls.append(ft.Text("Use Refresh to load valuation schedules.", color="#64748B"))
+    return root
