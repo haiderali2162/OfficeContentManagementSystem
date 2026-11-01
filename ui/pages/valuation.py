@@ -11,7 +11,7 @@ import asyncio
 from datetime import date
 from decimal import Decimal
 import json
-from typing import Any
+from typing import Any, Callable
 
 import flet as ft
 
@@ -66,7 +66,11 @@ def _money(value: Any, currency: str = "PKR") -> str:
     return f"{currency} {Decimal(str(value)):,.2f}"
 
 
-def build_valuation_page(page: ft.Page) -> ft.Control:
+def build_valuation_page(
+    page: ft.Page,
+    *,
+    on_rates_tab_change: Callable[[bool], None] | None = None,
+) -> ft.Control:
     """Build the estimate workflow plus the existing rates and tax-rule pages."""
     # Populate these lists asynchronously after the lightweight control tree is
     # attached; event handlers continue to use the same shared choice cache.
@@ -698,7 +702,12 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
 
     def on_valuation_tab_change(event):
         nonlocal rates_load_started
-        if event.control.selected_index == 2 and not rates_load_started:
+        rates_tab_selected = event.control.selected_index == 2
+        valuation_heading.visible = not rates_tab_selected
+        valuation_description.visible = not rates_tab_selected
+        if on_rates_tab_change is not None:
+            on_rates_tab_change(rates_tab_selected)
+        if rates_tab_selected and not rates_load_started:
             rates_load_started = True
             loader = rate_page_loader.get("load")
             if loader is not None:
@@ -713,9 +722,14 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
         on_change=on_valuation_tab_change,
         expand=True,
     )
+    valuation_heading = ft.Text("Property Valuation & Taxes", size=25, weight=ft.FontWeight.BOLD)
+    valuation_description = ft.Text(
+        "Calculate an explainable estimate, manage configurable charges, and maintain valuation schedules.",
+        color="#64748B",
+    )
     root = ft.Column([
-        ft.Text("Property Valuation & Taxes", size=25, weight=ft.FontWeight.BOLD),
-        ft.Text("Calculate an explainable estimate, manage configurable charges, and maintain valuation schedules.", color="#64748B"),
+        valuation_heading,
+        valuation_description,
         tabs,
     ], spacing=8, expand=True)
 

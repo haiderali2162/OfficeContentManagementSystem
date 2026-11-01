@@ -1,5 +1,5 @@
-now i need a remove duplicate rows option if there exist any duplicates in a mauza. like the same file get imported more than onces.
-if the square no, kila no and khasra no if present are same under the mauza then look for the location and classification and unit. if all these values are same then consider it a duplicate and remove that row.
-for the urban and fbr if two same rows exist more than once for all columns the values are same consider it a duplicate and remove it.
-output all the removed values in excel/csv/ods/odf format in documents folder in case of any os like window/linux/mac.
-also there is an error while closing the app, the command prompt remains like the application is still running, if there is any issue in the app, please fix it. also.
+still ui is not good enough.
+1. make the import/export section collapsable hide/show option.
+2. also the filer option, make it show/hide.
+3. make sure the cards with details of the properties should always be visible on the screen.
+4. remove the "valuaiton & taxes" ribbon at the very top only on "DC / FBR rates" tab or show/hide option whichever is better and professional.

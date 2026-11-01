@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 from ui.pages import dc_rates
 from ui.pages import valuation
+from ui.app_shell import AppShell
+from ui.navigation import NavigationItem
 
 
 class FakePage:
@@ -62,11 +64,56 @@ def test_dc_fbr_rates_load_is_scheduled_only_when_tab_is_selected(monkeypatch):
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
 
     page = TaskPage()
-    root = valuation.build_valuation_page(page)
+    tab_states = []
+    root = valuation.build_valuation_page(page, on_rates_tab_change=tab_states.append)
     tabs = root.controls[2]
     assert len(page.scheduled) == 1  # valuation choice/history loads only
+    assert root.controls[0].visible is True
+    assert root.controls[1].visible is True
 
     tabs.on_change(SimpleNamespace(control=SimpleNamespace(selected_index=2)))
 
     assert len(page.scheduled) == 2  # DC/FBR load is scheduled on demand
+    assert tab_states == [True]
+    assert root.controls[0].visible is False
+    assert root.controls[1].visible is False
+
+    tabs.on_change(SimpleNamespace(control=SimpleNamespace(selected_index=0)))
+    assert tab_states == [True, False]
+    assert root.controls[0].visible is True
+    assert root.controls[1].visible is True
+
+
+def test_app_shell_hides_shared_header_only_on_rates_tab(monkeypatch):
+    monkeypatch.setattr(valuation, "list_locations", lambda: [])
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+
+    page = FakePage()
+    page.add = lambda control: page.controls.append(control)
+    page.run_task = lambda handler: handler().close()
+    shell = AppShell(page)
+    shell.items = [NavigationItem(
+        key="valuation", title="Valuation & Taxes", description="Valuation workspace",
+        icon=None, page_builder=valuation.build_valuation_page,
+    )]
+    shell.render()
+
+    layout = page.controls[0]
+    main_column = layout.controls[1].content
+    shared_header = main_column.controls[0]
+    valuation_root = main_column.controls[1].content
+    tabs = valuation_root.controls[2]
+
+    tabs.on_change(SimpleNamespace(control=SimpleNamespace(selected_index=2)))
+    assert shared_header.visible is False
+    assert valuation_root.controls[0].visible is False
+
+    tabs.on_change(SimpleNamespace(control=SimpleNamespace(selected_index=1)))
+    assert shared_header.visible is True
+    assert valuation_root.controls[0].visible is True
 

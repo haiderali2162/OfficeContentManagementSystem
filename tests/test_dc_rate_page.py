@@ -214,10 +214,53 @@ def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch)
     assert len(autocompletes) == 4
     schedule = next(control for control in controls if isinstance(control, ft.Dropdown) and control.label == "Schedule")
     assert [option.key for option in schedule.options] == ["dc_rural", "dc_urban", "fbr", "all"]
+    search = next(control for control in controls if isinstance(control, ft.TextField)
+                  and control.label == "Search location, property, classification, or source")
+    search_bar = next(control for control in controls if isinstance(control, ft.ResponsiveRow)
+                      and any(child.content is search for child in control.controls
+                              if isinstance(child, ft.Container)))
     extended = next(control for control in controls if isinstance(control, ft.ResponsiveRow)
-                    and any(isinstance(child.content, ft.TextField) and child.content.label == "Search location, property, classification, or source"
+                    and any(isinstance(child.content, ft.Dropdown) and child.content.label == "Location"
                             for child in control.controls if isinstance(child, ft.Container)))
     assert extended.visible is False
+
+    filter_panel = next(control for control in controls if isinstance(control, ft.Container)
+                        and control.height == 170 and isinstance(control.content, ft.Column))
+    assert search_bar is not filter_panel.content.controls[0]
+    assert filter_panel.content.scroll == ft.ScrollMode.AUTO
+    assert filter_panel.visible is False
+
+
+def test_filter_and_import_export_sections_toggle_independently(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    toolbar = root.controls[2]
+    filter_button = next(control for control in toolbar.controls
+                         if isinstance(control, ft.TextButton) and control.content == "Show filters")
+    import_export_button = next(control for control in toolbar.controls
+                                if isinstance(control, ft.TextButton)
+                                and control.content == "Show import / export")
+    filter_panel = next(control for control in _walk(root) if isinstance(control, ft.Container)
+                        and control.height == 170)
+    import_export_panel = next(control for control in _walk(root) if isinstance(control, ft.Column)
+                               and control.visible is False
+                               and any(isinstance(child, ft.Text) and "Import mapped" in (child.value or "")
+                                       for child in control.controls))
+
+    filter_button.on_click(None)
+    assert filter_panel.visible is True
+    assert filter_button.content == "Hide filters"
+    assert import_export_panel.visible is False
+
+    import_export_button.on_click(None)
+    assert import_export_panel.visible is True
+    assert import_export_button.content == "Hide import / export"
+    assert filter_panel.visible is True
 
 
 def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch):
@@ -333,7 +376,10 @@ def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypa
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
 
-    asyncio.run(root.controls[2].controls[3].on_click())
+    import_button = next(control for control in _walk(root)
+                         if isinstance(control, ft.OutlinedButton)
+                         and control.content == "Import CSV / Excel / ODS")
+    asyncio.run(import_button.on_click())
     dialog = page.dialogs[-1]
     radio = next(control for control in _walk(dialog.content) if isinstance(control, ft.RadioGroup))
     labels = {control.label for control in _walk(dialog.content) if isinstance(control, ft.Dropdown)}
@@ -392,7 +438,10 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
 
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
-    asyncio.run(root.controls[2].controls[3].on_click())
+    import_button = next(control for control in _walk(root)
+                         if isinstance(control, ft.OutlinedButton)
+                         and control.content == "Import CSV / Excel / ODS")
+    asyncio.run(import_button.on_click())
     mapping_dialog = page.dialogs[-1]
     mapping_dialog.actions[-1].on_click(None)
     review_dialog = page.dialogs[-1]

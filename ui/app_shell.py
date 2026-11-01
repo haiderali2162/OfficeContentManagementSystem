@@ -3,6 +3,7 @@ import flet as ft
 
 from core.config import APP_NAME, APP_VERSION
 from ui.navigation import NavigationItem, build_navigation
+from ui.pages.valuation import build_valuation_page
 
 
 
@@ -171,15 +172,28 @@ class AppShell:
 
     def render(self) -> None:
         item = self.get_current_item()
+        topbar = self.build_topbar(item)
+
+        def set_rates_tab_chrome(is_rates_tab: bool) -> None:
+            """Give the rate schedule tab its full viewport height."""
+            topbar.visible = not is_rates_tab
+            self.page.update()
+
+        if item.key == "valuation":
+            page_content = build_valuation_page(
+                self.page,
+                on_rates_tab_change=set_rates_tab_chrome,
+            )
+        else:
+            page_content = item.page_builder(self.page)
 
         # Building the selected page runs its initial data query; the completed
         # layout is attached to Page and sent to the Flet client below.
         content = ft.Column(
             controls=[
-                self.build_topbar(item),
+                topbar,
                 ft.Container(
-                    # content=item.page_builder(),
-                    content=item.page_builder(self.page),
+                    content=page_content,
                     padding=26,
                     expand=True,
                 ),

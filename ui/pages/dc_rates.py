@@ -1173,25 +1173,58 @@ def build_dc_rates_page(
     published_year_filter.on_change = schedule_rates_refresh
     load_more_button.on_click = lambda _: schedule_rates_refresh(append=True)
 
+    import_export_button = ft.TextButton("Show import / export")
+    filter_button = ft.TextButton("Show filters")
+
+    def toggle_import_export(_):
+        import_export_toolbar.visible = not import_export_toolbar.visible
+        import_export_button.content = (
+            "Hide import / export" if import_export_toolbar.visible else "Show import / export"
+        )
+        page.update()
+
+    import_export_button.on_click = toggle_import_export
+    filter_button.on_click = lambda _: toggle_filters()
+
     toolbar = ft.Row(
         controls=[
             ft.Button("Add DC rate", on_click=open_rate_dialog),
             ft.OutlinedButton("Add FBR rate", on_click=lambda _: open_rate_dialog(schedule_type="fbr")),
             ft.OutlinedButton("Add location", on_click=open_location_dialog),
-            ft.OutlinedButton("Import CSV / Excel / ODS", on_click=import_excel),
-            *[
-                ft.OutlinedButton(
-                    f"Export {file_format.upper()}",
-                    on_click=make_export_handler(file_format),
-                )
-                for file_format in ("csv", "xlsx", "ods")
-            ],
             ft.OutlinedButton("Find / remove duplicates", on_click=open_duplicate_cleanup_dialog),
+            filter_button,
+            import_export_button,
             ft.TextButton("Refresh", on_click=schedule_rates_refresh),
         ],
-        wrap=True,
+        wrap=False,
+        scroll=ft.ScrollMode.AUTO,
         spacing=6,
-        run_spacing=6,
+    )
+    import_export_toolbar = ft.Column(
+        controls=[
+            ft.Text(
+                "Import mapped CSV, XLSX, or ODS schedules; export the current records in these formats.",
+                size=12,
+                color="#64748B",
+            ),
+            ft.Row(
+                controls=[
+                    ft.OutlinedButton("Import CSV / Excel / ODS", on_click=import_excel),
+                    *[
+                        ft.OutlinedButton(
+                            f"Export {file_format.upper()}",
+                            on_click=make_export_handler(file_format),
+                        )
+                        for file_format in ("csv", "xlsx", "ods")
+                    ],
+                ],
+                wrap=True,
+                spacing=6,
+                run_spacing=6,
+            ),
+        ],
+        spacing=4,
+        visible=False,
     )
     filters = ft.ResponsiveRow([
         ft.Container(ft.Column([ft.Text("Mauza"), mauza_filter], spacing=2), col={"xs": 12, "sm": 6, "md": 3}),
@@ -1201,18 +1234,41 @@ def build_dc_rates_page(
         ft.Container(unit_filter, col={"xs": 12, "sm": 6, "md": 2}),
         ft.Container(schedule_filter, col={"xs": 12, "sm": 6, "md": 2}),
     ], run_spacing=4)
+    search_bar = ft.ResponsiveRow([
+        ft.Container(search_field, col={"xs": 12, "md": 6}),
+    ], run_spacing=4)
     extended_filters = ft.ResponsiveRow([
-        ft.Container(search_field, col={"xs": 12, "md": 4}),
         ft.Container(location_filter, col={"xs": 12, "md": 4}),
         ft.Container(published_year_filter, col={"xs": 12, "md": 4}),
     ], visible=False, run_spacing=4)
 
     def toggle_extended_filters(_):
         extended_filters.visible = not extended_filters.visible
-        extended_filter_button.text = "Hide extended filters" if extended_filters.visible else "Extended filters"
+        extended_filter_button.content = "Hide extended filters" if extended_filters.visible else "Extended filters"
         page.update()
 
     extended_filter_button = ft.TextButton("Extended filters", on_click=toggle_extended_filters)
+    filter_panel = ft.Container(
+        content=ft.Column(
+            controls=[filters, extended_filter_button, extended_filters],
+            spacing=4,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        height=170,
+        padding=8,
+        bgcolor="#FFFFFF",
+        border=ft.Border.all(1, "#E2E8F0"),
+        border_radius=8,
+        visible=False,
+    )
+
+    def toggle_filters():
+        filter_panel.visible = not filter_panel.visible
+        filter_button.content = "Hide filters" if filter_panel.visible else "Show filters"
+        page.update()
+
+    # Search stays visible while optional controls start collapsed. On small
+    # windows, the bounded filter panel scrolls so cards keep the remaining area.
     if not defer_initial_load:
         refresh_locations()
     # AppShell attaches this page after its builder returns; avoid sending an
@@ -1230,14 +1286,9 @@ def build_dc_rates_page(
                 color="#64748B",
             ),
             toolbar,
-            ft.Text(
-                "Import mapped CSV, XLSX, or ODS schedules; export the current records to CSV, XLSX, or ODS.",
-                size=12,
-                color="#64748B",
-            ),
-            filters,
-            extended_filter_button,
-            extended_filters,
+            import_export_toolbar,
+            search_bar,
+            filter_panel,
             ft.Row([result_count, status_text], wrap=True, spacing=12),
             rate_summary,
             rate_list,
