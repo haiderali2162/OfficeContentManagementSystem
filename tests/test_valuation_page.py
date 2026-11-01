@@ -13,11 +13,13 @@ class FakePage:
     def __init__(self):
         self.services = []
         self.controls = []
+        self.dialogs = []
 
     def update(self):
         return None
 
-    def show_dialog(self, _dialog):
+    def show_dialog(self, dialog):
+        self.dialogs.append(dialog)
         return None
 
     def pop_dialog(self):
@@ -30,6 +32,7 @@ def test_valuation_page_builds_with_tabs_and_existing_rate_management(monkeypatc
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
 
@@ -60,6 +63,7 @@ def test_dc_fbr_rates_load_is_scheduled_only_when_tab_is_selected(monkeypatch):
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
 
@@ -90,6 +94,7 @@ def test_app_shell_hides_shared_header_only_on_rates_tab(monkeypatch):
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
 
@@ -116,4 +121,27 @@ def test_app_shell_hides_shared_header_only_on_rates_tab(monkeypatch):
     tabs.on_change(SimpleNamespace(control=SimpleNamespace(selected_index=1)))
     assert shared_header.visible is True
     assert valuation_root.controls[0].visible is True
+
+
+def test_add_tax_rule_opens_dialog_with_supported_flet_controls(monkeypatch):
+    monkeypatch.setattr(valuation, "list_locations", lambda: [])
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+
+    page = FakePage()
+    root = valuation.build_valuation_page(page)
+    tabs = root.controls[2]
+    rule_page = tabs.content.controls[1].controls[1]
+    add_rule = rule_page.controls[2].controls[0]
+
+    add_rule.on_click(SimpleNamespace(control=add_rule))
+
+    assert len(page.dialogs) == 1
+    assert isinstance(page.dialogs[0], ft.AlertDialog)
+    assert page.dialogs[0].title.value == "Add tax/fee rule"
 

@@ -331,6 +331,9 @@ def calculate_dual_valuation(
     floor: str | None = None,
     dc_rate_unit: str | None = None,
     fbr_rate_unit: str | None = None,
+    dc_rate_override: dict[str, Any] | None = None,
+    fbr_rate_override: dict[str, Any] | None = None,
+    fbr_location_id: int | None = None,
     registry_written_value: Any | None = None,
     settings: AreaSettings | None = None,
 ) -> dict[str, Any]:
@@ -339,7 +342,18 @@ def calculate_dual_valuation(
     DC must resolve uniquely. FBR is optional for a Mauza: missing or ambiguous
     FBR rows are reported and do not silently replace the DC valuation.
     """
-    dc_rate = resolve_valuation_rate(
+    def validate_override(rate: dict[str, Any] | None, schedule: str) -> dict[str, Any] | None:
+        if rate is None:
+            return None
+        if str(rate.get("schedule_type") or "dc").casefold() != schedule:
+            raise ValuationError(f"The selected {schedule.upper()} rate belongs to another schedule.")
+        if rate.get("effective_from") and rate["effective_from"] > transaction_date:
+            raise ValuationError(f"The selected {schedule.upper()} rate is not effective yet.")
+        if rate.get("effective_to") and rate["effective_to"] < transaction_date:
+            raise ValuationError(f"The selected {schedule.upper()} rate has expired.")
+        return rate
+
+    dc_rate = validate_override(dc_rate_override, "dc") or resolve_valuation_rate(
         location_id=location_id,
         property_type=property_type,
         schedule_type="dc",
@@ -365,8 +379,8 @@ def calculate_dual_valuation(
     warnings = list(dc_value["warnings"])
     fbr_warning: str | None = None
     try:
-        fbr_rate = resolve_valuation_rate(
-            location_id=location_id,
+        fbr_rate = validate_override(fbr_rate_override, "fbr") or resolve_valuation_rate(
+            location_id=fbr_location_id or location_id,
             property_type=property_type,
             schedule_type="fbr",
             transaction_date=transaction_date,

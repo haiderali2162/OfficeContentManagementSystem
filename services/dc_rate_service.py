@@ -16,12 +16,53 @@ from openpyxl import Workbook, load_workbook
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import joinedload
 
+from core.area_engine import AreaError, LandArea
 from core.database import SessionLocal
-from core.models import DC_RATE_UNITS, DCValuationRate, PropertyLocation
+from core.models import (
+    DC_RATE_UNITS,
+    DCValuationRate,
+    KhewatReference,
+    PropertyKhewat,
+    PropertyLocation,
+)
 
 
 class DCRateServiceError(ValueError):
     """Raised when a DC-rate operation fails validation or conflicts."""
+
+
+def normalize_rhz_year(value: str | int) -> str:
+    """Normalize RHZ year variants to the stored ``YYYY-YY`` format."""
+    raw = _text(value)
+    if not raw:
+        raise DCRateServiceError("Select an RHZ year.")
+    match = re.fullmatch(r"(\d{4})\s*[-/]\s*(\d{2}|\d{4})", raw)
+    if not match:
+        raise DCRateServiceError("Enter an RHZ year like 2019-20.")
+    start = int(match.group(1))
+    end_text = match.group(2)
+    end = int(end_text) if len(end_text) == 4 else (start // 100) * 100 + int(end_text)
+    if len(end_text) == 2 and end < start:
+        end += 100
+    if start < 1800 or start > 2198 or end != start + 1:
+        raise DCRateServiceError("RHZ year must cover two consecutive years, such as 2019-20.")
+    return f"{start:04d}-{end % 100:02d}"
+
+
+def normalize_khewat_size(value: str | None) -> str | None:
+    """Validate and canonicalize optional Kanal-Marla-Feet size text."""
+    raw = _text(value)
+    if not raw:
+        return None
+    try:
+        area = LandArea.parse(raw)
+    except AreaError as exc:
+        raise DCRateServiceError(
+            "Khewat size must use K-M-F format, for example 12-4-0."
+        ) from exc
+    del area  # Parsing validates whole, non-negative components without imposing a unit conversion.
+    parts = [int(part.strip()) for part in raw.split("-")]
+    return "-".join(str(part) for part in parts)
 
 
 LOCATION_FIELDS = (
@@ -692,6 +733,728 @@ def list_mauza_names(*, search: str = "", limit: int = 50) -> list[str]:
         return list(session.scalars(statement).all())
 
 
+MAUZA_CONTEXT_FIELDS = (
+    "province", "district", "tehsil", "qanoongoi", "patwar_circle",
+    "mauza_name", "hadbast_number",
+)
+_MAUZA_LOCATION_COLUMNS = {
+    "province": PropertyLocation.province,
+    "district": PropertyLocation.district,
+    "tehsil": PropertyLocation.tehsil,
+    "qanoongoi": PropertyLocation.qanoongoi,
+    "patwar_circle": PropertyLocation.patwar_circle,
+    "mauza_name": PropertyLocation.mauza,
+    "hadbast_number": PropertyLocation.hadbast_number,
+}
+
+
+def _apply_mauza_context(statement, context: dict[str, Any]):
+    """Restrict queries to the selected Mauza and its administrative identity."""
+    for name, column in _MAUZA_LOCATION_COLUMNS.items():
+        value = _text(context.get(name))
+        if name == "mauza_name" and not value:
+            raise DCRateServiceError("Select a Mauza before searching cadastral references.")
+        statement = statement.where(column == value if value else column.is_(None))
+    return statement
+
+
+def list_mauza_contexts(*, search: str = "", limit: int = 500) -> list[dict[str, str | None]]:
+    """List Mauza identities found in schedules or existing Khewat records."""
+    columns = [_MAUZA_LOCATION_COLUMNS[field] for field in MAUZA_CONTEXT_FIELDS]
+    statement = (
+        select(*columns)
+        .join(DCValuationRate, DCValuationRate.location_id == PropertyLocation.id)
+        .where(PropertyLocation.mauza.is_not(None), PropertyLocation.mauza != "")
+        .distinct()
+    )
+    query = search.strip()
+    if query:
+        statement = statement.where(PropertyLocation.mauza.ilike(f"%{query}%"))
+    statement = statement.order_by(PropertyLocation.mauza, PropertyLocation.district,
+                                  PropertyLocation.tehsil).limit(max(1, limit))
+    with SessionLocal() as session:
+        rows = session.execute(statement).all()
+        khewat_statement = select(
+            *(getattr(PropertyKhewat, field) for field in MAUZA_CONTEXT_FIELDS)
+        ).where(PropertyKhewat.mauza_name.is_not(None), PropertyKhewat.mauza_name != "")
+        if query:
+            khewat_statement = khewat_statement.where(
+                PropertyKhewat.mauza_name.ilike(f"%{query}%")
+            )
+        khewat_rows = session.execute(khewat_statement).all()
+    contexts = {
+        tuple(value or "" for value in row)
+        for row in [*rows, *khewat_rows]
+    }
+    ordered = sorted(contexts, key=lambda row: tuple(str(value).casefold() for value in row))
+    return [dict(zip(MAUZA_CONTEXT_FIELDS, row)) for row in ordered[:max(1, limit)]]
+
+
+def list_saved_khewat_mauzas(*, search: str = "", limit: int = 200) -> list[str]:
+    """Return saved Khewat Mauzas for the searchable Khewat filter."""
+    statement = select(PropertyKhewat.mauza_name).where(
+        PropertyKhewat.mauza_name.is_not(None), PropertyKhewat.mauza_name != ""
+    ).distinct()
+    if search.strip():
+        statement = statement.where(PropertyKhewat.mauza_name.ilike(f"%{search.strip()}%"))
+    statement = statement.order_by(PropertyKhewat.mauza_name).limit(max(1, limit))
+    with SessionLocal() as session:
+        return list(session.scalars(statement).all())
+
+
+def list_saved_khewat_numbers(*, mauza: str = "", search: str = "", limit: int = 200) -> list[str]:
+    """Return searchable Khewat numbers, optionally scoped to a Mauza."""
+    statement = select(PropertyKhewat.khewat_number).distinct()
+    if mauza.strip():
+        statement = statement.where(PropertyKhewat.mauza_name.ilike(f"%{mauza.strip()}%"))
+    if search.strip():
+        statement = statement.where(PropertyKhewat.khewat_number.ilike(f"%{search.strip()}%"))
+    statement = statement.order_by(PropertyKhewat.khewat_number).limit(max(1, limit))
+    with SessionLocal() as session:
+        return list(session.scalars(statement).all())
+
+
+def list_mauza_cadastral_values(
+    context: dict[str, Any], field_name: str, *, search: str = "", limit: int = 1000,
+) -> list[str]:
+    """List distinct expanded square or Kila references for one Mauza."""
+    if field_name not in {"square_no", "kila_no"}:
+        raise DCRateServiceError("Choose Square no. or Kila no. for this selection.")
+    field = getattr(PropertyLocation, field_name)
+    statement = (
+        select(field)
+        .join(DCValuationRate, DCValuationRate.location_id == PropertyLocation.id)
+        .where(field.is_not(None), field != "")
+    )
+    statement = _apply_mauza_context(statement, context).distinct()
+    with SessionLocal() as session:
+        stored_values = session.scalars(statement).all()
+    query = search.strip().casefold()
+    tokens = {
+        token
+        for stored_value in stored_values
+        for token in _reference_values(stored_value)
+        if not query or query in token.casefold()
+    }
+    return sorted(
+        tokens,
+        key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else token.casefold()),
+    )[:max(1, limit)]
+
+
+def summarize_mauza_cadastral_selection(
+    *, context: dict[str, Any], square_numbers: list[str], kila_numbers: list[str],
+    schedule_type: str | None = None, rate_unit: str | None = None,
+    published_year: int | None = None,
+) -> dict[str, Any]:
+    """Summarize rates intersecting selected square/Kila values in one Mauza."""
+    selected_squares = set(_reference_values(",".join(square_numbers)))
+    selected_kilas = set(_reference_values(",".join(kila_numbers)))
+    if not selected_squares and not selected_kilas:
+        raise DCRateServiceError("Select at least one square or Kila before requesting a summary.")
+
+    statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
+    statement = statement.join(DCValuationRate.location)
+    statement = _apply_mauza_context(statement, context)
+    if schedule_type in {"dc", "fbr"}:
+        statement = statement.where(DCValuationRate.schedule_type == schedule_type)
+    if rate_unit:
+        statement = statement.where(DCValuationRate.rate_unit == rate_unit)
+    if published_year is not None:
+        statement = statement.where(DCValuationRate.published_year == published_year)
+
+    with SessionLocal() as session:
+        rates = session.scalars(statement).unique().all()
+
+    matches: list[DCValuationRate] = []
+    matched_squares: set[str] = set()
+    matched_kilas: set[str] = set()
+    for rate in rates:
+        location = rate.location
+        rate_squares = set(_reference_values(location.square_no)) if location else set()
+        rate_kilas = set(_reference_values(location.kila_no)) if location else set()
+        square_match = not selected_squares or bool(selected_squares & rate_squares)
+        kila_match = not selected_kilas or bool(selected_kilas & rate_kilas)
+        if square_match and kila_match:
+            matches.append(rate)
+            matched_squares.update(selected_squares & rate_squares)
+            matched_kilas.update(selected_kilas & rate_kilas)
+
+    def ordered_extremes(values: set[str]) -> tuple[str | None, str | None]:
+        ordered = sorted(
+            values,
+            key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else token.casefold()),
+        )
+        return (ordered[0], ordered[-1]) if ordered else (None, None)
+
+    lowest_square, highest_square = ordered_extremes(matched_squares)
+    lowest_kila, highest_kila = ordered_extremes(matched_kilas)
+    lowest_rate = min(matches, key=lambda rate: (rate.rate_value, rate.id), default=None)
+    highest_rate = max(matches, key=lambda rate: (rate.rate_value, -rate.id), default=None)
+    return {
+        "count": len(matches),
+        "lowest_square": lowest_square,
+        "highest_square": highest_square,
+        "lowest_kila": lowest_kila,
+        "highest_kila": highest_kila,
+        "lowest_rate": lowest_rate.rate_value if lowest_rate else None,
+        "highest_rate": highest_rate.rate_value if highest_rate else None,
+    }
+
+
+def _khewat_record(item: PropertyKhewat) -> dict[str, Any]:
+    """Convert a Khewat and its child references into a UI/service record."""
+    natural_key = lambda value: (not value.isdigit(), int(value) if value.isdigit() else value.casefold())
+    return {
+        "id": item.id,
+        "province": item.province,
+        "district": item.district,
+        "tehsil": item.tehsil,
+        "qanoongoi": item.qanoongoi,
+        "patwar_circle": item.patwar_circle,
+        "mauza_name": item.mauza_name,
+        "hadbast_number": item.hadbast_number,
+        "khewat_number": item.khewat_number,
+        "rhz_year": item.rhz_year,
+        "khewat_size": item.khewat_size,
+        "squares": sorted(
+            (ref.reference_value for ref in item.references if ref.reference_type == "square"),
+            key=natural_key,
+        ),
+        "kilas": sorted(
+            (ref.reference_value for ref in item.references if ref.reference_type == "kila"),
+            key=natural_key,
+        ),
+    }
+
+
+def list_rhz_years(context: dict[str, Any] | None = None) -> list[str]:
+    """Build searchable canonical RHZ year options, including saved years."""
+    current_year = date.today().year
+    options = {f"{year}-{(year + 1) % 100:02d}" for year in range(1900, current_year + 3)}
+    statement = select(PropertyKhewat.rhz_year).where(PropertyKhewat.rhz_year.is_not(None))
+    if context:
+        criteria = {field: (_text(context.get(field)) or "") for field in MAUZA_CONTEXT_FIELDS}
+        statement = statement.where(*(
+            getattr(PropertyKhewat, field) == value for field, value in criteria.items()
+        ))
+    with SessionLocal() as session:
+        stored_years = session.scalars(statement.distinct()).all()
+    for value in stored_years:
+        try:
+            options.add(normalize_rhz_year(value))
+        except DCRateServiceError:
+            continue
+    return sorted(options, reverse=True)
+
+
+def latest_rhz_year(context: dict[str, Any]) -> str | None:
+    """Return the highest RHZ year already saved in this Mauza context."""
+    years = [item["rhz_year"] for item in list_khewats_for_mauza(context) if item.get("rhz_year")]
+    normalized = []
+    for year in years:
+        try:
+            normalized.append(normalize_rhz_year(year))
+        except DCRateServiceError:
+            continue
+    return max(normalized, key=lambda item: int(item[:4]), default=None)
+
+
+def list_khewats_for_mauza(
+    context: dict[str, Any], *, rhz_year: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return saved Khewats for an exact Mauza context and optional RHZ year."""
+    criteria = {field: (_text(context.get(field)) or "") for field in MAUZA_CONTEXT_FIELDS}
+    statement = (
+        select(PropertyKhewat)
+        .options(joinedload(PropertyKhewat.references))
+        .where(*(getattr(PropertyKhewat, field) == value for field, value in criteria.items()))
+    )
+    if rhz_year:
+        statement = statement.where(PropertyKhewat.rhz_year == normalize_rhz_year(rhz_year))
+    statement = statement.order_by(PropertyKhewat.rhz_year.desc(), PropertyKhewat.khewat_number)
+    with SessionLocal() as session:
+        return [_khewat_record(item) for item in session.scalars(statement).unique().all()]
+
+
+def search_khewats(
+    *, mauza: str = "", district: str = "", tehsil: str = "",
+    khewat_number: str = "", rhz_year: str | None = None,
+) -> list[dict[str, Any]]:
+    """Search saved Khewats using the filters shown on the rates page."""
+    statement = select(PropertyKhewat).options(joinedload(PropertyKhewat.references))
+    for field, value in (("mauza_name", mauza), ("district", district), ("tehsil", tehsil),
+                         ("khewat_number", khewat_number)):
+        if value.strip():
+            statement = statement.where(getattr(PropertyKhewat, field).ilike(f"%{value.strip()}%"))
+    if rhz_year:
+        statement = statement.where(PropertyKhewat.rhz_year == normalize_rhz_year(rhz_year))
+    statement = statement.order_by(
+        PropertyKhewat.mauza_name, PropertyKhewat.rhz_year.desc(), PropertyKhewat.khewat_number
+    )
+    with SessionLocal() as session:
+        return [_khewat_record(item) for item in session.scalars(statement).unique().all()]
+
+
+def get_khewat_details(khewat_id: int) -> dict[str, Any] | None:
+    with SessionLocal() as session:
+        item = session.scalar(
+            select(PropertyKhewat)
+            .options(joinedload(PropertyKhewat.references))
+            .where(PropertyKhewat.id == khewat_id)
+        )
+        return _khewat_record(item) if item else None
+
+
+KHEWAT_SUMMARY_COLUMNS = (
+    ("serial_no", "Sr no"), ("mauza", "Mauza"), ("square_no", "Square no"),
+    ("kila_no", "Kila no"), ("khasra_no", "Khasra no"),
+    ("unit", "Unit"), ("schedule", "Schedule"),
+)
+
+AREA_UNIT_DISPLAY_NAMES = {
+    "per_square_foot": "Square foot", "per_square_yard": "Square yard",
+    "per_square_meter": "Square meter", "per_marla": "Marla",
+    "per_kanal": "Kanal", "per_acre": "Acre", "per_kila": "Kila",
+    "per_plot": "Plot",
+}
+
+
+def list_khewat_summary(khewat_id: int) -> list[dict[str, Any]]:
+    """Build a schedule-aware, one-row-per-cadastral-reference Khewat summary."""
+    record = get_khewat_details(khewat_id)
+    if not record:
+        return []
+    return summarize_mauza_references(
+        context={field: record.get(field) for field in MAUZA_CONTEXT_FIELDS},
+        square_numbers=record["squares"], kila_numbers=record["kilas"],
+    )
+
+
+def summarize_mauza_references(
+    *, context: dict[str, Any], square_numbers: list[str], kila_numbers: list[str],
+) -> list[dict[str, Any]]:
+    """Build the exportable summary rows for selected cadastral references."""
+    selected_squares = list(dict.fromkeys(_reference_values(",".join(square_numbers))))
+    selected_kilas = list(dict.fromkeys(_reference_values(",".join(kila_numbers))))
+    statement = select(DCValuationRate).options(joinedload(DCValuationRate.location)).join(
+        DCValuationRate.location
+    )
+    statement = _apply_mauza_context(statement, context)
+    with SessionLocal() as session:
+        rates = session.scalars(statement).unique().all()
+    rows: list[dict[str, Any]] = []
+    refs = [("square", value) for value in selected_squares]
+    refs.extend(("kila", value) for value in selected_kilas)
+    for kind, value in refs:
+        field_name = "square_no" if kind == "square" else "kila_no"
+        matching = []
+        for rate in rates:
+            location = rate.location
+            if value in _reference_values(getattr(location, field_name, None)):
+                matching.append(rate)
+        if not matching:
+            rows.append({
+                "mauza": context.get("mauza_name") or "", "square_no": value if kind == "square" else "",
+                "kila_no": value if kind == "kila" else "", "khasra_no": "", "unit": "", "schedule": "",
+            })
+        for rate in matching:
+            location = rate.location
+            rows.append({
+                "mauza": context.get("mauza_name") or "",
+                "square_no": value if kind == "square" else "",
+                "kila_no": value if kind == "kila" else "",
+                "khasra_no": location.khasra_no or "",
+                "unit": AREA_UNIT_DISPLAY_NAMES.get(rate.rate_unit, rate.rate_unit or ""),
+                # Keep the schedule source visible while showing its actual
+                # valuation; a bare "DC" or "FBR" is not useful as a value.
+                "schedule": (
+                    f"{(rate.schedule_type or '').upper()} valuation: Rs. "
+                    f"{format(rate.rate_value.normalize(), 'f')}"
+                ),
+            })
+    for index, row in enumerate(rows, start=1):
+        row["serial_no"] = index
+    return rows
+
+
+def export_khewat_summary(rows: list[dict[str, Any]], file_format: str) -> bytes:
+    """Export Khewat summary rows as PDF, CSV, XLSX, or ODS."""
+    normalized = file_format.strip().lower().lstrip(".")
+    headers = [label for _key, label in KHEWAT_SUMMARY_COLUMNS]
+    values = [[str(row.get(key, "") or "") for key, _label in KHEWAT_SUMMARY_COLUMNS]
+              for row in rows]
+    output = BytesIO()
+    if normalized == "csv":
+        stream = StringIO(newline="")
+        writer = csv.writer(stream)
+        writer.writerow(headers)
+        writer.writerows(values)
+        return stream.getvalue().encode("utf-8-sig")
+    if normalized == "xlsx":
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Khewat Summary"
+        sheet.append(headers)
+        for row in values:
+            sheet.append(row)
+        workbook.save(output)
+        workbook.close()
+        return output.getvalue()
+    if normalized == "ods":
+        try:
+            from odf.opendocument import OpenDocumentSpreadsheet
+            from odf.table import Table, TableCell, TableRow
+            from odf.text import P
+            document = OpenDocumentSpreadsheet()
+            sheet = Table(name="Khewat Summary")
+            for values_row in [headers, *values]:
+                table_row = TableRow()
+                for value in values_row:
+                    cell = TableCell()
+                    if value:
+                        cell.addElement(P(text=value))
+                    table_row.addElement(cell)
+                sheet.addElement(table_row)
+            document.spreadsheet.addElement(sheet)
+            document.write(output)
+            return output.getvalue()
+        except Exception as exc:
+            raise DCRateServiceError(f"Could not create ODS export: {exc}") from exc
+    if normalized == "pdf":
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import landscape, A4
+        from reportlab.lib.units import mm
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+        document = SimpleDocTemplate(output, pagesize=landscape(A4), title="Khewat Summary",
+                                     rightMargin=10 * mm, leftMargin=10 * mm)
+        table = Table([headers, *values], repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#CBD5E1")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1F5F9")]),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        document.build([table])
+        return output.getvalue()
+    raise DCRateServiceError("Choose PDF, CSV, XLSX, or ODS for Khewat export.")
+
+
+def export_khewat_import_template(file_format: str) -> bytes:
+    """Create a blank, headered Khewat import sheet in a supported format."""
+    columns = [
+        ("mauza", "Mauza"), ("district", "District"), ("tehsil", "Tehsil"),
+        ("khewat_number", "Khewat number"), ("rhz_year", "RHZ year"),
+        ("square_no", "Square no"), ("kila_no", "Kila no"),
+    ]
+    headers = [label for _, label in columns]
+    return _export_simple_table(headers, [], file_format, "Khewat Import")
+
+
+def _export_simple_table(headers: list[str], rows: list[list[str]], file_format: str, title: str) -> bytes:
+    """Serialize header and rows for Khewat templates and summary exports."""
+    normalized = file_format.strip().lower().lstrip(".")
+    output = BytesIO()
+    if normalized == "csv":
+        stream = StringIO(newline="")
+        writer = csv.writer(stream)
+        writer.writerow(headers)
+        writer.writerows(rows)
+        return stream.getvalue().encode("utf-8-sig")
+    if normalized == "xlsx":
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = title[:31]
+        sheet.append(headers)
+        for row in rows:
+            sheet.append(row)
+        workbook.save(output)
+        workbook.close()
+        return output.getvalue()
+    if normalized == "ods":
+        try:
+            from odf.opendocument import OpenDocumentSpreadsheet
+            from odf.table import Table, TableCell, TableRow
+            from odf.text import P
+            document = OpenDocumentSpreadsheet()
+            sheet = Table(name=title[:31])
+            for values in [headers, *rows]:
+                table_row = TableRow()
+                for value in values:
+                    cell = TableCell()
+                    if value:
+                        cell.addElement(P(text=str(value)))
+                    table_row.addElement(cell)
+                sheet.addElement(table_row)
+            document.spreadsheet.addElement(sheet)
+            document.write(output)
+            return output.getvalue()
+        except Exception as exc:
+            raise DCRateServiceError(f"Could not create ODS file: {exc}") from exc
+    raise DCRateServiceError("Choose CSV, XLSX, or ODS.")
+
+
+def preview_khewat_import(
+    headers: list[str], rows: list[list[Any]], mapping: dict[str, int | None],
+) -> dict[str, Any]:
+    """Validate mapped Khewat spreadsheet rows without writing to the database."""
+    valid: list[dict[str, str]] = []
+    issues: list[dict[str, Any]] = []
+    if mapping.get("mauza") is None or mapping.get("khewat_number") is None:
+        raise DCRateServiceError("Map both Mauza and Khewat number columns.")
+    if mapping.get("square_no") is None and mapping.get("kila_no") is None:
+        raise DCRateServiceError("Map at least one Square no or Kila no column.")
+    for row_index, row in enumerate(rows, start=2):
+        def field(name: str) -> str:
+            column = mapping.get(name)
+            if column is None or column >= len(row):
+                return ""
+            return _text(row[column])
+        record = {name: field(name) for name in (
+            "mauza", "district", "tehsil", "khewat_number", "rhz_year", "square_no", "kila_no"
+        )}
+        problems = []
+        if not record["mauza"]:
+            problems.append("Mauza is required")
+        if not record["khewat_number"]:
+            problems.append("Khewat number is required")
+        if not record["square_no"] and not record["kila_no"]:
+            problems.append("Square no or Kila no is required")
+        if record["rhz_year"]:
+            try:
+                record["rhz_year"] = normalize_rhz_year(record["rhz_year"])
+            except DCRateServiceError as exc:
+                problems.append(str(exc))
+        if problems:
+            issues.append({"row": row_index, "reason": "; ".join(problems)})
+        else:
+            record["_source_row"] = str(row_index)
+            valid.append(record)
+    return {"valid_records": valid, "issues": issues, "rows_read": len(rows)}
+
+
+def import_khewat_assignments(assignments: list[dict[str, Any]]) -> dict[str, int]:
+    """Validate and import a complete grouped spreadsheet atomically."""
+    if not assignments:
+        raise DCRateServiceError("The import contains no Khewat assignments.")
+    normalized = []
+    for item in assignments:
+        values = _validated_khewat_values(
+            context=item["context"], khewat_number=item["khewat_number"],
+            rhz_year=item["rhz_year"], khewat_size=None,
+            square_numbers=item.get("square_numbers", []),
+            kila_numbers=item.get("kila_numbers", []),
+        )
+        normalized.append((values, item["context"]))
+    created = 0
+    added = 0
+    with SessionLocal.begin() as session:
+        # Validate all references before changing any record, so bad input never
+        # leaves a partially imported workbook.
+        for values, context in normalized:
+            context_values, _number, _year, _size, squares, kilas = values
+            _validate_khewat_references(session, context_values, squares, kilas)
+        for values, _context in normalized:
+            context_values, number, year, _size, squares, kilas = values
+            khewat = session.scalar(select(PropertyKhewat).where(
+                *(getattr(PropertyKhewat, field) == value for field, value in context_values.items()),
+                PropertyKhewat.khewat_number == number,
+                PropertyKhewat.rhz_year == year,
+            ))
+            if khewat is None:
+                khewat = PropertyKhewat(**context_values, khewat_number=number, rhz_year=year)
+                session.add(khewat)
+                session.flush()
+                created += 1
+            existing = {
+                (ref.reference_type, ref.reference_value)
+                for ref in session.scalars(select(KhewatReference).where(
+                    KhewatReference.khewat_id == khewat.id
+                )).all()
+            }
+            for reference_type, reference_value in (
+                [("square", value) for value in squares] + [("kila", value) for value in kilas]
+            ):
+                if (reference_type, reference_value) in existing:
+                    continue
+                session.add(KhewatReference(
+                    khewat_id=khewat.id, reference_type=reference_type,
+                    reference_value=reference_value,
+                ))
+                added += 1
+    return {"created": created, "references_added": added, "assignments": len(normalized)}
+
+
+def find_khewat_year_conflicts(
+    *, context: dict[str, Any], rhz_year: str, exclude_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Find records in the same Mauza and RHZ year before a new save."""
+    criteria = {field: (_text(context.get(field)) or "") for field in MAUZA_CONTEXT_FIELDS}
+    statement = (
+        select(PropertyKhewat)
+        .options(joinedload(PropertyKhewat.references))
+        .where(
+            *(getattr(PropertyKhewat, field) == value for field, value in criteria.items()),
+            PropertyKhewat.rhz_year == normalize_rhz_year(rhz_year),
+        )
+    )
+    if exclude_id is not None:
+        statement = statement.where(PropertyKhewat.id != exclude_id)
+    with SessionLocal() as session:
+        return [_khewat_record(item) for item in session.scalars(statement).unique().all()]
+
+
+def _validated_khewat_values(
+    *, context: dict[str, Any], khewat_number: str,
+    rhz_year: str, khewat_size: str | None,
+    square_numbers: list[str], kila_numbers: list[str], require_references: bool = True,
+) -> tuple[dict[str, str], str, str, str | None, list[str], list[str]]:
+    if not _text(context.get("mauza_name")):
+        raise DCRateServiceError("Select the Mauza that owns this Khewat.")
+    number = _text(khewat_number)
+    if not number:
+        raise DCRateServiceError("Enter a Khewat number.")
+    if len(number) > 100:
+        raise DCRateServiceError("Khewat number cannot exceed 100 characters.")
+    year = normalize_rhz_year(rhz_year)
+    size = normalize_khewat_size(khewat_size)
+    squares = list(dict.fromkeys(_reference_values(",".join(square_numbers))))
+    kilas = list(dict.fromkeys(_reference_values(",".join(kila_numbers))))
+    if require_references and not squares and not kilas:
+        raise DCRateServiceError("Select at least one square or Kila to add to the Khewat.")
+    context_values = {field: (_text(context.get(field)) or "") for field in MAUZA_CONTEXT_FIELDS}
+    return context_values, number, year, size, squares, kilas
+
+
+def _validate_khewat_references(
+    session, context, squares, kilas, *, allowed_existing: dict[str, set[str]] | None = None,
+) -> None:
+    allowed_existing = allowed_existing or {"square_no": set(), "kila_no": set()}
+    for field_name, values in (("square_no", squares), ("kila_no", kilas)):
+        known_values = set(_mauza_cadastral_values_in_session(session, context, field_name))
+        unknown = set(values) - known_values - allowed_existing.get(field_name, set())
+        if unknown:
+            raise DCRateServiceError(
+                f"These {field_name.replace('_no', '').title()} values are not listed for the selected Mauza: "
+                + ", ".join(sorted(unknown))
+            )
+
+
+def assign_cadastral_references_to_khewat(
+    *, context: dict[str, Any], khewat_number: str,
+    rhz_year: str, khewat_size: str | None = None,
+    square_numbers: list[str], kila_numbers: list[str],
+) -> dict[str, Any]:
+    """Create or extend a Khewat record identified by Mauza, number, and RHZ year."""
+    context_values, number, year, size, squares, kilas = _validated_khewat_values(
+        context=context, khewat_number=khewat_number, rhz_year=rhz_year,
+        khewat_size=khewat_size, square_numbers=square_numbers, kila_numbers=kila_numbers,
+    )
+    with SessionLocal.begin() as session:
+        _validate_khewat_references(session, context, squares, kilas)
+        khewat = session.scalar(select(PropertyKhewat).where(
+            *(getattr(PropertyKhewat, field) == value for field, value in context_values.items()),
+            PropertyKhewat.khewat_number == number,
+            PropertyKhewat.rhz_year == year,
+        ))
+        if khewat is None:
+            khewat = PropertyKhewat(**context_values, khewat_number=number, rhz_year=year)
+            session.add(khewat)
+            session.flush()
+        if size is not None:
+            khewat.khewat_size = size
+        existing = {
+            (reference.reference_type, reference.reference_value)
+            for reference in session.scalars(
+                select(KhewatReference).where(KhewatReference.khewat_id == khewat.id)
+            ).all()
+        }
+        requested = [("square", value) for value in squares] + [("kila", value) for value in kilas]
+        added = 0
+        for reference_type, reference_value in requested:
+            if (reference_type, reference_value) in existing:
+                continue
+            session.add(KhewatReference(
+                khewat_id=khewat.id,
+                reference_type=reference_type,
+                reference_value=reference_value,
+            ))
+            added += 1
+    return {
+        "khewat_number": number, "rhz_year": year, "khewat_size": size,
+        "added": added, "existing": len(requested) - added,
+        "squares": squares, "kilas": kilas,
+    }
+
+
+def update_khewat_record(
+    *, khewat_id: int, khewat_number: str, rhz_year: str, khewat_size: str | None,
+    square_numbers: list[str], kila_numbers: list[str],
+) -> dict[str, Any]:
+    """Edit a saved Khewat and replace its selected Square/Kila references."""
+    with SessionLocal.begin() as session:
+        existing = session.get(PropertyKhewat, khewat_id)
+        if existing is None:
+            raise DCRateServiceError("This Khewat no longer exists. Refresh the search results.")
+        context = {field: getattr(existing, field) for field in MAUZA_CONTEXT_FIELDS}
+        context_values, number, year, size, squares, kilas = _validated_khewat_values(
+            context=context, khewat_number=khewat_number, rhz_year=rhz_year,
+            khewat_size=khewat_size, square_numbers=square_numbers, kila_numbers=kila_numbers,
+            require_references=False,
+        )
+        conflict = session.scalar(select(PropertyKhewat.id).where(
+            *(getattr(PropertyKhewat, field) == value for field, value in context_values.items()),
+            PropertyKhewat.khewat_number == number,
+            PropertyKhewat.rhz_year == year,
+            PropertyKhewat.id != khewat_id,
+        ))
+        if conflict is not None:
+            raise DCRateServiceError("A Khewat with this number and RHZ year already exists in this Mauza.")
+        current_refs = session.scalars(
+            select(KhewatReference).where(KhewatReference.khewat_id == khewat_id)
+        ).all()
+        _validate_khewat_references(
+            session, context, squares, kilas,
+            allowed_existing={
+                "square_no": {ref.reference_value for ref in current_refs if ref.reference_type == "square"},
+                "kila_no": {ref.reference_value for ref in current_refs if ref.reference_type == "kila"},
+            },
+        )
+        existing.khewat_number = number
+        existing.rhz_year = year
+        existing.khewat_size = size
+        desired = {("square", value) for value in squares} | {("kila", value) for value in kilas}
+        current = {(ref.reference_type, ref.reference_value): ref for ref in current_refs}
+        removed = 0
+        for key, ref in current.items():
+            if key not in desired:
+                session.delete(ref)
+                removed += 1
+        added = 0
+        for ref_type, value in desired - set(current):
+            session.add(KhewatReference(
+                khewat_id=khewat_id, reference_type=ref_type, reference_value=value,
+            ))
+            added += 1
+    return {"id": khewat_id, "khewat_number": number, "rhz_year": year,
+            "khewat_size": size, "added": added, "removed": removed}
+
+
+def _mauza_cadastral_values_in_session(session, context: dict[str, Any], field_name: str) -> list[str]:
+    field = getattr(PropertyLocation, field_name)
+    statement = (
+        select(field)
+        .join(DCValuationRate, DCValuationRate.location_id == PropertyLocation.id)
+        .where(field.is_not(None), field != "")
+    )
+    stored_values = session.scalars(_apply_mauza_context(statement, context).distinct()).all()
+    return list(dict.fromkeys(
+        token for stored_value in stored_values for token in _reference_values(stored_value)
+    ))
+
+
 def list_cadastral_values(
     field_name: str, *, search: str = "", limit: int = 50,
 ) -> list[str]:
@@ -749,7 +1512,16 @@ def summarize_dc_rates(
     with SessionLocal() as session:
         count, lowest, highest = session.execute(aggregate).one()
         if not count:
-            return {"count": 0, "lowest": None, "highest": None}
+            return {
+                "count": 0, "lowest": None, "highest": None,
+                "lowest_square": None, "highest_square": None,
+                "lowest_kila": None, "highest_kila": None,
+            }
+        cadastral_rows = session.execute(
+            select(PropertyLocation.square_no, PropertyLocation.kila_no)
+            .join(DCValuationRate, DCValuationRate.location_id == PropertyLocation.id)
+            .where(DCValuationRate.id.in_(statement))
+        ).all()
         lowest_record = session.scalar(
             select(DCValuationRate)
             .where(DCValuationRate.id.in_(statement))
@@ -762,8 +1534,28 @@ def summarize_dc_rates(
             .order_by(DCValuationRate.rate_value.desc(), DCValuationRate.id.asc())
             .limit(1)
         )
+    def cadastral_extremes(values: set[str]) -> tuple[str | None, str | None]:
+        ordered = sorted(
+            values,
+            key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else token.casefold()),
+        )
+        return (ordered[0], ordered[-1]) if ordered else (None, None)
+
+    square_values: set[str] = set()
+    kila_values: set[str] = set()
+    for square_value, kila_value in cadastral_rows:
+        try:
+            square_values.update(_reference_values(square_value))
+            kila_values.update(_reference_values(kila_value))
+        except DCRateServiceError:
+            # An invalid legacy range should not hide the saved rate summary.
+            continue
+    lowest_square, highest_square = cadastral_extremes(square_values)
+    lowest_kila, highest_kila = cadastral_extremes(kila_values)
     return {
         "count": count, "lowest": lowest, "highest": highest,
+        "lowest_square": lowest_square, "highest_square": highest_square,
+        "lowest_kila": lowest_kila, "highest_kila": highest_kila,
         "lowest_unit": lowest_record.rate_unit,
         "lowest_schedule": lowest_record.schedule_type,
         "highest_unit": highest_record.rate_unit,

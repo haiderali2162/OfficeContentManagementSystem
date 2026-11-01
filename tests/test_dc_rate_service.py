@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import inspect, text
 
 from core.database import Base
-from core.models import DCValuationRate, PropertyLocation
+from core.models import DCValuationRate, KhewatReference, PropertyKhewat, PropertyLocation
 from services import dc_rate_service
 
 
@@ -449,7 +449,9 @@ def test_primary_schedule_filters_match_mauza_and_cadastral_tokens(rate_database
 
 
 def test_mauza_choices_and_rate_summary_include_both_schedules(rate_database):
-    mauza_id, _ = dc_rate_service.create_location(**_location_values(mauza="Example Mauza"))
+    mauza_id, _ = dc_rate_service.create_location(**_location_values(
+        mauza="Example Mauza", square_no="2-4", kila_no="7, 8",
+    ))
     dc_rate_service.create_dc_rate(
         location_id=mauza_id, **_rate_values(schedule_type="dc", rate_value="100", rate_unit="per_marla")
     )
@@ -465,6 +467,8 @@ def test_mauza_choices_and_rate_summary_include_both_schedules(rate_database):
     assert all_units["lowest_schedule"] == "dc"
     assert Decimal(str(all_units["highest"])) == Decimal("250")
     assert all_units["highest_schedule"] == "fbr"
+    assert (all_units["lowest_square"], all_units["highest_square"]) == ("2", "4")
+    assert (all_units["lowest_kila"], all_units["highest_kila"]) == ("7", "8")
     one_unit = dc_rate_service.summarize_dc_rates(mauza="Example", rate_unit="per_marla")
     assert one_unit["count"] == 1
 
@@ -472,7 +476,192 @@ def test_mauza_choices_and_rate_summary_include_both_schedules(rate_database):
 def test_schedule_summary_reports_empty_results(rate_database):
     assert dc_rate_service.summarize_dc_rates(mauza="No such Mauza") == {
         "count": 0, "lowest": None, "highest": None,
+        "lowest_square": None, "highest_square": None,
+        "lowest_kila": None, "highest_kila": None,
     }
+
+
+def test_mauza_cadastral_selection_summary_and_khewat_assignment(rate_database):
+    context_values = _location_values(
+        mauza="Selection Mauza", name="Selection Mauza", district="Selection District",
+        qanoongoi="Qanoongoi A", patwar_circle="PC A", square_no="10, 12",
+        kila_no="2-4",
+    )
+    location_id, _ = dc_rate_service.create_location(**context_values)
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values(rate_value="100"))
+    context = next(
+        item for item in dc_rate_service.list_mauza_contexts()
+        if item["mauza_name"] == "Selection Mauza"
+    )
+
+    assert dc_rate_service.list_mauza_cadastral_values(context, "square_no") == ["10", "12"]
+    assert dc_rate_service.list_mauza_cadastral_values(context, "kila_no", search="3") == ["3"]
+    result = dc_rate_service.summarize_mauza_cadastral_selection(
+        context=context, square_numbers=["12"], kila_numbers=["3"],
+    )
+    assert result == {
+        "count": 1,
+        "lowest_square": "12", "highest_square": "12",
+        "lowest_kila": "3", "highest_kila": "3",
+        "lowest_rate": Decimal("100.00000000"),
+        "highest_rate": Decimal("100.00000000"),
+    }
+
+    assignment = dc_rate_service.assign_cadastral_references_to_khewat(
+        context=context,
+        khewat_number="30/2/1",
+        rhz_year="2019-20",
+        square_numbers=["10", "12"],
+        kila_numbers=["3", "4"],
+    )
+    assert assignment["added"] == 4
+    assert assignment["existing"] == 0
+    duplicate_assignment = dc_rate_service.assign_cadastral_references_to_khewat(
+        context=context,
+        khewat_number="30/2/1",
+        rhz_year="2019-20",
+        square_numbers=["10", "12"],
+        kila_numbers=["3", "4"],
+    )
+    assert duplicate_assignment["added"] == 0
+    assert duplicate_assignment["existing"] == 4
+    saved_khewat = dc_rate_service.list_khewats_for_mauza(context)[0]
+    assert saved_khewat["id"] == 1
+    assert saved_khewat["khewat_number"] == "30/2/1"
+    assert saved_khewat["rhz_year"] == "2019-20"
+    assert saved_khewat["squares"] == ["10", "12"]
+    assert saved_khewat["kilas"] == ["3", "4"]
+
+    with Session(rate_database) as session:
+        khewat = session.scalar(select(PropertyKhewat))
+        session.delete(khewat)
+        session.commit()
+        assert session.scalars(select(KhewatReference)).all() == []
+
+
+def test_khewat_year_normalization_search_and_edit(rate_database):
+    context = {
+        "province": "Punjab", "district": "District A", "tehsil": "Tehsil A",
+        "qanoongoi": None, "patwar_circle": None, "mauza_name": "Year Mauza",
+        "hadbast_number": "55",
+    }
+    location_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Year Mauza", mauza="Year Mauza", district="District A", tehsil="Tehsil A",
+        hadbast_number="55", square_no="1, 2", kila_no="7, 8",
+    ))
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+    assert dc_rate_service.normalize_rhz_year("2000 - 2001") == "2000-01"
+    assert dc_rate_service.normalize_rhz_year("2019/20") == "2019-20"
+    assert dc_rate_service.normalize_khewat_size(" 12 - 4 - 0 ") == "12-4-0"
+    with pytest.raises(dc_rate_service.DCRateServiceError, match="consecutive"):
+        dc_rate_service.normalize_rhz_year("2019-22")
+
+    dc_rate_service.assign_cadastral_references_to_khewat(
+        context=context, khewat_number="30/2/1", rhz_year="2019-20",
+        khewat_size="12-4-0", square_numbers=["1"], kila_numbers=["7"],
+    )
+    dc_rate_service.assign_cadastral_references_to_khewat(
+        context=context, khewat_number="30/2/1", rhz_year="2020-21",
+        square_numbers=["2"], kila_numbers=["8"],
+    )
+    assert dc_rate_service.latest_rhz_year(context) == "2020-21"
+    assert [item["khewat_number"] for item in dc_rate_service.find_khewat_year_conflicts(
+        context=context, rhz_year="2019 - 2020",
+    )] == ["30/2/1"]
+    assert dc_rate_service.find_khewat_year_conflicts(
+        context=context, rhz_year="2021-22",
+    ) == []
+    assert len(dc_rate_service.search_khewats(
+        mauza="Year Mauza", district="District A", tehsil="Tehsil A",
+        khewat_number="30/2/1",
+    )) == 2
+
+    old_year_record = next(
+        item for item in dc_rate_service.list_khewats_for_mauza(context)
+        if item["rhz_year"] == "2019-20"
+    )
+    outcome = dc_rate_service.update_khewat_record(
+        khewat_id=old_year_record["id"], khewat_number="30/2/1",
+        rhz_year="2000 - 2001", khewat_size="13-0-0",
+        square_numbers=["2"], kila_numbers=[],
+    )
+    assert outcome["rhz_year"] == "2000-01"
+    assert outcome["removed"] == 2
+    updated = dc_rate_service.get_khewat_details(old_year_record["id"])
+    assert updated["khewat_size"] == "13-0-0"
+    assert updated["squares"] == ["2"]
+    assert updated["kilas"] == []
+
+
+def test_saved_khewats_are_in_mauza_choices_and_have_searchable_summaries(rate_database):
+    location_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Saved Only Mauza", mauza="Saved Only Mauza", district="District S",
+        tehsil="Tehsil S", square_no="8", kila_no="2", khasra_no="14/2",
+    ))
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values(rate_unit="per_marla"))
+    context = next(item for item in dc_rate_service.list_mauza_contexts()
+                   if item["mauza_name"] == "Saved Only Mauza")
+    dc_rate_service.assign_cadastral_references_to_khewat(
+        context=context, khewat_number="K-88", rhz_year="2023-24",
+        square_numbers=["8"], kila_numbers=["2"],
+    )
+    rows = dc_rate_service.search_khewats(mauza="Saved Only", khewat_number="K-88")
+    assert len(rows) == 1
+    summary = dc_rate_service.list_khewat_summary(rows[0]["id"])
+    square_summary = next(item for item in summary if item["square_no"] == "8")
+    assert square_summary["khasra_no"] == "14/2"
+    assert square_summary["schedule"].startswith("DC valuation: Rs. ")
+    assert square_summary["unit"] == "Marla"
+    with Session(rate_database) as session:
+        session.query(DCValuationRate).delete()
+        session.commit()
+    assert "Saved Only Mauza" in dc_rate_service.list_saved_khewat_mauzas(search="Only")
+    assert "K-88" in dc_rate_service.list_saved_khewat_numbers(mauza="Saved Only", search="88")
+    assert dc_rate_service.list_mauza_contexts(search="Saved Only")[0]["mauza_name"] == "Saved Only Mauza"
+
+
+def test_khewat_import_preview_export_and_atomic_reference_validation(rate_database):
+    preview = dc_rate_service.preview_khewat_import(
+        ["Mauza", "Khewat no", "RHZ year", "Square", "Kila"],
+        [["Import Mauza", "K-1", "2000 - 2001", "1", ""],
+         ["", "K-2", "bad", "", ""]],
+        {"mauza": 0, "khewat_number": 1, "rhz_year": 2, "square_no": 3, "kila_no": 4},
+    )
+    assert preview["valid_records"][0]["rhz_year"] == "2000-01"
+    assert preview["issues"][0]["row"] == 3
+    template = dc_rate_service.export_khewat_import_template("xlsx")
+    headers, rows = dc_rate_service.read_schedule_spreadsheet(template, "template.xlsx")
+    assert headers[:4] == ["Mauza", "District", "Tehsil", "Khewat number"]
+    assert rows == []
+
+    context = {
+        "province": "Punjab", "district": "", "tehsil": "", "qanoongoi": "",
+        "patwar_circle": "", "mauza_name": "Import Mauza", "hadbast_number": "",
+    }
+    with pytest.raises(dc_rate_service.DCRateServiceError, match="not listed"):
+        dc_rate_service.import_khewat_assignments([{
+            "context": context, "khewat_number": "K-1", "rhz_year": "2000-01",
+            "square_numbers": ["unknown"], "kila_numbers": [],
+        }])
+    assert dc_rate_service.search_khewats(mauza="Import Mauza") == []
+    location_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Import Mauza", mauza="Import Mauza", district="Import District",
+        tehsil="Import Tehsil", square_no="5", kila_no="9",
+    ))
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+    import_context = next(item for item in dc_rate_service.list_mauza_contexts()
+                          if item["mauza_name"] == "Import Mauza")
+    outcome = dc_rate_service.import_khewat_assignments([{
+        "context": import_context, "khewat_number": "K-1", "rhz_year": "2000-01",
+        "square_numbers": ["5"], "kila_numbers": ["9"],
+    }])
+    assert outcome == {"created": 1, "references_added": 2, "assignments": 1}
+    for extension in ("pdf", "csv", "xlsx", "ods"):
+        payload = dc_rate_service.export_khewat_summary([{
+            "serial_no": 1, "mauza": "M", "square_no": "1", "kila_no": "2",
+            "khasra_no": "3", "unit": "per_marla", "schedule": "DC",
+        }], extension)
+        assert payload.startswith(b"%PDF-" if extension == "pdf" else b"PK" if extension == "xlsx" else b"\x50\x4b" if extension == "ods" else b"\xef\xbb\xbf")
 
 
 def _insert_raw_dc_rate(location_id, **overrides):

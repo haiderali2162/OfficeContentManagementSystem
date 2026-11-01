@@ -12,22 +12,42 @@ import flet as ft
 from core.models import DC_RATE_UNITS
 from services.dc_rate_service import (
     DCRateServiceError,
+    MAUZA_CONTEXT_FIELDS,
     create_dc_rate,
     create_location,
     export_schedule_records,
     get_dc_rate,
     import_dc_rate_records,
+    assign_cadastral_references_to_khewat,
+    list_khewats_for_mauza,
+    list_khewat_summary,
+    export_khewat_summary,
+    export_khewat_import_template,
+    preview_khewat_import,
+    import_khewat_assignments,
+    list_saved_khewat_mauzas,
+    list_saved_khewat_numbers,
+    list_mauza_contexts,
     list_cadastral_values,
     list_dc_rates,
     list_locations,
+    list_mauza_cadastral_values,
+    list_rhz_years,
     list_mauza_names,
     find_duplicate_dc_rates,
+    find_khewat_year_conflicts,
+    latest_rhz_year,
+    normalize_rhz_year,
     preview_dc_rate_workbook,
     preview_mapped_schedule,
     read_schedule_spreadsheet,
     remove_duplicate_dc_rates_with_report,
     suggested_column_mapping,
     summarize_dc_rates,
+    summarize_mauza_cadastral_selection,
+    search_khewats,
+    summarize_mauza_references,
+    update_khewat_record,
     update_dc_rate,
 )
 
@@ -46,6 +66,15 @@ UNIT_LABELS = {
 
 def _format_date(value: date | None, *, empty: str = "Not supplied") -> str:
     return value.isoformat() if value else empty
+
+
+def _cadastral_label(record: dict) -> str:
+    """Format cadastral identifiers consistently on rate cards and details."""
+    return " | ".join((
+        f"Square no.: {record.get('square_no') or '—'}",
+        f"Kila no.: {record.get('kila_no') or '—'}",
+        f"Khasra no.: {record.get('khasra_no') or '—'}",
+    ))
 
 
 def build_dc_rates_page(
@@ -214,6 +243,14 @@ def build_dc_rates_page(
                         f"Lowest: {summary['lowest']} {low_unit} ({summary.get('lowest_schedule', '').upper()}) · "
                         f"Highest: {summary['highest']} {high_unit} ({summary.get('highest_schedule', '').upper()})"
                     )
+                if summary["count"] and any(summary.get(key) is not None for key in (
+                    "lowest_square", "highest_square", "lowest_kila", "highest_kila"
+                )):
+                    summary_text += (
+                        f" | Square no. {summary.get('lowest_square') or '-'} to "
+                        f"{summary.get('highest_square') or '-'}; Kila no. "
+                        f"{summary.get('lowest_kila') or '-'} to {summary.get('highest_kila') or '-'}"
+                    )
                 rate_summary.content.value = summary_text
             status_text.value = ""
             if not records and not append:
@@ -348,9 +385,11 @@ def build_dc_rates_page(
             f"Revenue circle: {record.get('revenue_circle') or '—'}",
             f"Floor: {record.get('floor') or '—'}",
             f"Property area / Mauza: {record.get('property_area') or '—'} / {record.get('mauza') or '—'}",
+            _cadastral_label(record),
             f"Location: {record.get('locality') or record['location_name']}",
             f"Classification: {record.get('classification') or '—'}",
-            f"Rate: {record['rate_value']} {UNIT_LABELS[record['rate_unit']]}",
+            f"Valuation: Rs. {record['rate_value']}",
+            f"Unit: {UNIT_LABELS[record['rate_unit']].removeprefix('Per ').title()}",
             f"Published year: {record.get('published_year') or 'Not supplied'}",
             f"Source reference: {record.get('source_reference') or 'Not supplied'}",
             f"Created: {record.get('created_at') or '—'}",
@@ -421,6 +460,11 @@ def build_dc_rates_page(
                             selectable=True,
                         ),
                         ft.Text(location_summary, size=12, color="#475569", selectable=True),
+                        ft.Text(
+                            f"{_cadastral_label(record)} | Unit: "
+                            f"{UNIT_LABELS.get(record['rate_unit'], record['rate_unit']).removeprefix('Per ').title()}",
+                            size=12, color="#475569", selectable=True,
+                        ),
                         ft.Text(
                             f"Published year: {published_year} · Source: {record.get('source_reference') or 'Not supplied'}",
                             size=12,
@@ -1161,6 +1205,728 @@ def build_dc_rates_page(
             page.update()
         return export_schedule
 
+    def open_cadastral_selection_dialog(_=None, *, khewat_record=None):
+        """Select cadastral values or edit a saved Mauza-scoped Khewat."""
+        try:
+            mauza_contexts = list_mauza_contexts()
+        except Exception as exc:
+            status_text.value = f"Could not load Mauza choices: {exc}"
+            page.update()
+            return
+        if not mauza_contexts:
+            status_text.value = "Add or import a schedule with a Mauza before selecting squares and Kilas."
+            page.update()
+            return
+        if khewat_record:
+            record_context = {field: khewat_record.get(field) for field in MAUZA_CONTEXT_FIELDS}
+            if record_context not in mauza_contexts:
+                mauza_contexts.append(record_context)
+
+        if khewat_record:
+            matching_context = next(
+                (index for index, item in enumerate(mauza_contexts)
+                 if item == record_context), 0,
+            )
+        else:
+            matching_context = next(
+                (index for index, item in enumerate(mauza_contexts)
+                 if (item.get("mauza_name") or "").casefold() == (mauza_filter.value or "").casefold()),
+                0,
+            )
+        initial_context = mauza_contexts[matching_context]
+
+        def field_suggestions(field_name: str, query: str = ""):
+            """Filter choices by the other location fields, then by typed text."""
+            criteria = {
+                "mauza_name": (mauza_field.value or "").strip(),
+                "district": (district_field.value or "").strip(),
+                "tehsil": (tehsil_field.value or "").strip(),
+            }
+            candidates = []
+            for context in mauza_contexts:
+                if any(
+                    name != field_name and criteria[name]
+                    and criteria[name].casefold() not in (context.get(name) or "").casefold()
+                    for name in criteria
+                ):
+                    continue
+                value = context.get(field_name) or ""
+                if query.casefold() in value.casefold() and value:
+                    candidates.append(value)
+            return sorted(set(candidates), key=str.casefold)
+
+        mauza_field = ft.AutoComplete(
+            value=initial_context.get("mauza_name") or "", width=240,
+            suggestions_max_height=240, disabled=bool(khewat_record),
+        )
+        district_field = ft.AutoComplete(
+            value=initial_context.get("district") or "", width=220,
+            suggestions_max_height=240, disabled=bool(khewat_record),
+        )
+        tehsil_field = ft.AutoComplete(
+            value=initial_context.get("tehsil") or "", width=220,
+            suggestions_max_height=240, disabled=bool(khewat_record),
+        )
+
+        def refresh_location_suggestions(_=None):
+            for field, key in ((mauza_field, "mauza_name"),
+                               (district_field, "district"), (tehsil_field, "tehsil")):
+                field.suggestions = [
+                    ft.AutoCompleteSuggestion(key=value, value=value)
+                    for value in field_suggestions(key, field.value or "")
+                ]
+            page.update()
+
+        refresh_location_suggestions()
+        square_search = ft.TextField(label="Search squares", expand=True)
+        kila_search = ft.TextField(label="Search Kilas", expand=True)
+        square_checks = ft.Column(height=190, spacing=0, scroll=ft.ScrollMode.AUTO)
+        kila_checks = ft.Column(height=190, spacing=0, scroll=ft.ScrollMode.AUTO)
+        summary_text = ft.Text("Select a Mauza and mark one or more square/Kila values.", size=12)
+        summary_table = ft.DataTable(
+            columns=[ft.DataColumn(label="Summary"), ft.DataColumn(label="Value")],
+            rows=[],
+            column_spacing=22,
+            visible=False,
+        )
+        summary_table_button = ft.TextButton("Show table")
+        khewat_summary_table = ft.DataTable(
+            columns=[ft.DataColumn(label=ft.Text(label)) for _key, label in (
+                ("serial_no", "Sr no"), ("mauza", "Mauza"), ("square_no", "Square no"),
+                ("kila_no", "Kila no"), ("khasra_no", "Khasra no"),
+                ("unit", "Unit"), ("schedule", "Schedule"),
+            )],
+            rows=[], column_spacing=12, horizontal_margin=8,
+        )
+        khewat_summary_rows = []
+        summary_sort_field = ft.Dropdown(
+            label="Sort summary by", value="serial_no", width=180,
+            options=[ft.dropdown.Option(key, label) for key, label in (
+                ("serial_no", "Sr no"), ("mauza", "Mauza"), ("square_no", "Square no"),
+                ("kila_no", "Kila no"), ("khasra_no", "Khasra no"),
+                ("unit", "Unit"), ("schedule", "Schedule"),
+            )],
+        )
+        summary_sort_direction = ft.TextButton("Ascending")
+        selection_count = ft.Text("No cadastral values selected.", size=12, color="#475569")
+        assignment_status = ft.Text("", size=12, color="#475569")
+        saved_khewats = ft.Column(height=100, spacing=3, scroll=ft.ScrollMode.AUTO)
+        khewat_number = ft.TextField(
+            label="Khewat number",
+            hint_text="For example: 30/1 or 30/2/1",
+            max_length=100,
+            value=khewat_record.get("khewat_number") if khewat_record else "",
+        )
+        rhz_year = ft.Dropdown(
+            label="RHZ year",
+            value=khewat_record.get("rhz_year") if khewat_record else None,
+            options=[ft.dropdown.Option(year, year) for year in list_rhz_years()],
+            enable_filter=True,
+            editable=True,
+            menu_height=320,
+            width=220,
+        )
+        khewat_size = ft.TextField(
+            label="Khewat size (optional, K-M-F)",
+            hint_text="For example: 12-4-0",
+            value=khewat_record.get("khewat_size") if khewat_record else "",
+            width=240,
+        )
+        selected_values = {
+            "square": set(khewat_record.get("squares", [])) if khewat_record else set(),
+            "kila": set(khewat_record.get("kilas", [])) if khewat_record else set(),
+        }
+        available_values = {"square": [], "kila": []}
+
+        def selected_context():
+            mauza = (mauza_field.value or "").strip()
+            district = (district_field.value or "").strip()
+            tehsil = (tehsil_field.value or "").strip()
+            if not mauza:
+                raise DCRateServiceError("Choose a Mauza before loading or saving references.")
+            matches = [item for item in mauza_contexts
+                       if (item.get("mauza_name") or "").casefold() == mauza.casefold()]
+            if district:
+                matches = [item for item in matches
+                           if (item.get("district") or "").casefold() == district.casefold()]
+            if tehsil:
+                matches = [item for item in matches
+                           if (item.get("tehsil") or "").casefold() == tehsil.casefold()]
+            if not matches:
+                raise DCRateServiceError("Select a Mauza, District, and Tehsil combination from the suggestions.")
+            return matches[0]
+
+        def update_selection_count():
+            squares = len(selected_values["square"])
+            kilas = len(selected_values["kila"])
+            selection_count.value = f"Selected: {squares} square(s), {kilas} Kila(s)."
+
+        def render_khewat_summary():
+            """Refresh the sortable, export-ready details for selected references."""
+            nonlocal khewat_summary_rows
+            try:
+                khewat_summary_rows = summarize_mauza_references(
+                    context=selected_context(),
+                    square_numbers=sorted(selected_values["square"]),
+                    kila_numbers=sorted(selected_values["kila"]),
+                ) if selected_values["square"] or selected_values["kila"] else []
+                field = summary_sort_field.value or "serial_no"
+                reverse = summary_sort_direction.content == "Descending"
+                khewat_summary_rows.sort(
+                    key=lambda row: str(row.get(field) or "").casefold(), reverse=reverse
+                )
+                for serial_no, row in enumerate(khewat_summary_rows, start=1):
+                    row["serial_no"] = serial_no
+                khewat_summary_table.rows = [ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(str(row.get(key) or "")))
+                    for key in ("serial_no", "mauza", "square_no", "kila_no", "khasra_no", "unit", "schedule")
+                ]) for row in khewat_summary_rows]
+            except Exception as exc:
+                assignment_status.value = f"Could not build Khewat summary: {exc}"
+
+        def change_summary_sort(_=None):
+            render_khewat_summary()
+            page.update()
+
+        def toggle_summary_sort_direction(_=None):
+            summary_sort_direction.content = (
+                "Descending" if summary_sort_direction.content == "Ascending" else "Ascending"
+            )
+            render_khewat_summary()
+            page.update()
+
+        async def export_khewat_rows(file_format: str):
+            try:
+                render_khewat_summary()
+                payload = export_khewat_summary(khewat_summary_rows, file_format)
+                destination = await file_picker.save_file(
+                    dialog_title="Export Khewat summary",
+                    file_name=f"khewat_summary_{date.today().isoformat()}.{file_format}",
+                    allowed_extensions=[file_format], src_bytes=payload,
+                )
+                assignment_status.value = (
+                    f"Exported Khewat summary to {destination}." if destination
+                    else "Export cancelled."
+                )
+            except Exception as exc:
+                assignment_status.value = f"Could not export Khewat summary: {exc}"
+            page.update()
+
+        def export_khewat_handler(file_format: str):
+            async def handler(_=None):
+                await export_khewat_rows(file_format)
+            return handler
+
+        async def save_khewat_template(_=None):
+            try:
+                payload = export_khewat_import_template("xlsx")
+                destination = await file_picker.save_file(
+                    dialog_title="Save Khewat import template",
+                    file_name="khewat_import_template.xlsx",
+                    allowed_extensions=["xlsx"], src_bytes=payload,
+                )
+                assignment_status.value = (
+                    f"Saved Khewat import template to {destination}." if destination
+                    else "Template download cancelled."
+                )
+            except Exception as exc:
+                assignment_status.value = f"Could not create import template: {exc}"
+            page.update()
+
+        async def import_khewat_file(_=None):
+            try:
+                selected_files = await file_picker.pick_files(
+                    dialog_title="Import Khewats", allow_multiple=False,
+                    allowed_extensions=["csv", "xlsx", "ods"],
+                )
+                if not selected_files:
+                    return
+                selected_file = selected_files[0]
+                payload = getattr(selected_file, "bytes", None)
+                if payload is None and getattr(selected_file, "path", None):
+                    payload = Path(selected_file.path).read_bytes()
+                if payload is None:
+                    raise ValueError("The selected file could not be read.")
+                headers, rows = read_schedule_spreadsheet(payload, selected_file.name)
+                field_labels = [
+                    ("mauza", "Mauza (required)"), ("district", "District (optional)"),
+                    ("tehsil", "Tehsil (optional)"), ("khewat_number", "Khewat number (required)"),
+                    ("rhz_year", "RHZ year (optional)"), ("square_no", "Square no"),
+                    ("kila_no", "Kila no"),
+                ]
+                mapping_controls = {}
+                for key, label in field_labels:
+                    mapping_controls[key] = ft.Dropdown(
+                        label=label,
+                        value="none",
+                        options=[ft.dropdown.Option("none", "Not mapped")]
+                        + [ft.dropdown.Option(str(i), header or f"Column {i + 1}")
+                           for i, header in enumerate(headers)],
+                        expand=True,
+                    )
+                suggestions = {
+                    "mauza": ("mauza",), "district": ("district",), "tehsil": ("tehsil",),
+                    "khewat_number": ("khewat_number", "khewat_no", "khewat"),
+                    "rhz_year": ("rhz_year", "year"), "square_no": ("square_no", "square"),
+                    "kila_no": ("kila_no", "kila"),
+                }
+                for key, needles in suggestions.items():
+                    for index, header in enumerate(headers):
+                        normalized_header = "".join(ch for ch in header.casefold() if ch.isalnum())
+                        if any("".join(ch for ch in needle if ch.isalnum()) in normalized_header
+                               for needle in needles):
+                            mapping_controls[key].value = str(index)
+                            break
+
+                def commit_import(_event=None):
+                    try:
+                        mapping = {
+                            key: int(control.value) if control.value != "none" else None
+                            for key, control in mapping_controls.items()
+                        }
+                        preview = preview_khewat_import(headers, rows, mapping)
+                        contexts = list_mauza_contexts()
+                        grouped = {}
+                        issues = list(preview["issues"])
+                        latest_year_defaults = set()
+                        for record in preview["valid_records"]:
+                            row_number = int(record.get("_source_row", "0"))
+                            matches = [ctx for ctx in contexts if (ctx.get("mauza_name") or "").casefold()
+                                       == record["mauza"].casefold()]
+                            if record["district"]:
+                                matches = [ctx for ctx in matches if (ctx.get("district") or "").casefold()
+                                           == record["district"].casefold()]
+                            if record["tehsil"]:
+                                matches = [ctx for ctx in matches if (ctx.get("tehsil") or "").casefold()
+                                           == record["tehsil"].casefold()]
+                            if len(matches) != 1:
+                                issues.append({"row": row_number, "reason": (
+                                    "Mauza context is ambiguous; map District/Tehsil or confirm the Mauza exists."
+                                    if matches else "Mauza does not exist in saved schedules or Khewats."
+                                )})
+                                continue
+                            context = matches[0]
+                            year = record["rhz_year"]
+                            if not year:
+                                year = (rhz_year.text or rhz_year.value or "").strip()
+                            if not year:
+                                year = latest_rhz_year(context) or ""
+                                if year:
+                                    latest_year_defaults.add((context.get("mauza_name") or "", year))
+                            if not year:
+                                issues.append({"row": row_number, "reason": "RHZ year is missing and this Mauza has no saved year."})
+                                continue
+                            try:
+                                year = normalize_rhz_year(year)
+                            except Exception as exc:
+                                issues.append({"row": row_number, "reason": str(exc)})
+                                continue
+                            key = (tuple(context.get(field) or "" for field in MAUZA_CONTEXT_FIELDS),
+                                   record["khewat_number"], year)
+                            group = grouped.setdefault(key, {
+                                "context": context, "khewat_number": record["khewat_number"],
+                                "rhz_year": year, "square_numbers": [], "kila_numbers": [],
+                            })
+                            if record["square_no"]:
+                                group["square_numbers"].append(record["square_no"])
+                            if record["kila_no"]:
+                                group["kila_numbers"].append(record["kila_no"])
+                        if issues:
+                            details = "\n".join(f"Row {item['row']}: {item['reason']}" for item in issues[:12])
+                            assignment_status.value = (
+                                f"Import stopped; fix {len(issues)} invalid row(s) before saving.\n{details}"
+                            )
+                            page.pop_dialog()
+                            page.update()
+                            return
+                        def persist_import(_confirm=None):
+                            try:
+                                outcome = import_khewat_assignments(list(grouped.values()))
+                                assignment_status.value = (
+                                    f"Imported {outcome['assignments']} Khewat group(s), created "
+                                    f"{outcome['created']} record(s), added {outcome['references_added']} reference(s)."
+                                )
+                                render_saved_khewats()
+                                render_khewat_summary()
+                                page.pop_dialog()
+                                page.update()
+                            except Exception as exc:
+                                assignment_status.value = f"Khewat import failed: {exc}"
+                                page.update()
+
+                        if latest_year_defaults:
+                            mauza_years = ", ".join(
+                                f"{mauza}: {year}" for mauza, year in sorted(latest_year_defaults)
+                            )
+                            page.show_dialog(ft.AlertDialog(
+                                modal=True,
+                                title=ft.Text("Use latest saved RHZ year for blank rows?"),
+                                content=ft.Text(
+                                    f"Some imported rows have no year. Use these latest Mauza years? {mauza_years}"
+                                ),
+                                actions=[
+                                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                                    ft.Button("Continue import", on_click=lambda _: (
+                                        page.pop_dialog(), persist_import()
+                                    )),
+                                ],
+                            ))
+                        else:
+                            persist_import()
+                    except Exception as exc:
+                        assignment_status.value = f"Khewat import failed: {exc}"
+                        page.update()
+
+                page.show_dialog(ft.AlertDialog(
+                    modal=True, title=ft.Text("Map Khewat import columns"),
+                    content=ft.Column([
+                        ft.Text("Map Mauza and Khewat number, plus at least one Square/Kila column. "
+                                "RHZ year can be supplied here or from the selected year field. "
+                                "Rows matching Mauza + Khewat + RHZ year add references to that record; "
+                                "existing references are retained."),
+                        *mapping_controls.values(),
+                    ], width=620, height=520, spacing=8, scroll=ft.ScrollMode.AUTO),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                        ft.Button("Validate and import", on_click=commit_import),
+                    ],
+                ))
+                page.update()
+            except Exception as exc:
+                assignment_status.value = f"Could not prepare Khewat import: {exc}"
+                page.update()
+
+        summary_sort_field.on_select = change_summary_sort
+        summary_sort_direction.on_click = toggle_summary_sort_direction
+
+        def render_reference_checks(kind: str):
+            values = available_values[kind]
+            query = (square_search.value if kind == "square" else kila_search.value) or ""
+            filtered_values = [value for value in values if query.casefold() in value.casefold()]
+            target = square_checks if kind == "square" else kila_checks
+            target.controls.clear()
+            if not filtered_values:
+                target.controls.append(ft.Text("No matching values for this Mauza.", size=12, color="#64748B"))
+            for value in filtered_values:
+                target.controls.append(ft.Checkbox(
+                    label=value,
+                    value=value in selected_values[kind],
+                    on_change=lambda event, item=value, category=kind: update_reference_selection(
+                        category, item, event
+                    ),
+                ))
+
+        def update_reference_selection(kind: str, value: str, event):
+            if event.control.value:
+                selected_values[kind].add(value)
+            else:
+                selected_values[kind].discard(value)
+            update_selection_count()
+            render_khewat_summary()
+            summary_text.value = "Selection changed. Choose Show summary to refresh the totals."
+            page.update()
+
+        def toggle_summary_table(_=None):
+            summary_table.visible = not summary_table.visible
+            summary_table_button.content = "Hide table" if summary_table.visible else "Show table"
+            page.update()
+
+        summary_table_button.on_click = toggle_summary_table
+
+        def render_saved_khewats():
+            saved_khewats.controls.clear()
+            for record in list_khewats_for_mauza(selected_context()):
+                saved_khewats.controls.append(ft.Text(
+                    f"Khewat {record['khewat_number']} | RHZ {record.get('rhz_year') or 'year unknown'} "
+                    f"| Size: {record.get('khewat_size') or '-'} "
+                    f"| Squares: {', '.join(record['squares']) or '-'} "
+                    f"| Kilas: {', '.join(record['kilas']) or '-'}",
+                    size=12,
+                ))
+            if not saved_khewats.controls:
+                saved_khewats.controls.append(ft.Text("No Khewat assignments saved for this Mauza yet.", size=12))
+
+        def load_mauza_references(_=None):
+            try:
+                context = selected_context()
+                if not khewat_record:
+                    selected_values["square"].clear()
+                    selected_values["kila"].clear()
+                available_values["square"] = list_mauza_cadastral_values(context, "square_no")
+                available_values["kila"] = list_mauza_cadastral_values(context, "kila_no")
+                if khewat_record:
+                    available_values["square"] = sorted(
+                        set(available_values["square"]) | set(khewat_record.get("squares", []))
+                    )
+                    available_values["kila"] = sorted(
+                        set(available_values["kila"]) | set(khewat_record.get("kilas", []))
+                    )
+                render_reference_checks("square")
+                render_reference_checks("kila")
+                render_saved_khewats()
+                render_khewat_summary()
+                assignment_status.value = ""
+                page.update()
+            except Exception as exc:
+                summary_text.value = f"Could not load cadastral values: {exc}"
+                page.update()
+
+        def clear_selection(_=None):
+            selected_values["square"].clear()
+            selected_values["kila"].clear()
+            render_reference_checks("square")
+            render_reference_checks("kila")
+            update_selection_count()
+            summary_text.value = "Selection cleared."
+            page.update()
+
+        def show_selection_summary(_=None):
+            try:
+                raw_year = (published_year_filter.value or "").strip()
+                year = int(raw_year) if raw_year else None
+                if year is not None and not 1900 <= year <= 2200:
+                    raise ValueError("Published year must be between 1900 and 2200.")
+                schedule_type, _land_type = selected_schedule_filters()
+                result = summarize_mauza_cadastral_selection(
+                    context=selected_context(),
+                    square_numbers=sorted(selected_values["square"]),
+                    kila_numbers=sorted(selected_values["kila"]),
+                    schedule_type=schedule_type,
+                    rate_unit=unit_filter.value if unit_filter.value != "all" else None,
+                    published_year=year,
+                )
+                table_values = [
+                    ("Matching rates", result["count"]),
+                    ("Lowest Square no.", result["lowest_square"] or "-"),
+                    ("Highest Square no.", result["highest_square"] or "-"),
+                    ("Lowest Kila no.", result["lowest_kila"] or "-"),
+                    ("Highest Kila no.", result["highest_kila"] or "-"),
+                    ("Lowest rate", result["lowest_rate"] if result["lowest_rate"] is not None else "-"),
+                    ("Highest rate", result["highest_rate"] if result["highest_rate"] is not None else "-"),
+                ]
+                summary_table.rows = [ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(str(label))), ft.DataCell(ft.Text(str(value))),
+                ]) for label, value in table_values]
+                if not result["count"]:
+                    summary_text.value = "No schedule records match this selection and the current rate filters."
+                else:
+                    summary_text.value = (
+                        f"{result['count']} matching rate(s) | "
+                        f"Square range: {result['lowest_square'] or '-'} to {result['highest_square'] or '-'} | "
+                        f"Kila range: {result['lowest_kila'] or '-'} to {result['highest_kila'] or '-'} | "
+                        f"Rate range: {result['lowest_rate']} to {result['highest_rate']}"
+                    )
+            except (TypeError, ValueError) as exc:
+                summary_text.value = str(exc)
+            except Exception as exc:
+                summary_text.value = f"Could not summarize selection: {exc}"
+            page.update()
+
+        def save_khewat_for_year(year: str):
+            try:
+                if khewat_record:
+                    result = update_khewat_record(
+                        khewat_id=khewat_record["id"],
+                        khewat_number=khewat_number.value or "",
+                        rhz_year=year,
+                        khewat_size=khewat_size.value,
+                        square_numbers=sorted(selected_values["square"]),
+                        kila_numbers=sorted(selected_values["kila"]),
+                    )
+                    assignment_status.value = (
+                        f"Saved Khewat {result['khewat_number']} for RHZ {result['rhz_year']}; "
+                        f"added {result['added']} and removed {result['removed']} reference(s)."
+                    )
+                else:
+                    result = assign_cadastral_references_to_khewat(
+                        context=selected_context(),
+                        khewat_number=khewat_number.value or "",
+                        rhz_year=year,
+                        khewat_size=khewat_size.value,
+                        square_numbers=sorted(selected_values["square"]),
+                        kila_numbers=sorted(selected_values["kila"]),
+                    )
+                    assignment_status.value = (
+                        f"Khewat {result['khewat_number']} for RHZ {result['rhz_year']}: "
+                        f"added {result['added']} reference(s); {result['existing']} were already assigned."
+                    )
+                render_saved_khewats()
+            except Exception as exc:
+                assignment_status.value = f"Could not save Khewat assignment: {exc}"
+            page.update()
+
+        def open_existing_khewat(record):
+            page.pop_dialog()  # Close the conflict prompt.
+            page.pop_dialog()  # Close the new-entry dialog.
+            open_cadastral_selection_dialog(khewat_record=record)
+
+        def check_year_conflicts_and_save(year: str):
+            if khewat_record:
+                save_khewat_for_year(year)
+                return
+            conflicts = find_khewat_year_conflicts(context=selected_context(), rhz_year=year)
+            if not conflicts:
+                save_khewat_for_year(year)
+                return
+            same_number = next(
+                (item for item in conflicts if item["khewat_number"] == (khewat_number.value or "").strip()),
+                None,
+            )
+            if same_number:
+                page.show_dialog(ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Khewat already saved for this RHZ year"),
+                    content=ft.Text(
+                        f"Khewat {same_number['khewat_number']} already exists in this Mauza for {year}. "
+                        "Open it to view or edit, or change the Khewat number to create another record."
+                    ),
+                    actions=[
+                        ft.TextButton("Choose another number", on_click=lambda _: page.pop_dialog()),
+                        ft.Button("View / edit existing", on_click=lambda _: open_existing_khewat(same_number)),
+                    ],
+                ))
+                return
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Khewats already exist for this RHZ year"),
+                content=ft.Text(
+                    f"This Mauza already has {len(conflicts)} Khewat(s) for {year}. "
+                    "You can view or edit an existing Khewat, or continue creating another one."
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.OutlinedButton(
+                        f"View {conflicts[0]['khewat_number']}",
+                        on_click=lambda _: open_existing_khewat(conflicts[0]),
+                    ),
+                    ft.Button(
+                        "Create another Khewat",
+                        on_click=lambda _: (page.pop_dialog(), save_khewat_for_year(year)),
+                    ),
+                ],
+            ))
+
+        def save_khewat_assignment(_=None):
+            raw_year = rhz_year.text or rhz_year.value or ""
+            if not raw_year.strip():
+                try:
+                    latest_year = latest_rhz_year(selected_context())
+                except Exception as exc:
+                    assignment_status.value = f"Could not find the latest RHZ year: {exc}"
+                    page.update()
+                    return
+                if latest_year is None:
+                    assignment_status.value = (
+                        "No RHZ year exists for this Mauza yet. Choose an RHZ year before saving."
+                    )
+                    page.update()
+                    return
+                rhz_year.value = latest_year
+                page.show_dialog(ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Use the latest saved RHZ year?"),
+                    content=ft.Text(
+                        f"No year was selected. The latest year for this Mauza is {latest_year}. "
+                        "Continue with that year?"
+                    ),
+                    actions=[
+                        ft.TextButton("Choose another year", on_click=lambda _: page.pop_dialog()),
+                        ft.Button(
+                            f"Continue with {latest_year}",
+                            on_click=lambda _: (
+                                page.pop_dialog(), check_year_conflicts_and_save(latest_year)
+                            ),
+                        ),
+                    ],
+                ))
+                return
+            try:
+                year = normalize_rhz_year(raw_year)
+                rhz_year.value = year
+                check_year_conflicts_and_save(year)
+            except Exception as exc:
+                assignment_status.value = f"Could not save Khewat: {exc}"
+                page.update()
+
+        square_search.on_change = lambda _: render_reference_checks("square")
+        kila_search.on_change = lambda _: render_reference_checks("kila")
+        def location_field_changed(_=None):
+            refresh_location_suggestions()
+            try:
+                selected_context()
+            except DCRateServiceError:
+                return
+            load_mauza_references()
+
+        for field in (mauza_field, district_field, tehsil_field):
+            field.on_change = location_field_changed
+            field.on_select = load_mauza_references
+        load_mauza_references()
+
+        reference_columns = ft.ResponsiveRow([
+            ft.Container(content=ft.Column([
+                square_search,
+                square_checks,
+            ], spacing=4), col={"xs": 12, "md": 6}),
+            ft.Container(content=ft.Column([
+                kila_search,
+                kila_checks,
+            ], spacing=4), col={"xs": 12, "md": 6}),
+        ], run_spacing=6)
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Select squares and Kilas"),
+            content=ft.Column([
+                ft.Text("Choose one Mauza, search its saved values, then mark any squares and Kilas."),
+                ft.ResponsiveRow([
+                    ft.Container(ft.Column([ft.Text("Mauza"), mauza_field], spacing=2),
+                                 col={"xs": 12, "md": 4}),
+                    ft.Container(ft.Column([ft.Text("District"), district_field], spacing=2),
+                                 col={"xs": 12, "md": 4}),
+                    ft.Container(ft.Column([ft.Text("Tehsil"), tehsil_field], spacing=2),
+                                 col={"xs": 12, "md": 4}),
+                ], run_spacing=4),
+                reference_columns,
+                selection_count,
+                ft.Text("Khewat summary", weight=ft.FontWeight.BOLD, size=13),
+                ft.Row([
+                    summary_sort_field, summary_sort_direction,
+                    ft.OutlinedButton("Export PDF", on_click=export_khewat_handler("pdf")),
+                    ft.OutlinedButton("Export Excel", on_click=export_khewat_handler("xlsx")),
+                    ft.OutlinedButton("Export CSV", on_click=export_khewat_handler("csv")),
+                    ft.OutlinedButton("Export ODS", on_click=export_khewat_handler("ods")),
+                ], wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Container(khewat_summary_table, expand=True, bgcolor="#FFFFFF",
+                             border=ft.Border.all(1, "#E2E8F0"), border_radius=6, padding=6),
+                ft.Row([
+                    ft.OutlinedButton("Clear selection", on_click=clear_selection),
+                    ft.Button("Show summary", on_click=show_selection_summary),
+                    summary_table_button,
+                ], wrap=True),
+                summary_text,
+                summary_table,
+                ft.Divider(),
+                ft.Text("Khewat record", weight=ft.FontWeight.BOLD, size=13),
+                ft.Text("Select the Mauza together with its district and tehsil context.", size=11, color="#64748B"),
+                ft.Row([khewat_number, rhz_year, khewat_size], wrap=True,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Row([
+                    ft.OutlinedButton("Import Khewats (CSV / Excel / ODS)", on_click=import_khewat_file),
+                    ft.TextButton("Download Excel template", on_click=save_khewat_template),
+                ], wrap=True),
+                ft.Button(
+                    "Save Khewat changes" if khewat_record else "Add selected to Khewat",
+                    on_click=save_khewat_assignment,
+                ),
+                assignment_status,
+                ft.Text("Saved Khewats in this Mauza", weight=ft.FontWeight.BOLD, size=13),
+                saved_khewats,
+            ], width=880, height=650, spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[ft.TextButton("Close", on_click=lambda _: close_dialog())],
+        ))
+        page.update()
+
     search_field.on_change = schedule_rates_refresh
     mauza_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="mauza")
     mauza_filter.on_select = schedule_rates_refresh
@@ -1172,6 +1938,135 @@ def build_dc_rates_page(
     unit_filter.on_select = schedule_rates_refresh
     published_year_filter.on_change = schedule_rates_refresh
     load_more_button.on_click = lambda _: schedule_rates_refresh(append=True)
+
+    def open_khewat_search_dialog(_=None):
+        """Search saved Khewats by Mauza, admin area, number, and RHZ year."""
+        mauza_search = ft.AutoComplete(width=220, suggestions_max_height=240)
+        district_search = ft.TextField(label="District", width=190)
+        tehsil_search = ft.TextField(label="Tehsil", width=190)
+        number_search = ft.AutoComplete(width=190, suggestions_max_height=240)
+        year_search = ft.Dropdown(
+            label="RHZ year",
+            value="all",
+            options=[ft.dropdown.Option("all", "All years")]
+            + [ft.dropdown.Option(year, year) for year in list_rhz_years()],
+            enable_filter=True,
+            menu_height=320,
+            width=190,
+        )
+        search_status = ft.Text("Enter any filters, then search saved Khewats.", size=12, color="#475569")
+        results = ft.Column(height=360, spacing=6, scroll=ft.ScrollMode.AUTO)
+
+        def run_search(_=None):
+            results.controls.clear()
+            try:
+                records = search_khewats(
+                    mauza=mauza_search.value or "",
+                    district=district_search.value or "",
+                    tehsil=tehsil_search.value or "",
+                    khewat_number=number_search.value or "",
+                    rhz_year=year_search.value if year_search.value != "all" else None,
+                )
+                search_status.value = f"Found {len(records)} saved Khewat(s)."
+                mauza_search.suggestions = [
+                    ft.AutoCompleteSuggestion(key=name, value=name)
+                    for name in list_saved_khewat_mauzas(search=mauza_search.value or "")
+                ]
+                number_search.suggestions = [
+                    ft.AutoCompleteSuggestion(key=value, value=value)
+                    for value in list_saved_khewat_numbers(
+                        mauza=mauza_search.value or "", search=number_search.value or ""
+                    )
+                ]
+                if not records:
+                    results.controls.append(ft.Text("No Khewats match these filters."))
+                for record in records:
+                    details = (
+                        f"{context_label_for_record(record)} | Khewat {record['khewat_number']} "
+                        f"| RHZ {record.get('rhz_year') or 'year unknown'} "
+                        f"| Size {record.get('khewat_size') or '-'}\n"
+                        f"Squares: {', '.join(record['squares']) or '-'} | "
+                        f"Kilas: {', '.join(record['kilas']) or '-'}"
+                    )
+                    results.controls.append(ft.Container(
+                        padding=10,
+                        bgcolor="#F8FAFC",
+                        border=ft.Border.all(1, "#E2E8F0"),
+                        border_radius=8,
+                        content=ft.Row([
+                            ft.Text(details, selectable=True, expand=True, size=12),
+                            ft.OutlinedButton(
+                                "View / edit",
+                                on_click=lambda _, saved=record: open_saved_khewat(saved),
+                            ),
+                        ], wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ))
+            except Exception as exc:
+                search_status.value = f"Could not search Khewats: {exc}"
+            page.update()
+
+        def context_label_for_record(record):
+            return " | ".join(
+                str(record[field]) for field in ("mauza_name", "district", "tehsil")
+                if record.get(field)
+            )
+
+        def open_saved_khewat(record):
+            page.pop_dialog()
+            open_cadastral_selection_dialog(khewat_record=record)
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Search saved Khewats"),
+            content=ft.Column([
+                ft.ResponsiveRow([
+                    ft.Container(ft.Column([ft.Text("Mauza"), mauza_search], spacing=2),
+                                 col={"xs": 12, "sm": 6, "md": 4}),
+                    ft.Container(district_search, col={"xs": 12, "sm": 6, "md": 4}),
+                    ft.Container(tehsil_search, col={"xs": 12, "sm": 6, "md": 4}),
+                    ft.Container(ft.Column([ft.Text("Khewat number"), number_search], spacing=2),
+                                 col={"xs": 12, "sm": 6, "md": 4}),
+                    ft.Container(year_search, col={"xs": 12, "sm": 6, "md": 4}),
+                ], run_spacing=4),
+                ft.Row([
+                    ft.Button("Search", on_click=run_search),
+                    ft.TextButton("Clear", on_click=lambda _: clear_search_filters()),
+                ], wrap=True),
+                search_status,
+                results,
+            ], width=900, height=570, spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[ft.TextButton("Close", on_click=lambda _: close_dialog())],
+        ))
+
+        def update_khewat_suggestions(_=None):
+            try:
+                mauza_search.suggestions = [
+                    ft.AutoCompleteSuggestion(key=name, value=name)
+                    for name in list_saved_khewat_mauzas(search=mauza_search.value or "")
+                ]
+                number_search.suggestions = [
+                    ft.AutoCompleteSuggestion(key=value, value=value)
+                    for value in list_saved_khewat_numbers(
+                        mauza=mauza_search.value or "", search=number_search.value or ""
+                    )
+                ]
+            except Exception as exc:
+                search_status.value = f"Could not load Khewat suggestions: {exc}"
+            page.update()
+
+        mauza_search.on_change = update_khewat_suggestions
+        number_search.on_change = update_khewat_suggestions
+
+        def clear_search_filters():
+            mauza_search.value = ""
+            district_search.value = ""
+            tehsil_search.value = ""
+            number_search.value = ""
+            year_search.value = "all"
+            run_search()
+
+        run_search()
+        page.update()
 
     import_export_button = ft.TextButton("Show import / export")
     filter_button = ft.TextButton("Show filters")
@@ -1192,6 +2087,8 @@ def build_dc_rates_page(
             ft.OutlinedButton("Add FBR rate", on_click=lambda _: open_rate_dialog(schedule_type="fbr")),
             ft.OutlinedButton("Add location", on_click=open_location_dialog),
             ft.OutlinedButton("Find / remove duplicates", on_click=open_duplicate_cleanup_dialog),
+            ft.OutlinedButton("Select squares / Kilas", on_click=open_cadastral_selection_dialog),
+            ft.OutlinedButton("View Khewats", on_click=open_khewat_search_dialog),
             filter_button,
             import_export_button,
             ft.TextButton("Refresh", on_click=schedule_rates_refresh),

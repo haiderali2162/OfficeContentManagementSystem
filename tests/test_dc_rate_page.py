@@ -3,6 +3,7 @@
 from datetime import date
 import asyncio
 from types import SimpleNamespace
+from types import SimpleNamespace
 
 import flet as ft
 
@@ -187,8 +188,10 @@ def test_edit_button_passes_the_rate_id_explicitly(monkeypatch):
 def test_rate_card_shows_rate_and_location_text(monkeypatch):
     record = _rate_record()
     record["rate_value"] = "12345.00"
+    record.update({"square_no": "7-8", "kila_no": "4", "khasra_no": "21/3"})
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
+    monkeypatch.setattr(dc_rates, "get_dc_rate", lambda _rate_id: record)
     page = FakePage()
 
     root = dc_rates.build_dc_rates_page(page)
@@ -196,6 +199,14 @@ def test_rate_card_shows_rate_and_location_text(monkeypatch):
     assert any("Test Mauza" in value and "DC schedule" in value for value in text_values)
     assert any("Rate: 12345.00" in value for value in text_values)
     assert any("Residential" in value for value in text_values)
+    assert any("Square no.: 7-8" in value and "Kila no.: 4" in value
+               and "Khasra no.: 21/3" in value and "Unit: Marla" in value for value in text_values)
+    next(control for control in _walk(root)
+         if isinstance(control, ft.TextButton) and control.content == "Details").on_click(None)
+    detail_text = [control.value for control in _walk(page.dialogs[-1].content)
+                   if isinstance(control, ft.Text)]
+    assert any("Square no.: 7-8" in value and "Khasra no.: 21/3" in value for value in detail_text)
+    assert "Unit: Marla" in detail_text
 
 
 def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch):
@@ -261,6 +272,184 @@ def test_filter_and_import_export_sections_toggle_independently(monkeypatch):
     assert import_export_panel.visible is True
     assert import_export_button.content == "Hide import / export"
     assert filter_panel.visible is True
+
+
+def test_cadastral_selection_dialog_summarizes_and_saves_slash_khewat(monkeypatch):
+    context = {
+        "province": "Punjab", "district": "Test District", "tehsil": "Test Tehsil",
+        "qanoongoi": None, "patwar_circle": None, "mauza_name": "Test Mauza",
+        "hadbast_number": "123",
+    }
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
+    monkeypatch.setattr(dc_rates, "list_mauza_contexts", lambda: [context])
+    monkeypatch.setattr(dc_rates, "summarize_mauza_references", lambda **kwargs: [
+        {"serial_no": 1, "mauza": "Test Mauza", "square_no": "12", "kila_no": "",
+         "khasra_no": "5", "unit": "Marla", "schedule": "DC valuation: Rs. 100"},
+        {"serial_no": 2, "mauza": "Test Mauza", "square_no": "", "kila_no": "4",
+         "khasra_no": "6", "unit": "Acre", "schedule": "FBR valuation: Rs. 200"},
+    ])
+    monkeypatch.setattr(dc_rates, "list_rhz_years", lambda _context=None: ["2020-21", "2019-20"])
+    monkeypatch.setattr(
+        dc_rates, "list_mauza_cadastral_values",
+        lambda _context, field, **_: ["12"] if field == "square_no" else ["4"],
+    )
+    monkeypatch.setattr(dc_rates, "list_khewats_for_mauza", lambda _context: [])
+    monkeypatch.setattr(dc_rates, "find_khewat_year_conflicts", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "latest_rhz_year", lambda _context: "2020-21")
+    summary_calls = []
+    monkeypatch.setattr(dc_rates, "summarize_mauza_cadastral_selection", lambda **kwargs: (
+        summary_calls.append(kwargs) or {
+            "count": 2,
+            "lowest_square": "12", "highest_square": "12",
+            "lowest_kila": "4", "highest_kila": "4",
+            "lowest_rate": 100, "highest_rate": 200,
+        }
+    ))
+    assignments = []
+    monkeypatch.setattr(dc_rates, "assign_cadastral_references_to_khewat", lambda **kwargs: (
+        assignments.append(kwargs) or {
+            "khewat_number": kwargs["khewat_number"], "added": 2, "existing": 0,
+        }
+    ))
+
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    selection_button = next(control for control in root.controls[2].controls
+                            if isinstance(control, ft.OutlinedButton)
+                            and control.content == "Select squares / Kilas")
+    selection_button.on_click(None)
+    dialog = page.dialogs[-1]
+    controls = list(_walk(dialog.content))
+    location_fields = [control for control in controls if isinstance(control, ft.AutoComplete)]
+    assert len(location_fields) == 3
+    assert {control.value for control in location_fields} == {"Test Mauza", "Test District", "Test Tehsil"}
+    assert {control.value for control in controls if isinstance(control, ft.Text)} >= {
+        "Mauza", "District", "Tehsil"
+    }
+    boxes = [control for control in controls if isinstance(control, ft.Checkbox)]
+    assert [box.label for box in boxes] == ["12", "4"]
+    next(control for control in _walk(dialog.content)
+         if isinstance(control, ft.OutlinedButton) and control.content == "Clear selection").on_click(None)
+    assert all(not control.value for control in _walk(dialog.content)
+               if isinstance(control, ft.Checkbox))
+    boxes = [control for control in _walk(dialog.content) if isinstance(control, ft.Checkbox)]
+    for box in boxes:
+        box.value = True
+        box.on_change(SimpleNamespace(control=box))
+    cadastral_table = next(control for control in _walk(dialog.content)
+                           if isinstance(control, ft.DataTable) and len(control.columns) == 7)
+    assert len(cadastral_table.rows) == 2
+    assert cadastral_table.rows[0].cells[-2].content.value == "Marla"
+    assert cadastral_table.rows[0].cells[-1].content.value == "DC valuation: Rs. 100"
+
+    next(control for control in _walk(dialog.content)
+         if isinstance(control, ft.Button) and control.content == "Show summary").on_click(None)
+    assert summary_calls[0]["square_numbers"] == ["12"]
+    assert summary_calls[0]["kila_numbers"] == ["4"]
+    assert any("Square range: 12 to 12" in (control.value or "")
+               for control in _walk(dialog.content) if isinstance(control, ft.Text))
+    table_button = next(control for control in _walk(dialog.content)
+                        if isinstance(control, ft.TextButton) and control.content == "Show table")
+    table_button.on_click(None)
+    table = next(control for control in _walk(dialog.content)
+                 if isinstance(control, ft.DataTable) and len(control.rows) == 7)
+    assert table.visible is True
+    assert len(table.rows) == 7
+
+    khewat = next(control for control in _walk(dialog.content)
+                  if isinstance(control, ft.TextField) and control.label == "Khewat number")
+    khewat.value = "30/2/1"
+    year = next(control for control in _walk(dialog.content)
+                if isinstance(control, ft.Dropdown) and control.label == "RHZ year")
+    year.value = "2019-20"
+    next(control for control in _walk(dialog.content)
+         if isinstance(control, ft.Button) and control.content == "Add selected to Khewat").on_click(None)
+    assert assignments[0]["khewat_number"] == "30/2/1"
+    assert assignments[0]["rhz_year"] == "2019-20"
+
+    khewat.value = "31/1"
+    year.value = None
+    year.text = ""
+    next(control for control in _walk(dialog.content)
+         if isinstance(control, ft.Button) and control.content == "Add selected to Khewat").on_click(None)
+    confirmation = page.dialogs[-1]
+    assert confirmation.title.value == "Use the latest saved RHZ year?"
+    next(control for control in confirmation.actions
+         if isinstance(control, ft.Button) and control.content == "Continue with 2020-21").on_click(None)
+    assert assignments[1]["khewat_number"] == "31/1"
+    assert assignments[1]["rhz_year"] == "2020-21"
+
+    existing_record = {
+        **context, "id": 8, "khewat_number": "30/2/1", "rhz_year": "2019-20",
+        "khewat_size": None, "squares": ["12"], "kilas": ["4"],
+    }
+    monkeypatch.setattr(dc_rates, "find_khewat_year_conflicts", lambda **_: [existing_record])
+    khewat.value = "32/1"
+    year.value = "2019-20"
+    next(control for control in _walk(dialog.content)
+         if isinstance(control, ft.Button) and control.content == "Add selected to Khewat").on_click(None)
+    conflict_dialog = page.dialogs[-1]
+    assert conflict_dialog.title.value == "Khewats already exist for this RHZ year"
+    next(control for control in conflict_dialog.actions
+         if isinstance(control, ft.Button) and control.content == "Create another Khewat").on_click(None)
+    assert assignments[2]["khewat_number"] == "32/1"
+
+
+def test_main_khewat_search_filters_and_opens_saved_record(monkeypatch):
+    context = {
+        "province": "Punjab", "district": "Test District", "tehsil": "Test Tehsil",
+        "qanoongoi": None, "patwar_circle": None, "mauza_name": "Test Mauza",
+        "hadbast_number": "123",
+    }
+    record = {
+        **context, "id": 42, "khewat_number": "30/1", "rhz_year": "2019-20",
+        "khewat_size": "12-4-0", "squares": ["12"], "kilas": ["4"],
+    }
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
+    monkeypatch.setattr(dc_rates, "search_khewats", lambda **_: [record])
+    monkeypatch.setattr(dc_rates, "list_saved_khewat_mauzas", lambda **_: ["Test Mauza"])
+    monkeypatch.setattr(dc_rates, "list_saved_khewat_numbers", lambda **_: ["30/1"])
+    monkeypatch.setattr(dc_rates, "list_mauza_contexts", lambda: [context])
+    monkeypatch.setattr(dc_rates, "list_rhz_years", lambda _context=None: ["2019-20"])
+    monkeypatch.setattr(
+        dc_rates, "list_mauza_cadastral_values",
+        lambda _context, field, **_: ["12"] if field == "square_no" else ["4"],
+    )
+    monkeypatch.setattr(dc_rates, "list_khewats_for_mauza", lambda _context: [record])
+
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    view_button = next(control for control in root.controls[2].controls
+                       if isinstance(control, ft.OutlinedButton) and control.content == "View Khewats")
+    view_button.on_click(None)
+    search_dialog = page.dialogs[-1]
+    autocomplete = [control for control in _walk(search_dialog.content)
+                    if isinstance(control, ft.AutoComplete)]
+    assert autocomplete[0].suggestions[0].value == "Test Mauza"
+    assert autocomplete[1].suggestions[0].value == "30/1"
+    autocomplete[0].value = "Test"
+    autocomplete[0].on_change(None)
+    assert any(isinstance(control, ft.Dropdown) and control.label == "RHZ year"
+               for control in _walk(search_dialog.content))
+    edit_button = next(control for control in _walk(search_dialog.content)
+                       if isinstance(control, ft.OutlinedButton) and control.content == "View / edit")
+    edit_button.on_click(None)
+    edit_dialog = page.dialogs[-1]
+    fields = list(_walk(edit_dialog.content))
+    assert next(field for field in fields if isinstance(field, ft.TextField)
+                and field.label == "Khewat number").value == "30/1"
+    assert next(field for field in fields if isinstance(field, ft.Dropdown)
+                and field.label == "RHZ year").value == "2019-20"
+    assert next(field for field in fields if isinstance(field, ft.TextField)
+                and field.label == "Khewat size (optional, K-M-F)").value == "12-4-0"
 
 
 def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch):

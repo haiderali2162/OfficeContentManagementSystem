@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import json
 from typing import Any, Callable
 
@@ -17,7 +17,7 @@ import flet as ft
 
 from core.area_engine import AreaSettings
 from core.models import DC_RATE_UNITS
-from services.dc_rate_service import list_locations
+from services.dc_rate_service import list_locations, list_dc_rates
 from services.estimate_service import (
     get_estimate,
     list_client_choices,
@@ -43,6 +43,9 @@ from services.registry_fee_service import (
     create_registry_fee_formula,
     list_registry_fee_formulas,
     update_registry_fee_formula,
+    create_registry_fee_custom_field,
+    list_registry_fee_custom_fields,
+    delete_registry_fee_custom_field,
 )
 from services.valuation_service import ValuationError, calculate_dual_valuation
 
@@ -139,7 +142,7 @@ def build_valuation_page(
                 page.update()
         return export
 
-    location = ft.Dropdown(label="Property location (required)", width=300, options=[
+    location = ft.Dropdown(label="Resolved location", visible=False, options=[
         ft.dropdown.Option(str(item["id"]), " · ".join(str(v) for v in (
             item.get("name"), item.get("district"), item.get("tehsil"), item.get("land_type")
         ) if v)) for item in locations
@@ -150,13 +153,21 @@ def build_valuation_page(
     ])
     # Effective date is fixed to today's date for the streamlined workflow.
     transaction_date = date.today()
-    mauza = ft.TextField(label="Mauza (required)", width=230, read_only=True)
+    property_profile = ft.RadioGroup(value="rural", content=ft.Row([
+        ft.Radio(value="rural", label="Rural"), ft.Radio(value="urban", label="Urban"),
+    ], spacing=16))
+    district = ft.AutoComplete(width=220, suggestions_max_height=220)
+    tehsil = ft.AutoComplete(width=220, suggestions_max_height=220)
+    mauza = ft.AutoComplete(width=240, suggestions_max_height=220)
+    town = ft.AutoComplete(width=220, suggestions_max_height=220)
+    revenue_circle = ft.AutoComplete(width=220, suggestions_max_height=220)
+    property_area = ft.AutoComplete(width=220, suggestions_max_height=220)
+    schedule_location = ft.AutoComplete(width=240, suggestions_max_height=220)
     square_no = ft.TextField(label="Square no.", width=150)
     kila_no = ft.TextField(label="Kila no.", width=150)
     khasra_no = ft.TextField(label="Khasra no. (optional)", width=180)
-    khasra_no.visible = False
-    classification = ft.Dropdown(label="Property classification", width=220, options=[
-        ft.dropdown.Option(value, value) for value in ("Agricultural", "Residential", "Commercial")
+    classification = ft.Dropdown(label="Classification (optional)", width=220, options=[
+        ft.dropdown.Option("none", "All / not specified"),
     ])
     floor = ft.TextField(label="Floor (if applicable)", width=180)
     dc_rate_unit = ft.Dropdown(label="DC rate unit (select explicitly)", width=220, options=[
@@ -165,10 +176,14 @@ def build_valuation_page(
     fbr_rate_unit = ft.Dropdown(label="FBR rate unit (if available)", width=220, options=[
         ft.dropdown.Option(unit, RATE_UNITS[unit]) for unit in DC_RATE_UNITS
     ])
-    area_value = ft.TextField(label="Property area", width=190, hint_text="e.g. 2-5-0")
-    area_unit = ft.Dropdown(label="Area input unit", value="kmf", width=190, options=[
-        ft.dropdown.Option(key, label) for key, label in AREA_UNITS.items()
+    area_value = ft.TextField(label="Area (K-M-F)", width=190, hint_text="For example: 2-5-0")
+    area_unit = ft.Dropdown(label="Area input unit", value="kmf", visible=False, options=[
+        ft.dropdown.Option("kmf", "K-M-F")
     ])
+    dc_rate_choice = ft.Dropdown(label="Matched DC rate", width=360, options=[])
+    fbr_rate_choice = ft.Dropdown(label="Matched FBR rate (editable)", width=360, options=[])
+    location_match = ft.Dropdown(label="Matching schedule location", width=360, options=[], visible=False)
+    rate_match_status = ft.Text("Enter schedule fields to find matching DC and FBR rates.", size=12, color="#475569")
     marla_setting = ft.Dropdown(label="Square feet per marla", value="272", width=210, options=[
         ft.dropdown.Option("272", "272 sq ft"), ft.dropdown.Option("225", "225 sq ft")
     ])
@@ -188,17 +203,168 @@ def build_valuation_page(
             ("unknown", "Unknown"), ("ATL", "ATL"), ("late_filer", "Late filer"), ("non_ATL", "Non-ATL")
         )
     ])
-    def set_location_details(_=None):
-        """Keep the displayed Mauza and formula scope tied to the selected profile."""
-        selected = next((item for item in locations if str(item["id"]) == location.value), None)
-        mauza.value = (selected or {}).get("mauza") or (selected or {}).get("name") or ""
-        square_no.value = (selected or {}).get("square_no") or ""
-        kila_no.value = (selected or {}).get("kila_no") or ""
-        khasra_no.value = (selected or {}).get("khasra_no") or ""
-        khasra_no.visible = str((selected or {}).get("land_type") or "urban").casefold() == "urban"
+    custom_formula_fields: list[dict[str, Any]] = []
+    custom_field_inputs: dict[str, ft.TextField] = {}
+    custom_field_controls = ft.ResponsiveRow(run_spacing=5)
+
+    def render_custom_field_inputs(fields: list[dict[str, Any]]) -> None:
+        """Build numeric form inputs from saved custom formula field definitions."""
+        custom_formula_fields.clear()
+        custom_formula_fields.extend(fields)
+        custom_field_inputs.clear()
+        custom_field_controls.controls.clear()
+        for item in custom_formula_fields:
+            key = item["field_key"]
+            field = ft.TextField(label=item["label"], width=220, hint_text="Optional numeric formula input")
+            custom_field_inputs[key] = field
+            custom_field_controls.controls.append(
+                ft.Container(field, col={"xs": 12, "md": 4})
+            )
+
+    rate_records: dict[str, list[dict[str, Any]]] = {"dc": [], "fbr": []}
+
+    def _text_value(control) -> str:
+        return (control.value or "").strip()
+
+    def _value_matches(candidate: Any, query: str) -> bool:
+        return not query or query.casefold() in str(candidate or "").casefold()
+
+    def _reference_matches(candidate: Any, query: str) -> bool:
+        """Match cadastral identifiers as whole tokens (2 must not match 12)."""
+        if not query:
+            return True
+        tokens = {
+            part.strip().casefold()
+            for part in str(candidate or "").replace(";", ",").split(",")
+            if part.strip()
+        }
+        return query.casefold() in tokens
+
+    def _location_field_matches(item: dict[str, Any], key: str, query: str) -> bool:
+        if key == "locality":
+            # Schedule imports may put a location in either the named
+            # location or its finer locality/detail column.
+            return not query or any(
+                _value_matches(item.get(field), query)
+                for field in ("locality", "name")
+            )
+        if key in {"square_no", "kila_no", "khasra_no"}:
+            return _reference_matches(item.get(key), query)
+        return _value_matches(item.get(key), query)
+
+    def _active_location_fields():
+        if property_profile.value == "rural":
+            return [("district", district), ("tehsil", tehsil), ("mauza", mauza),
+                    ("locality", schedule_location), ("square_no", square_no), ("kila_no", kila_no)]
+        return [("tehsil", tehsil), ("committee_town", town), ("revenue_circle", revenue_circle),
+                ("property_area", property_area), ("locality", schedule_location),
+                ("square_no", square_no), ("kila_no", kila_no), ("khasra_no", khasra_no)]
+
+    def matching_locations():
+        active_fields = _active_location_fields()
+        matches = []
+        for item in locations:
+            if str(item.get("land_type") or "urban").casefold() != property_profile.value:
+                continue
+            if all(_location_field_matches(item, key, _text_value(control))
+                   for key, control in active_fields):
+                matches.append(item)
+        return matches
+
+    def refresh_location_hints(_=None):
+        """Filter type-ahead suggestions from schedule-backed location values."""
+        active = _active_location_fields()
+        for key, control in active:
+            candidates = []
+            for item in locations:
+                if str(item.get("land_type") or "urban").casefold() != property_profile.value:
+                    continue
+                if any(other_key != key and _text_value(other_control)
+                       and not _location_field_matches(item, other_key, _text_value(other_control))
+                       for other_key, other_control in active):
+                    continue
+                raw = item.get(key)
+                values = [part.strip() for part in str(raw or "").replace(";", ",").split(",") if part.strip()]
+                if key == "locality":
+                    values.extend((str(item.get("name") or "").strip(),))
+                query = _text_value(control)
+                candidates.extend(value for value in values if value and _value_matches(value, query))
+            control.suggestions = [ft.AutoCompleteSuggestion(key=value, value=value)
+                                   for value in sorted(set(candidates), key=str.casefold)[:100]]
+
+    def _rate_label(rate: dict[str, Any]) -> str:
+        place = rate.get("mauza") or rate.get("property_area") or rate.get("committee_town") or rate.get("location_name") or "Location"
+        unit = RATE_UNITS.get(rate.get("rate_unit"), rate.get("rate_unit") or "Unit")
+        return f"Rs. {rate.get('rate_value')} / {unit.removeprefix('Per ')} · {rate.get('classification') or rate.get('property_type')} · {place}"
+
+    def refresh_rate_matches(_=None):
+        """Fetch active schedule rows and preselect unique unit/rate matches."""
+        refresh_location_hints()
+        lookup_value = _text_value(mauza) if property_profile.value == "rural" else (
+            _text_value(property_area) or _text_value(town)
+        )
+        candidates = matching_locations() if lookup_value else []
+        if location_match.value and any(str(row["id"]) == location_match.value for row in candidates):
+            candidates = [row for row in candidates if str(row["id"]) == location_match.value]
+        location_match.options = [ft.dropdown.Option(
+            str(row["id"]), " · ".join(str(value) for value in (
+                row.get("name"), row.get("district"), row.get("tehsil"), row.get("mauza"),
+                row.get("committee_town"), row.get("property_area"),
+            ) if value)
+        ) for row in candidates]
+        location_match.visible = len(candidates) > 1
+        if len(candidates) == 1:
+            location_match.value = str(candidates[0]["id"])
+        if not candidates:
+            rate_records["dc"], rate_records["fbr"] = [], []
+            dc_rate_choice.options, fbr_rate_choice.options = [], []
+            dc_rate_choice.value, fbr_rate_choice.value = None, None
+            rate_match_status.value = "No matching schedule location yet. Complete the location fields."
+            page.update()
+            return
+
+        all_rates = [row for item in candidates for schedule in ("dc", "fbr")
+                     for row in list_dc_rates(location_id=int(item["id"]), schedule_type=schedule,
+                                              effective_on=transaction_date)]
+        if classification.value not in (None, "", "none"):
+            all_rates = [row for row in all_rates if str(row.get("classification") or "").casefold()
+                         == classification.value.casefold()]
+        for schedule, unit_control, rate_control in (
+            ("dc", dc_rate_unit, dc_rate_choice), ("fbr", fbr_rate_unit, fbr_rate_choice)
+        ):
+            rows = [row for row in all_rates if row.get("schedule_type") == schedule]
+            units = sorted({row["rate_unit"] for row in rows})
+            unit_control.options = [ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units]
+            if unit_control.value not in units:
+                unit_control.value = units[0] if len(units) == 1 else None
+            rows = [row for row in rows if not unit_control.value or row["rate_unit"] == unit_control.value]
+            rate_records[schedule] = rows
+            rate_control.options = [ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows]
+            if rate_control.value not in {str(row["id"]) for row in rows}:
+                rate_control.value = str(rows[0]["id"]) if len(rows) == 1 else None
+        classes = sorted({str(row.get("classification")) for row in all_rates if row.get("classification")})
+        classification.options = [ft.dropdown.Option("none", "All / not specified")]
+        classification.options.extend(ft.dropdown.Option(value, value) for value in classes)
+        if classification.value not in classes and len(classes) == 1:
+            classification.value = classes[0]
+        selected_dc = next((row for row in rate_records["dc"]
+                            if str(row["id"]) == dc_rate_choice.value), None)
+        if selected_dc:
+            location.value = str(selected_dc["location_id"])
+            rate_match_status.value = f"DC rate found: {_rate_label(selected_dc)}"
+        else:
+            rate_match_status.value = f"{len(rate_records['dc'])} matching DC rate(s); choose a unit or rate if needed."
         page.update()
 
-    location.on_change = set_location_details
+    for control in (district, tehsil, mauza, town, revenue_circle, property_area,
+                    schedule_location, square_no, kila_no, khasra_no, classification,
+                    dc_rate_unit, fbr_rate_unit, location_match):
+        control.on_change = refresh_rate_matches
+        if isinstance(control, ft.AutoComplete):
+            control.on_select = refresh_rate_matches
+    property_profile.on_change = refresh_rate_matches
+    dc_rate_choice.on_select = refresh_rate_matches
+    fbr_rate_choice.on_select = refresh_rate_matches
 
     def show_estimate(estimate_id: int):
         saved = get_estimate(estimate_id)
@@ -287,31 +453,41 @@ def build_valuation_page(
         form_error.value = ""
         last_calculation.clear()
         try:
-            if not location.value:
-                raise ValuationError("Select a property location.")
-            if not classification.value:
-                raise ValuationError("Select a property classification.")
-            selected_location = next(item for item in locations if str(item["id"]) == location.value)
-            selected_mauza = (selected_location.get("mauza") or selected_location.get("name") or "").strip()
+            refresh_rate_matches()
+            dc_rate = next((row for row in rate_records["dc"]
+                            if str(row["id"]) == dc_rate_choice.value), None)
+            if dc_rate is None:
+                raise ValuationError("Complete the location fields and choose a matching DC schedule rate.")
+            selected_location = next(item for item in locations
+                                     if int(item["id"]) == int(dc_rate["location_id"]))
+            selected_mauza = (_text_value(mauza) if property_profile.value == "rural"
+                              else selected_location.get("mauza") or selected_location.get("name") or "").strip()
             if not selected_mauza:
-                raise ValuationError("The selected location must have a Mauza name.")
-            if str(selected_location.get("land_type") or "urban").casefold() != "urban":
-                khasra_no.value = ""
+                selected_mauza = selected_location.get("name") or ""
+            effective_classification = (
+                classification.value if classification.value not in (None, "", "none")
+                else dc_rate.get("classification") or dc_rate.get("property_type")
+            )
             settings = AreaSettings(square_feet_per_marla=int(marla_setting.value))
             material_value = Decimal((building_material_value.value or "0").strip()) if constructed.value else Decimal("0")
             if material_value < 0:
                 raise ValuationError("Building material value cannot be negative.")
             written_value = (registry_written_value.value or "").strip() or None
+            fbr_rate = next((row for row in rate_records["fbr"]
+                             if str(row["id"]) == fbr_rate_choice.value), None)
             valuation = calculate_dual_valuation(
-                location_id=int(location.value),
-                property_type=classification.value,
-                classification=classification.value,
-                floor=(floor.value or "").strip() or None,
+                location_id=int(dc_rate["location_id"]),
+                fbr_location_id=int(fbr_rate["location_id"]) if fbr_rate else None,
+                property_type=effective_classification,
+                classification=effective_classification,
+                floor=dc_rate.get("floor"),
                 transaction_date=transaction_date,
                 area_value=area_value.value,
-                area_unit=area_unit.value,
+                area_unit="kmf",
                 dc_rate_unit=dc_rate_unit.value or None,
                 fbr_rate_unit=fbr_rate_unit.value or None,
+                dc_rate_override=dc_rate,
+                fbr_rate_override=fbr_rate,
                 registry_written_value=written_value,
                 settings=settings,
             )
@@ -320,8 +496,8 @@ def build_valuation_page(
             area_acre = area_kanal / Decimal(8)
             context = {
                 "transaction_type": transaction_type.value,
-                "property_type": classification.value,
-                "classification": classification.value,
+                "property_type": effective_classification,
+                "classification": effective_classification,
                 "land_type": selected_location.get("land_type"),
                 "buyer_filer_status": buyer_filer.value,
                 "seller_filer_status": seller_filer.value,
@@ -338,6 +514,13 @@ def build_valuation_page(
                 "area_acre": area_acre,
                 "area_square_feet": valuation["area_square_feet"],
                 "mauza": selected_mauza,
+                "property_profile": property_profile.value,
+                "district": _text_value(district) or selected_location.get("district"),
+                "tehsil": _text_value(tehsil) or selected_location.get("tehsil"),
+                "town": _text_value(town) or selected_location.get("committee_town"),
+                "revenue_circle": _text_value(revenue_circle) or selected_location.get("revenue_circle"),
+                "property_area": _text_value(property_area) or selected_location.get("property_area"),
+                "location": _text_value(schedule_location) or selected_location.get("locality") or selected_location.get("name"),
                 "square_no": (square_no.value or "").strip() or None,
                 "kila_no": (kila_no.value or "").strip() or None,
                 "khasra_no": (khasra_no.value or "").strip() or None,
@@ -349,6 +532,15 @@ def build_valuation_page(
                 "property_count": 1,
                 "property_unit": "property",
             }
+            custom_values = {}
+            for key, field in custom_field_inputs.items():
+                value = (field.value or "").strip()
+                if value:
+                    try:
+                        custom_values[key] = Decimal(value)
+                    except (InvalidOperation, ValueError):
+                        raise ValueError(f"Custom field '{field.label}' must be a valid number.") from None
+            context.update(custom_values)
             rules = list_tax_fee_rules()
             # Both values are available to rules; each rule explicitly picks
             # DC or FBR as its calculation base. Registry formulas use the same
@@ -358,6 +550,7 @@ def build_valuation_page(
             formulas_result = calculate_registry_fee_formulas(
                 formulas=list_registry_fee_formulas(), effective_on=transaction_date,
                 context=context, jurisdictions=["Punjab", "Punjab, Pakistan"],
+                custom_variables=[field["field_key"] for field in custom_formula_fields],
             )
             charges["charges"].extend(formulas_result["charges"])
             for currency, amount in formulas_result["totals_by_currency"].items():
@@ -369,7 +562,7 @@ def build_valuation_page(
                     f"{item['rule']}: {item['reason']}" for item in charges["skipped_rules"]
                 )
             inputs = {
-                "location_id": int(location.value),
+                "location_id": int(dc_rate["location_id"]),
                 "client_id": int(client.value) if client.value not in (None, "none") else None,
                 "transaction_date": transaction_date,
                 "transaction_type": transaction_type.value,
@@ -378,13 +571,13 @@ def build_valuation_page(
                 "square_no": (square_no.value or "").strip() or None,
                 "kila_no": (kila_no.value or "").strip() or None,
                 "khasra_no": (khasra_no.value or "").strip() or None,
-                "property_type": classification.value,
-                "classification": classification.value,
+                "property_type": effective_classification,
+                "classification": effective_classification,
                 "schedule_type": "dc_and_fbr",
                 "transaction_date_is_automatic": True,
-                "floor": (floor.value or "").strip() or None,
+                "floor": dc_rate.get("floor"),
                 "area_value": area_value.value,
-                "area_unit": area_unit.value,
+                "area_unit": "kmf",
                 "square_feet_per_marla": settings.square_feet_per_marla,
                 "dc_rate_unit": dc_rate_unit.value,
                 "fbr_rate_unit": fbr_rate_unit.value,
@@ -398,6 +591,8 @@ def build_valuation_page(
                 "declared_consideration": valuation["registry_written_value"],
                 "buyer_filer_status": buyer_filer.value,
                 "seller_filer_status": seller_filer.value,
+                "custom_formula_fields": custom_values,
+                "fbr_rate_id": int(fbr_rate["id"]) if fbr_rate else None,
             }
             last_calculation.update({"inputs": inputs, "valuation": valuation, "charges": charges})
             draw_result(valuation, charges)
@@ -474,6 +669,12 @@ def build_valuation_page(
         ])
         formula_error = ft.Text("", color="#B91C1C", size=12)
 
+        def use_plra_formula(_=None):
+            name.value = "PLRA charges"
+            category.value = "plra"
+            expression.value = "3300 if dc_value < 3000000 else dc_value * 0.1%"
+            page.update()
+
         def save_formula(_):
             try:
                 values = {
@@ -502,7 +703,13 @@ def build_valuation_page(
         page.show_dialog(ft.AlertDialog(
             modal=True, title=ft.Text("Registry fee formula"),
             content=ft.Column([
-                ft.Text("Allowed values: area (marlas), area_kanal, area_acre, area_square_feet, dc_value, fbr_value, registry_written_value, building_material_value. Use + - * / and parentheses. X and % notation are supported.", size=12, color="#475569"),
+                ft.Text(
+                    "Built-in values: area (marlas), area_kanal, area_acre, area_square_feet, dc_value, fbr_value, registry_written_value, building_material_value. "
+                    "Use + - * /, parentheses, and numeric conditions. Custom numeric fields are available as formula keys.",
+                    size=12, color="#475569",
+                ),
+                ft.Text("PLRA example supplied by the user (unverified; assumes DC valuation): fixed 3,300 below 3,000,000, otherwise 0.1% of DC valuation.", size=12, color="#9A3412"),
+                ft.OutlinedButton("Use supplied PLRA formula", on_click=use_plra_formula),
                 ft.ResponsiveRow([
                     ft.Container(name, col={"xs": 12, "md": 6}),
                     ft.Container(category, col={"xs": 12, "md": 6}),
@@ -519,41 +726,142 @@ def build_valuation_page(
                      ft.FilledButton("Save formula", on_click=save_formula)],
         ))
 
+    custom_fields_status = ft.Text("", size=12, color="#475569")
+
+    def open_custom_fields_dialog(_=None):
+        """Manage numeric inputs that are exposed to saved fee formulas."""
+        label_field = ft.TextField(label="Field label", width=240)
+        key_field = ft.TextField(label="Formula key", hint_text="e.g. plot_count_extra", width=240)
+        error = ft.Text("", size=12, color="#B91C1C")
+        saved_fields = ft.Column(height=260, spacing=5, scroll=ft.ScrollMode.AUTO)
+
+        def load_fields():
+            saved_fields.controls.clear()
+            try:
+                rows = list_registry_fee_custom_fields()
+                render_custom_field_inputs(rows)
+                if not rows:
+                    saved_fields.controls.append(ft.Text("No custom fields defined yet."))
+                for item in rows:
+                    saved_fields.controls.append(ft.Row([
+                        ft.Text(f"{item['label']}  ·  {item['field_key']}", expand=True),
+                        ft.TextButton("Remove", on_click=lambda _, row=item: remove_field(row)),
+                    ]))
+            except Exception as exc:
+                saved_fields.controls.append(ft.Text(f"Could not load custom fields: {exc}", color="#B91C1C"))
+
+        def add_field(_=None):
+            try:
+                create_registry_fee_custom_field(label=label_field.value, field_key=key_field.value)
+                label_field.value = ""
+                key_field.value = ""
+                error.value = ""
+                load_fields()
+                custom_fields_status.value = "Custom numeric field added. It is now available in the Calculate form and fee formulas."
+                page.update()
+            except (RegistryFeeFormulaError, ValueError) as exc:
+                error.value = str(exc)
+                page.update()
+            except Exception as exc:
+                error.value = f"Could not add custom field: {exc}"
+                page.update()
+
+        def remove_field(item):
+            try:
+                delete_registry_fee_custom_field(item["id"])
+                error.value = ""
+                load_fields()
+                custom_fields_status.value = f"Removed custom field '{item['label']}'."
+            except RegistryFeeFormulaError as exc:
+                error.value = str(exc)
+            page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("Custom formula fields"),
+            content=ft.Column([
+                ft.Text("Custom fields are numeric inputs. Formula keys use lowercase letters, digits, and underscores; fields used by saved formulas cannot be removed."),
+                ft.Row([label_field, key_field, ft.Button("Add field", on_click=add_field)], wrap=True),
+                error, ft.Divider(), saved_fields,
+            ], width=680, height=430, spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[ft.TextButton("Close", on_click=lambda _: page.pop_dialog())],
+        ))
+        load_fields()
+        page.update()
+
+    # These controls form one shared chain: profile-specific location fields
+    # narrow the cached schedule locations, the rate selectors expose the
+    # matching DC/FBR rows, and Calculate passes those exact rows to the
+    # valuation service rather than asking it to guess from a partial address.
+    rural_fields_panel = ft.ResponsiveRow([
+        ft.Container(ft.Column([ft.Text("District"), district]), col={"xs": 12, "md": 4}),
+        ft.Container(ft.Column([ft.Text("Mauza (type to search schedules)"), mauza]), col={"xs": 12, "md": 4}),
+    ], run_spacing=5)
+    urban_fields_panel = ft.ResponsiveRow([
+        ft.Container(ft.Column([ft.Text("Town / city"), town]), col={"xs": 12, "md": 4}),
+        ft.Container(ft.Column([ft.Text("Revenue circle"), revenue_circle]), col={"xs": 12, "md": 4}),
+        ft.Container(ft.Column([ft.Text("Property area"), property_area]), col={"xs": 12, "md": 4}),
+        ft.Container(classification, col={"xs": 12, "md": 4}),
+        ft.Container(khasra_no, col={"xs": 12, "md": 4}),
+    ], run_spacing=5, visible=False)
+    advanced_inputs = ft.ResponsiveRow([
+        ft.Container(client, col={"xs": 12, "md": 6}),
+        ft.Container(registry_written_value, col={"xs": 12, "md": 6}),
+        ft.Container(constructed, col={"xs": 12, "md": 4}),
+        ft.Container(building_material_value, col={"xs": 12, "md": 4}),
+        ft.Container(transaction_type, col={"xs": 12, "md": 4}),
+        ft.Container(buyer_filer, col={"xs": 12, "md": 4}),
+        ft.Container(seller_filer, col={"xs": 12, "md": 4}),
+        ft.Container(floor, col={"xs": 12, "md": 4}),
+        ft.Container(marla_setting, col={"xs": 12, "md": 4}),
+    ], run_spacing=5, visible=False)
+    advanced_button = ft.TextButton("Show advanced calculation fields")
+
+    def toggle_advanced_inputs(_=None):
+        advanced_inputs.visible = not advanced_inputs.visible
+        advanced_button.content = "Hide advanced calculation fields" if advanced_inputs.visible else "Show advanced calculation fields"
+        page.update()
+
+    def switch_property_profile(_=None):
+        is_rural = property_profile.value == "rural"
+        rural_fields_panel.visible = is_rural
+        urban_fields_panel.visible = not is_rural
+        fbr_rate_choice.visible = not is_rural
+        fbr_rate_unit.visible = not is_rural
+        refresh_rate_matches()
+
+    advanced_button.on_click = toggle_advanced_inputs
+    property_profile.on_change = switch_property_profile
+    switch_property_profile()
+
     estimate_form = ft.Column([
         ft.Text("Estimate inputs", size=19, weight=ft.FontWeight.BOLD),
-        ft.Text("Mauza and property location are required. Select a client only when saving. DC and FBR schedules are resolved independently; configured charges select their own DC or FBR base.", size=12, color="#9A3412"),
+        ft.Text("Choose Rural or Urban, enter schedule-backed location details, then enter the area in K-M-F format. Matching DC and FBR rates are fetched from saved schedules.", size=12, color="#9A3412"),
         ft.ResponsiveRow([
-            ft.Container(location, col={"xs": 12, "md": 6}),
-            ft.Container(mauza, col={"xs": 12, "md": 6}),
-            ft.Container(client, col={"xs": 12, "md": 6}),
-            ft.Container(classification, col={"xs": 12, "md": 4}),
-            ft.Container(floor, col={"xs": 12, "md": 4}),
-            ft.Container(area_value, col={"xs": 12, "md": 4}),
-            ft.Container(area_unit, col={"xs": 12, "md": 4}),
-            ft.Container(marla_setting, col={"xs": 12, "md": 4}),
+            ft.Container(property_profile, col=12),
+            ft.Container(rural_fields_panel, col=12),
+            ft.Container(urban_fields_panel, col=12),
+            ft.Container(ft.ResponsiveRow([
+                ft.Container(ft.Column([ft.Text("Tehsil"), tehsil]), col={"xs": 12, "md": 4}),
+                ft.Container(ft.Column([ft.Text("Location"), schedule_location]), col={"xs": 12, "md": 4}),
+                ft.Container(square_no, col={"xs": 12, "md": 2}),
+                ft.Container(kila_no, col={"xs": 12, "md": 2}),
+            ], run_spacing=5), col=12),
+            ft.Container(location_match, col={"xs": 12, "md": 6}),
             ft.Container(dc_rate_unit, col={"xs": 12, "md": 4}),
+            ft.Container(dc_rate_choice, col={"xs": 12, "md": 8}),
             ft.Container(fbr_rate_unit, col={"xs": 12, "md": 4}),
-            ft.Container(square_no, col={"xs": 12, "md": 4}),
-            ft.Container(kila_no, col={"xs": 12, "md": 4}),
-            ft.Container(khasra_no, col={"xs": 12, "md": 4}),
-            ft.Container(registry_written_value, col={"xs": 12, "md": 4}),
-            ft.Container(constructed, col={"xs": 12, "md": 4}),
-            ft.Container(building_material_value, col={"xs": 12, "md": 4}),
-            ft.Container(transaction_type, col={"xs": 12, "md": 4}),
-            ft.Container(buyer_filer, col={"xs": 12, "md": 4}),
-            ft.Container(seller_filer, col={"xs": 12, "md": 4}),
+            ft.Container(fbr_rate_choice, col={"xs": 12, "md": 8}),
+            ft.Container(rate_match_status, col=12),
+            ft.Container(area_value, col={"xs": 12, "md": 4}),
         ], run_spacing=5),
+        advanced_button,
+        advanced_inputs,
+        custom_field_controls,
         ft.Row([ft.Button("Calculate estimate", on_click=calculate),
                 ft.OutlinedButton("Save estimate", on_click=save_current)], wrap=True, spacing=8),
         form_error,
         status,
         ft.Container(result_panel, padding=14, bgcolor="#FFFFFF", border=ft.Border.all(1, "#E2E8F0"), border_radius=10, height=360),
-        ft.Row([
-            ft.Text("Saved registry fee formulas", size=18, weight=ft.FontWeight.BOLD, expand=True),
-            ft.OutlinedButton("Add formula", on_click=lambda _: open_formula_dialog()),
-        ], wrap=True),
-        ft.Text("Formulas are retained in the database, dated, and default to unverified. Examples: area * 2.5% + 2000 or (dc_value * 1.5%) + 500.", size=12, color="#64748B"),
-        formula_list,
         ft.Text("Saved estimate history", size=18, weight=ft.FontWeight.BOLD),
         ft.Row([
             ft.OutlinedButton("Export history CSV", on_click=history_export_handler("csv")),
@@ -618,7 +926,7 @@ def build_valuation_page(
             label="Eligibility / payer / base JSON", multiline=True,
             value=existing.get("eligibility_conditions_json") or '{"base":"transferred_value","payer":"buyer"}',
             width=560, min_lines=2, max_lines=5,
-            helper_text='Percentage bases include property_value, transferred_value, registry_written_value, building_material_value, dc_value, and fbr_value. Per-unit charges match the selected valuation rate unit.',
+            hint_text='Percentage bases include property_value, transferred_value, registry_written_value, building_material_value, dc_value, and fbr_value.',
         )
         error = ft.Text("", color="#B91C1C", size=12)
 
@@ -635,6 +943,22 @@ def build_valuation_page(
 
         method.on_select = update_rule_method
         update_rule_method()
+
+        def use_percentage_preset(label: str):
+            rule_name.value = label
+            category.value = label.casefold().replace(" ", "_")
+            method.value = "percentage"
+            rate.value = ""
+            conditions.value = '{"base":"dc_value","payer":"buyer"}'
+            update_rule_method()
+
+        def use_fixed_preset(_=None):
+            rule_name.value = "Service charge"
+            category.value = "service_charge"
+            method.value = "fixed_amount"
+            fixed.value = ""
+            conditions.value = '{"payer":"other"}'
+            update_rule_method()
 
         def save(_):
             try:
@@ -666,11 +990,24 @@ def build_valuation_page(
             except (TaxRuleError, ValueError, TypeError) as exc:
                 error.value = str(exc)
                 page.update()
+            except Exception as exc:
+                # Keep storage/runtime errors inside the dialog so a failed
+                # write does not escape the Flet click handler and crash UI.
+                error.value = f"Could not save rule: {exc}"
+                page.update()
 
         page.show_dialog(ft.AlertDialog(
             modal=True,
             title=ft.Text("Edit tax/fee rule" if existing.get("id") else "Add tax/fee rule"),
             content=ft.Column([
+                ft.Text("Start with a common rule type. Enter the applicable percentage or amount from your verified source.", size=12, color="#475569"),
+                ft.Row([
+                    ft.OutlinedButton("Stamp fee", on_click=lambda _: use_percentage_preset("Stamp fee")),
+                    ft.OutlinedButton("Committee fee", on_click=lambda _: use_percentage_preset("Committee fee")),
+                    ft.OutlinedButton("236C", on_click=lambda _: use_percentage_preset("236C")),
+                    ft.OutlinedButton("236K", on_click=lambda _: use_percentage_preset("236K")),
+                    ft.OutlinedButton("Fixed service charge", on_click=use_fixed_preset),
+                ], wrap=True),
                 ft.Row([rule_name, category, rule_jurisdiction], wrap=True),
                 ft.Row([method, rate, fixed, rate_unit_field], wrap=True),
                 ft.Row([effective_from, effective_to, minimum, maximum], wrap=True),
@@ -685,6 +1022,15 @@ def build_valuation_page(
         ft.Text("Enter rules from their official source. Verification requires a source and reviewer. The calculator reports estimates and missing eligibility inputs.", size=12, color="#9A3412"),
         ft.Row([ft.Button("Add rule", on_click=lambda _: open_rule_dialog()), ft.TextButton("Refresh", on_click=lambda _: refresh_rules()), rule_status], wrap=True),
         rules_list,
+        ft.Divider(),
+        ft.Row([
+            ft.Text("Custom registry formulas", size=18, weight=ft.FontWeight.BOLD, expand=True),
+            ft.OutlinedButton("Add formula", on_click=lambda _: open_formula_dialog()),
+            ft.OutlinedButton("Manage custom fields", on_click=open_custom_fields_dialog),
+        ], wrap=True),
+        ft.Text("Formula fields are numeric inputs shown on Calculate. Formulas are dated and default to unverified. Example: area * 2.5% + 2000.", size=12, color="#64748B"),
+        custom_fields_status,
+        formula_list,
     ], expand=True)
     rules_list.controls.append(ft.Text("Loading tax and fee rules…", color="#64748B"))
 
@@ -736,12 +1082,13 @@ def build_valuation_page(
     async def load_initial_data():
         """Fetch page data on worker threads so navigation stays responsive."""
         try:
-            loaded_locations, loaded_clients, estimates, rules, formulas = await asyncio.gather(
+            loaded_locations, loaded_clients, estimates, rules, formulas, custom_fields = await asyncio.gather(
                 asyncio.to_thread(list_locations),
                 asyncio.to_thread(list_client_choices),
                 asyncio.to_thread(list_estimates, limit=100),
                 asyncio.to_thread(list_tax_fee_rules),
                 asyncio.to_thread(list_registry_fee_formulas),
+                asyncio.to_thread(list_registry_fee_custom_fields),
             )
             locations.extend(loaded_locations)
             clients.extend(loaded_clients)
@@ -754,6 +1101,11 @@ def build_valuation_page(
             refresh_history(estimates)
             refresh_rules(rules)
             refresh_formulas_with_records(formulas)
+            render_custom_field_inputs(custom_fields)
+            # Populate schedule-backed suggestions immediately on page open.
+            # Rate matching remains empty until the user provides enough detail.
+            refresh_location_hints()
+            refresh_rate_matches()
             page.update()
         except Exception as exc:
             status.value = f"Could not load valuation data: {exc}"

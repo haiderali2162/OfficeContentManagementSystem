@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from sqlalchemy import select
 
 from core.database import SessionLocal
-from core.models import RegistryFeeFormula
+from core.models import RegistryFeeCustomField, RegistryFeeFormula
 
 
 class RegistryFeeFormulaError(ValueError):
@@ -57,12 +57,14 @@ def _normalize_expression(expression: Any) -> str:
     return value
 
 
-def _parse_expression(expression: Any) -> ast.Expression:
+def _parse_expression(expression: Any, allowed_variables: Iterable[str] = ()) -> ast.Expression:
     normalized = _normalize_expression(expression)
     try:
         parsed = ast.parse(normalized, mode="eval")
     except SyntaxError:
         raise RegistryFeeFormulaError("Use numbers, allowed value names, + - * /, and parentheses.") from None
+
+    variable_names = FORMULA_VARIABLES | {str(key).casefold() for key in allowed_variables}
 
     def inspect_node(node: ast.AST) -> None:
         if isinstance(node, ast.Expression):
@@ -71,32 +73,45 @@ def _parse_expression(expression: Any) -> ast.Expression:
             if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
                 raise RegistryFeeFormulaError("Only numeric constants are allowed in a formula.")
         elif isinstance(node, ast.Name):
-            if node.id.casefold() not in FORMULA_VARIABLES:
+            if node.id.casefold() not in variable_names:
                 raise RegistryFeeFormulaError(f"Unknown formula value '{node.id}'.")
         elif isinstance(node, ast.BinOp) and isinstance(
             node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)
         ):
             inspect_node(node.left)
             inspect_node(node.right)
+        elif isinstance(node, ast.IfExp):
+            inspect_node(node.test)
+            inspect_node(node.body)
+            inspect_node(node.orelse)
+        elif isinstance(node, ast.Compare):
+            if len(node.ops) != 1 or not isinstance(
+                node.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)
+            ):
+                raise RegistryFeeFormulaError("Use one numeric comparison in a conditional formula.")
+            inspect_node(node.left)
+            inspect_node(node.comparators[0])
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             inspect_node(node.operand)
         else:
             raise RegistryFeeFormulaError(
-                "Formula functions, attributes, and other Python expressions are not allowed."
+                "Formula functions, attributes, and unsupported Python expressions are not allowed."
             )
 
     inspect_node(parsed)
     return parsed
 
 
-def validate_formula(expression: Any) -> str:
+def validate_formula(expression: Any, allowed_variables: Iterable[str] = ()) -> str:
     """Return a normalized formula after checking its safe arithmetic grammar."""
-    return ast.unparse(_parse_expression(expression))
+    return ast.unparse(_parse_expression(expression, allowed_variables))
 
 
-def evaluate_formula(expression: Any, values: dict[str, Any]) -> Decimal:
+def evaluate_formula(
+    expression: Any, values: dict[str, Any], allowed_variables: Iterable[str] = (),
+) -> Decimal:
     """Evaluate whitelisted arithmetic with Decimal and no Python eval()."""
-    tree = _parse_expression(expression)
+    tree = _parse_expression(expression, allowed_variables)
     normalized_values = {str(key).casefold(): value for key, value in values.items()}
 
     def evaluate(node: ast.AST) -> Decimal:
@@ -119,6 +134,18 @@ def evaluate_formula(expression: Any, values: dict[str, Any]) -> Decimal:
         if isinstance(node, ast.UnaryOp):
             value = evaluate(node.operand)
             return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.IfExp):
+            return evaluate(node.body) if evaluate_condition(node.test) else evaluate(node.orelse)
+        if isinstance(node, ast.Compare):
+            left, right = evaluate(node.left), evaluate(node.comparators[0])
+            operation = node.ops[0]
+            return Decimal(1) if (
+                left < right if isinstance(operation, ast.Lt) else
+                left <= right if isinstance(operation, ast.LtE) else
+                left > right if isinstance(operation, ast.Gt) else
+                left >= right if isinstance(operation, ast.GtE) else
+                left == right if isinstance(operation, ast.Eq) else left != right
+            ) else Decimal(0)
         if isinstance(node, ast.BinOp):
             left, right = evaluate(node.left), evaluate(node.right)
             try:
@@ -139,6 +166,23 @@ def evaluate_formula(expression: Any, values: dict[str, Any]) -> Decimal:
             except InvalidOperation:
                 raise RegistryFeeFormulaError("Formula arithmetic is outside the supported numeric range.") from None
         raise RegistryFeeFormulaError("Unsupported formula expression.")
+
+    def evaluate_condition(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Compare):
+            return evaluate(node) != 0
+        left, right = evaluate(node.left), evaluate(node.comparators[0])
+        operation = node.ops[0]
+        if isinstance(operation, ast.Lt):
+            return left < right
+        if isinstance(operation, ast.LtE):
+            return left <= right
+        if isinstance(operation, ast.Gt):
+            return left > right
+        if isinstance(operation, ast.GtE):
+            return left >= right
+        if isinstance(operation, ast.Eq):
+            return left == right
+        return left != right
 
     result = evaluate(tree)
     if not result.is_finite():
@@ -174,7 +218,7 @@ def _formula_data(values: dict[str, Any]) -> dict[str, Any]:
     if not name or not category or not jurisdiction:
         raise RegistryFeeFormulaError("Formula name, fee category, and jurisdiction are required.")
     formula = str(values.get("formula_expression") or "").strip()
-    _parse_expression(formula)
+    _parse_expression(formula, _registered_custom_field_keys())
     start = _date(values.get("effective_from") or date.today(), "Effective from", required=True)
     end = _date(values.get("effective_to"), "Effective to")
     if end and end < start:
@@ -253,12 +297,64 @@ def list_registry_fee_formulas() -> list[dict[str, Any]]:
         return [_record(item) for item in session.scalars(statement).all()]
 
 
+def _registered_custom_field_keys() -> set[str]:
+    with SessionLocal() as session:
+        return set(session.scalars(select(RegistryFeeCustomField.field_key)).all())
+
+
+def list_registry_fee_custom_fields() -> list[dict[str, Any]]:
+    """List numeric formula inputs in stable display order."""
+    with SessionLocal() as session:
+        rows = session.scalars(select(RegistryFeeCustomField).order_by(
+            RegistryFeeCustomField.label, RegistryFeeCustomField.id
+        )).all()
+        return [{"id": row.id, "field_key": row.field_key, "label": row.label}
+                for row in rows]
+
+
+def create_registry_fee_custom_field(*, label: str, field_key: str) -> int:
+    """Create one numeric custom input available to calculator formulas."""
+    clean_label = str(label or "").strip()
+    key = str(field_key or "").strip().casefold()
+    if not clean_label:
+        raise RegistryFeeFormulaError("Enter a label for the custom field.")
+    if len(clean_label) > 120:
+        raise RegistryFeeFormulaError("Custom field labels must be 120 characters or shorter.")
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,63}", key):
+        raise RegistryFeeFormulaError("Use a formula key with lowercase letters, numbers, and underscores.")
+    if key in FORMULA_VARIABLES:
+        raise RegistryFeeFormulaError("That key is already reserved by a built-in formula value.")
+    with SessionLocal.begin() as session:
+        if session.scalar(select(RegistryFeeCustomField.id).where(
+            RegistryFeeCustomField.field_key == key
+        )):
+            raise RegistryFeeFormulaError(f"The custom field '{key}' already exists.")
+        field = RegistryFeeCustomField(field_key=key, label=clean_label)
+        session.add(field)
+        session.flush()
+        return field.id
+
+
+def delete_registry_fee_custom_field(field_id: int) -> None:
+    """Delete an unused custom formula input; protect fields referenced by formulas."""
+    with SessionLocal.begin() as session:
+        field = session.get(RegistryFeeCustomField, field_id)
+        if field is None:
+            raise RegistryFeeFormulaError("Custom field was not found.")
+        formula_expressions = session.scalars(select(RegistryFeeFormula.formula_expression)).all()
+        pattern = re.compile(rf"\b{re.escape(field.field_key)}\b", re.IGNORECASE)
+        if any(pattern.search(expression or "") for expression in formula_expressions):
+            raise RegistryFeeFormulaError("This field is referenced by a saved formula and cannot be removed.")
+        session.delete(field)
+
+
 def calculate_registry_fee_formulas(
     *,
     formulas: Iterable[dict[str, Any]],
     effective_on: date,
     context: dict[str, Any],
     jurisdictions: Iterable[str] = ("Punjab",),
+    custom_variables: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Calculate date-valid, matching formulas and preserve their source snapshots."""
     accepted_jurisdictions = {str(item).strip().casefold() for item in jurisdictions}
@@ -281,7 +377,9 @@ def calculate_registry_fee_formulas(
         if any(str(context.get(key)).casefold() != str(value).casefold() for key, value in when.items()):
             continue
         try:
-            amount = evaluate_formula(formula["formula_expression"], context)
+            amount = evaluate_formula(
+                formula["formula_expression"], context, allowed_variables=custom_variables
+            )
         except RegistryFeeFormulaError as exc:
             skipped.append({"rule": formula["name"], "reason": str(exc)})
             continue

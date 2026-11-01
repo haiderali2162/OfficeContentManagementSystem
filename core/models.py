@@ -388,6 +388,75 @@ class DCValuationRate(Base):
     )
 
 
+class PropertyKhewat(Base):
+    """A Khewat number and its square/Kila references within a Mauza."""
+
+    __tablename__ = "property_khewats"
+    __table_args__ = (
+        UniqueConstraint(
+            "province", "district", "tehsil", "qanoongoi", "patwar_circle",
+            "mauza_name", "hadbast_number", "khewat_number", "rhz_year",
+            name="uq_property_khewat_mauza_number_year",
+        ),
+        Index("ix_property_khewat_mauza", "mauza_name", "district", "tehsil"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Save the Mauza context as a snapshot: a Khewat can group cadastral
+    # references even when multiple schedule rows describe that same Mauza.
+    province: Mapped[str] = mapped_column(String(120), default="", server_default="", nullable=False)
+    district: Mapped[str] = mapped_column(String(120), default="", server_default="", nullable=False)
+    tehsil: Mapped[str] = mapped_column(String(120), default="", server_default="", nullable=False)
+    qanoongoi: Mapped[str] = mapped_column(String(200), default="", server_default="", nullable=False)
+    patwar_circle: Mapped[str] = mapped_column(String(200), default="", server_default="", nullable=False)
+    mauza_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    hadbast_number: Mapped[str] = mapped_column(String(50), default="", server_default="", nullable=False)
+    # Khewat numbers are identifiers, not quantities; keep them as text so
+    # numbers containing slash segments such as 30/2/1 are preserved.
+    khewat_number: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Nullable only for rows created before RHZ year tracking was introduced.
+    rhz_year: Mapped[Optional[str]] = mapped_column(String(7), index=True)
+    khewat_size: Mapped[Optional[str]] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now,
+        nullable=False,
+    )
+
+    references: Mapped[list["KhewatReference"]] = relationship(
+        back_populates="khewat", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class KhewatReference(Base):
+    """One selected square or Kila attached to a property Khewat."""
+
+    __tablename__ = "khewat_references"
+    __table_args__ = (
+        CheckConstraint(
+            "reference_type IN ('square', 'kila')",
+            name="ck_khewat_reference_type",
+        ),
+        UniqueConstraint(
+            "khewat_id", "reference_type", "reference_value",
+            name="uq_khewat_reference_value",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    khewat_id: Mapped[int] = mapped_column(
+        ForeignKey("property_khewats.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reference_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    reference_value: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    khewat: Mapped["PropertyKhewat"] = relationship(back_populates="references")
+
+
 class TaxFeeRule(Base):
     """Configurable, source-traceable tax or fee rule; unverified by default."""
 
@@ -514,6 +583,26 @@ class RegistryFeeFormula(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class RegistryFeeCustomField(Base):
+    """User-defined numeric input that saved fee formulas may reference."""
+
+    __tablename__ = "registry_fee_custom_fields"
+    __table_args__ = (
+        UniqueConstraint("field_key", name="uq_registry_fee_custom_field_key"),
+        CheckConstraint(
+            "field_key GLOB '[a-z_]*' AND field_key NOT GLOB '*[^a-z0-9_]*'",
+            name="ck_registry_fee_custom_field_key_format",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    field_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
 
 

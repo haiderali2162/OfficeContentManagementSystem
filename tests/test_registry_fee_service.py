@@ -59,3 +59,40 @@ def test_formulas_match_mauza_and_square_scope():
         effective_on=date(2026, 1, 1), context={"mauza": "Example", "square_no": "7", "dc_value": 10000},
     )
     assert result["totals_by_currency"]["PKR"] == Decimal("100.00")
+
+
+def test_custom_numeric_fields_can_be_used_in_saved_formulas(formula_database):
+    field_id = formula_service.create_registry_fee_custom_field(
+        label="Additional plots", field_key="additional_plots"
+    )
+    formula_id = formula_service.create_registry_fee_formula(
+        name="Additional plot fee", category="custom",
+        formula_expression="additional_plots * 500", jurisdiction="Punjab",
+        effective_from="2025-01-01",
+    )
+
+    formula = formula_service.list_registry_fee_formulas()[0]
+    result = formula_service.calculate_registry_fee_formulas(
+        formulas=[formula], effective_on=date(2026, 1, 1),
+        context={"additional_plots": Decimal("3")},
+        custom_variables=["additional_plots"],
+    )
+
+    assert formula_id > 0
+    assert result["totals_by_currency"]["PKR"] == Decimal("1500.00")
+    assert formula_service.list_registry_fee_custom_fields()[0]["id"] == field_id
+    with pytest.raises(formula_service.RegistryFeeFormulaError, match="referenced"):
+        formula_service.delete_registry_fee_custom_field(field_id)
+
+
+@pytest.mark.parametrize(
+    ("dc_value", "expected"),
+    [(Decimal("2999999"), Decimal("3300.00")),
+     (Decimal("3000000"), Decimal("3000.00"))],
+)
+def test_user_supplied_plra_formula_condition(dc_value, expected):
+    result = formula_service.evaluate_formula(
+        "3300 if dc_value < 3000000 else dc_value * 0.1%",
+        {"dc_value": dc_value},
+    )
+    assert result == expected

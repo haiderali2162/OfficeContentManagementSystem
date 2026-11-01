@@ -1,5 +1,11 @@
-still ui is not good enough.
-1. make the import/export section collapsable hide/show option.
-2. also the filer option, make it show/hide.
-3. make sure the cards with details of the properties should always be visible on the screen.
-4. remove the "valuaiton & taxes" ribbon at the very top only on "DC / FBR rates" tab or show/hide option whichever is better and professional.
+on the "add tax/fee rule" dialog, make the following changes:
+	1. remove source reference, source date, verified, verified by fields, effective from, effective to. as these are unnecessary fields.
+	2. if a rule is successfully saved, show a snackbar and clear the fields.
+	3. all these rules must be used to calculate the total valuation of a deed.
+	4. under the "add rule" button there is a large gray box, it does not show anything, please fix it and make it responsive.
+
+on the calculate page make the following changes:
+	1. square no does not shows hint or list of available square no in the selected mauza so make it available, also under the selected square in killa no show the relevent killa no hints also.
+	2. dc rate unit field is not showing anything fix it also.
+	3. matched dc rate is also not working, it is not showing anything,fix it also.
+	4. under these, there is a white bar which does not show any thing, fix it.
