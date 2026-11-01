@@ -6,11 +6,14 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 import csv
+import os
+import sys
 import re
+from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import joinedload
 
 from core.database import SessionLocal
@@ -372,6 +375,9 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
         "id": rate.id,
         "location_id": rate.location_id,
         "location_name": location.name if location else "Unassigned",
+        "location_notes": location.notes if location else None,
+        "location_created_at": location.created_at if location else None,
+        "location_updated_at": location.updated_at if location else None,
         "province": location.province if location else None,
         "district": location.district if location else None,
         "tehsil": location.tehsil if location else None,
@@ -409,9 +415,153 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
     }
 
 
+def _duplicate_value(value: Any) -> Any:
+    """Normalize text for duplicate identity while preserving typed values."""
+    if isinstance(value, str):
+        return " ".join(value.split()).casefold()
+    return value
+
+
+def _duplicate_key(rate: DCValuationRate) -> tuple[Any, ...]:
+    """Build the explicit rural key or strict full-row key requested by the UI."""
+    location = rate.location
+    if rate.schedule_type == "dc" and location and (location.land_type or "").casefold() == "rural":
+        # Rural DC schedules identify a row within its Mauza by cadastral
+        # numbers, location, classification, and unit. Administrative context
+        # avoids colliding with similarly named Mauzas in other districts.
+        location_key = tuple(_duplicate_value(getattr(location, field)) for field in (
+            "province", "district", "tehsil", "qanoongoi", "patwar_circle",
+            "mauza", "square_no", "kila_no", "khasra_no", "name", "locality",
+        ))
+        return (
+            "rural_dc", location_key,
+            _duplicate_value(rate.classification or rate.property_type),
+            _duplicate_value(rate.rate_unit),
+        )
+
+    # Urban DC and FBR rows are duplicates only when all source values match.
+    # Surrogate IDs and audit timestamps differ on repeated inserts, so exclude
+    # those while retaining every substantive schedule and location column.
+    rate_values = tuple(
+        (column.name, _duplicate_value(getattr(rate, column.name)))
+        for column in DCValuationRate.__table__.columns
+        if column.name not in {"id", "location_id", "created_at", "updated_at"}
+    )
+    location_values = tuple(
+        (column.name, _duplicate_value(getattr(location, column.name)) if location else None)
+        for column in PropertyLocation.__table__.columns
+        if column.name not in {"id", "created_at", "updated_at"}
+    )
+    return "strict", rate_values, location_values
+
+
+def _duplicate_rate_groups(session) -> list[list[DCValuationRate]]:
+    rows = session.scalars(
+        select(DCValuationRate)
+        .options(joinedload(DCValuationRate.location))
+        .order_by(DCValuationRate.id)
+    ).unique().all()
+    grouped: dict[tuple[Any, ...], list[DCValuationRate]] = {}
+    for rate in rows:
+        grouped.setdefault(_duplicate_key(rate), []).append(rate)
+    return [group for group in grouped.values() if len(group) > 1]
+
+
+def find_duplicate_dc_rates() -> list[dict[str, Any]]:
+    """List duplicate rows that would be removed, preserving the first row."""
+    with SessionLocal() as session:
+        duplicate_rows: list[dict[str, Any]] = []
+        for group in _duplicate_rate_groups(session):
+            survivor_id = group[0].id
+            for duplicate in group[1:]:
+                record = _record_dict(duplicate)
+                record["duplicate_of"] = survivor_id
+                duplicate_rows.append(record)
+        return duplicate_rows
+
+
+def _documents_directory() -> Path:
+    """Resolve the user's Documents folder on Windows, macOS, or Linux."""
+    if sys.platform == "win32":
+        user_profile = os.environ.get("USERPROFILE")
+        base = Path(user_profile) if user_profile else Path.home()
+        return base / "Documents"
+    if sys.platform == "darwin":
+        return Path.home() / "Documents"
+
+    # Linux desktop environments may move Documents via XDG user directories.
+    config_file = Path.home() / ".config" / "user-dirs.dirs"
+    try:
+        for line in config_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("XDG_DOCUMENTS_DIR="):
+                configured = line.partition("=")[2].strip().strip('"')
+                configured = configured.replace("$HOME", str(Path.home()))
+                resolved = Path(configured).expanduser()
+                if resolved.is_absolute():
+                    return resolved
+    except OSError:
+        pass
+    return Path.home() / "Documents"
+
+
+def remove_duplicate_dc_rates_with_report(file_format: str) -> tuple[int, Path | None]:
+    """Export duplicate row values to Documents, then remove the extra rows.
+
+    If report generation fails, no database rows are deleted. The lowest ID in
+    each duplicate group is retained, and SQLAlchemy's SET NULL policy keeps
+    historical estimate snapshots valid when duplicate rate links are removed.
+    """
+    if file_format not in {"csv", "xlsx", "ods"}:
+        raise DCRateServiceError("Choose CSV, Excel, or ODS for the duplicate report.")
+
+    report_path: Path | None = None
+    try:
+        with SessionLocal.begin() as session:
+            groups = _duplicate_rate_groups(session)
+            duplicates = [
+                (survivor, duplicate)
+                for group in groups
+                for survivor, duplicate in ((group[0], row) for row in group[1:])
+            ]
+            if not duplicates:
+                return 0, None
+
+            report_records = []
+            for survivor, duplicate in duplicates:
+                record = _record_dict(duplicate)
+                record["duplicate_of"] = survivor.id
+                report_records.append(record)
+            payload = export_schedule_records(report_records, file_format)
+
+            documents_dir = _documents_directory()
+            documents_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            report_path = documents_dir / f"dc_rate_duplicates_removed_{timestamp}.{file_format}"
+            # Exclusive creation prevents overwriting a prior audit report.
+            with report_path.open("xb") as report_file:
+                report_file.write(payload)
+
+            for _survivor, duplicate in duplicates:
+                session.delete(duplicate)
+        return len(duplicates), report_path
+    except Exception:
+        # A report is created before deletion so the removed values are never
+        # lost. If the DB transaction fails, remove only the report we created.
+        if report_path is not None:
+            try:
+                report_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
 SCHEDULE_EXPORT_COLUMNS = (
+    ("id", "Record ID"),
+    ("duplicate_of", "Duplicate of record ID"),
+    ("location_id", "Location ID"),
     ("schedule_type", "Schedule"),
     ("serial_no", "Serial no."),
+    ("province", "Province"),
     ("district", "District"),
     ("tehsil", "Tehsil"),
     ("land_type", "Rural or urban"),
@@ -426,13 +576,26 @@ SCHEDULE_EXPORT_COLUMNS = (
     ("floor", "Floor"),
     ("property_area", "Property area"),
     ("location_name", "Location"),
+    ("locality", "Location detail"),
+    ("hadbast_number", "Hadbast number"),
     ("classification", "Land classification"),
     ("rate_value", "Schedule rate"),
     ("rate_unit", "Unit"),
     ("structure_rate", "Structure rate"),
     ("per_marla_value", "Per marla valuation"),
+    ("effective_from", "Effective from"),
+    ("effective_to", "Effective to"),
     ("published_year", "Published year"),
     ("source_reference", "Schedule reference"),
+    ("source_date", "Source date"),
+    ("verification_status", "Verification status"),
+    ("verified_at", "Verified at"),
+    ("verified_by", "Verified by"),
+    ("location_notes", "Location notes"),
+    ("location_created_at", "Location created at"),
+    ("location_updated_at", "Location updated at"),
+    ("created_at", "Rate created at"),
+    ("updated_at", "Rate updated at"),
 )
 
 
@@ -511,6 +674,101 @@ def list_locations() -> list[dict[str, Any]]:
             }
             for location in locations
         ]
+
+
+def list_mauza_names(*, search: str = "", limit: int = 50) -> list[str]:
+    """Return distinct Mauza values that have at least one DC or FBR rate."""
+    statement = (
+        select(PropertyLocation.mauza)
+        .join(DCValuationRate, DCValuationRate.location_id == PropertyLocation.id)
+        .where(PropertyLocation.mauza.is_not(None), PropertyLocation.mauza != "")
+        .distinct()
+        .order_by(PropertyLocation.mauza)
+    )
+    if search.strip():
+        statement = statement.where(PropertyLocation.mauza.ilike(f"%{search.strip()}%"))
+    statement = statement.limit(max(1, limit))
+    with SessionLocal() as session:
+        return list(session.scalars(statement).all())
+
+
+def list_cadastral_values(
+    field_name: str, *, search: str = "", limit: int = 50,
+) -> list[str]:
+    """Return matching Square, Kila, or Khasra tokens present in saved schedules."""
+    fields = {
+        "square_no": PropertyLocation.square_no,
+        "kila_no": PropertyLocation.kila_no,
+        "khasra_no": PropertyLocation.khasra_no,
+    }
+    field = fields.get(field_name)
+    if field is None:
+        raise DCRateServiceError("Choose Square no., Kila no., or Khasra no. for suggestions.")
+    statement = (
+        select(field)
+        .join(DCValuationRate, DCValuationRate.location_id == PropertyLocation.id)
+        .where(field.is_not(None), field != "")
+        .distinct()
+    )
+    query = search.strip()
+    if query:
+        statement = statement.where(field.ilike(f"%{query}%"))
+    with SessionLocal() as session:
+        stored_values = session.scalars(statement).all()
+    tokens = {
+        token
+        for stored_value in stored_values
+        for token in _reference_values(stored_value)
+        if not query or token.casefold().startswith(query.casefold())
+    }
+    return sorted(tokens, key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else token.casefold()))[:max(1, limit)]
+
+
+def summarize_dc_rates(
+    *, mauza: str = "", rate_unit: str | None = None,
+    schedule_type: str | None = None, land_type: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate rate extremes for the selected Mauza, unit, and schedule."""
+    statement = (
+        select(DCValuationRate.id)
+        .join(PropertyLocation, DCValuationRate.location_id == PropertyLocation.id)
+    )
+    if mauza.strip():
+        statement = statement.where(PropertyLocation.mauza.ilike(f"%{mauza.strip()}%"))
+    if rate_unit:
+        statement = statement.where(DCValuationRate.rate_unit == rate_unit)
+    if schedule_type in {"dc", "fbr"}:
+        statement = statement.where(DCValuationRate.schedule_type == schedule_type)
+    if land_type in {"rural", "urban"}:
+        statement = statement.where(PropertyLocation.land_type == land_type)
+    aggregate = select(
+        func.count(DCValuationRate.id),
+        func.min(DCValuationRate.rate_value),
+        func.max(DCValuationRate.rate_value),
+    ).where(DCValuationRate.id.in_(statement))
+    with SessionLocal() as session:
+        count, lowest, highest = session.execute(aggregate).one()
+        if not count:
+            return {"count": 0, "lowest": None, "highest": None}
+        lowest_record = session.scalar(
+            select(DCValuationRate)
+            .where(DCValuationRate.id.in_(statement))
+            .order_by(DCValuationRate.rate_value.asc(), DCValuationRate.id.asc())
+            .limit(1)
+        )
+        highest_record = session.scalar(
+            select(DCValuationRate)
+            .where(DCValuationRate.id.in_(statement))
+            .order_by(DCValuationRate.rate_value.desc(), DCValuationRate.id.asc())
+            .limit(1)
+        )
+    return {
+        "count": count, "lowest": lowest, "highest": highest,
+        "lowest_unit": lowest_record.rate_unit,
+        "lowest_schedule": lowest_record.schedule_type,
+        "highest_unit": highest_record.rate_unit,
+        "highest_schedule": highest_record.schedule_type,
+    }
 
 
 def create_location(**values: Any) -> tuple[int, bool]:
@@ -619,16 +877,22 @@ def list_dc_rates(
     mauza: str = "",
     square_no: str = "",
     kila_no: str = "",
+    khasra_no: str = "",
+    land_type: str | None = None,
     limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
     search = search.strip()
-    if mauza.strip() or (search and not search.isdigit()):
+    if (mauza.strip() or square_no.strip() or kila_no.strip() or khasra_no.strip()
+            or land_type in {"rural", "urban"} or (search and not search.isdigit())):
         statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
     if location_id is not None:
         statement = statement.where(DCValuationRate.location_id == location_id)
+    if land_type in {"rural", "urban"}:
+        statement = statement.where(PropertyLocation.land_type == land_type)
     if rate_unit:
         statement = statement.where(DCValuationRate.rate_unit == rate_unit)
     if verification_status in {"unverified", "verified"}:
@@ -648,7 +912,9 @@ def list_dc_rates(
         )
     # Cadastral fields are stored as token lists; query candidates in SQLite,
     # then validate whole tokens below so (for example) 2 does not match 12.
-    for field_name, term in (("square_no", square_no), ("kila_no", kila_no)):
+    for field_name, term in (
+        ("square_no", square_no), ("kila_no", kila_no), ("khasra_no", khasra_no)
+    ):
         if term.strip():
             field = getattr(PropertyLocation, field_name)
             statement = statement.where(field.ilike(f"%{term.strip()}%"))
@@ -676,11 +942,16 @@ def list_dc_rates(
     statement = statement.order_by(
         DCValuationRate.effective_from.desc(), DCValuationRate.id.desc()
     )
+    # Whole-token reference validation and legacy range expansion happen in
+    # Python below, so paginate those filtered results only after validation.
+    has_reference_filter = any((square_no.strip(), kila_no.strip(), khasra_no.strip()))
+    sql_pagination = limit is not None and not has_reference_filter
+    apply_sql_pagination = sql_pagination and (not search or not search.isdigit())
     with SessionLocal() as session:
-        if limit is not None and not search.strip():
-            statement = statement.limit(max(1, limit))
+        if apply_sql_pagination:
+            statement = statement.limit(max(1, limit)).offset(max(0, offset))
         rows = session.scalars(statement).unique().all()
-        if not search and not square_no.strip() and not kila_no.strip():
+        if not search and not has_reference_filter:
             return [_record_dict(row) for row in rows]
 
         search_key = search.casefold()
@@ -695,9 +966,12 @@ def list_dc_rates(
                 kila_match = not kila_no.strip() or bool(set(_reference_values(kila_no)).intersection(
                     _reference_values(record.get("kila_no"))
                 ))
+                khasra_match = not khasra_no.strip() or bool(set(_reference_values(khasra_no)).intersection(
+                    _reference_values(record.get("khasra_no"))
+                ))
             except DCRateServiceError:
-                square_match = kila_match = False
-            if not square_match or not kila_match:
+                square_match = kila_match = khasra_match = False
+            if not square_match or not kila_match or not khasra_match:
                 continue
             # Ordinary fields retain the existing case-insensitive substring
             # search. Cadastral identifiers match complete expanded tokens,
@@ -724,7 +998,10 @@ def list_dc_rates(
                 found = False
             if not search_key or found:
                 matches.append(record)
-        return matches
+        if apply_sql_pagination:
+            return matches
+        start = max(0, offset)
+        return matches[start : start + limit] if limit is not None else matches
 
 
 def _header_key(value: Any) -> str:

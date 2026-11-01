@@ -448,6 +448,141 @@ def test_primary_schedule_filters_match_mauza_and_cadastral_tokens(rate_database
     )] == [matching_id]
 
 
+def test_mauza_choices_and_rate_summary_include_both_schedules(rate_database):
+    mauza_id, _ = dc_rate_service.create_location(**_location_values(mauza="Example Mauza"))
+    dc_rate_service.create_dc_rate(
+        location_id=mauza_id, **_rate_values(schedule_type="dc", rate_value="100", rate_unit="per_marla")
+    )
+    dc_rate_service.create_dc_rate(
+        location_id=mauza_id, **_rate_values(schedule_type="fbr", rate_value="250", rate_unit="per_square_foot")
+    )
+
+    assert dc_rate_service.list_mauza_names() == ["Example Mauza"]
+    assert dc_rate_service.list_mauza_names(search="example") == ["Example Mauza"]
+    all_units = dc_rate_service.summarize_dc_rates(mauza="Example")
+    assert all_units["count"] == 2
+    assert Decimal(str(all_units["lowest"])) == Decimal("100")
+    assert all_units["lowest_schedule"] == "dc"
+    assert Decimal(str(all_units["highest"])) == Decimal("250")
+    assert all_units["highest_schedule"] == "fbr"
+    one_unit = dc_rate_service.summarize_dc_rates(mauza="Example", rate_unit="per_marla")
+    assert one_unit["count"] == 1
+
+
+def test_schedule_summary_reports_empty_results(rate_database):
+    assert dc_rate_service.summarize_dc_rates(mauza="No such Mauza") == {
+        "count": 0, "lowest": None, "highest": None,
+    }
+
+
+def _insert_raw_dc_rate(location_id, **overrides):
+    values = dc_rate_service._rate_data(_rate_values(**overrides))
+    with Session(dc_rate_service.SessionLocal.kw["bind"]) as session:
+        rate = DCValuationRate(location_id=location_id, **values)
+        session.add(rate)
+        session.flush()
+        record_id = rate.id
+        session.commit()
+    return record_id
+
+
+def test_rural_duplicate_scan_and_export_before_removal(rate_database, tmp_path, monkeypatch):
+    location_id, _ = dc_rate_service.create_location(**_location_values(
+        land_type="rural", qanoongoi="Qanoongoi 1", square_no="4",
+        kila_no="8", khasra_no="10-12", locality="North field",
+    ))
+    survivor_id = _insert_raw_dc_rate(location_id, rate_value="100")
+    duplicate_id = _insert_raw_dc_rate(location_id, rate_value="120")
+    monkeypatch.setattr(dc_rate_service, "_documents_directory", lambda: tmp_path / "Documents")
+
+    preview = dc_rate_service.find_duplicate_dc_rates()
+    assert [record["id"] for record in preview] == [duplicate_id]
+    assert preview[0]["duplicate_of"] == survivor_id
+
+    removed_count, report_path = dc_rate_service.remove_duplicate_dc_rates_with_report("csv")
+
+    assert removed_count == 1
+    assert report_path.parent == tmp_path / "Documents"
+    assert report_path.exists()
+    report = report_path.read_text(encoding="utf-8-sig")
+    assert "Record ID" in report and "Duplicate of record ID" in report
+    assert str(duplicate_id) in report and str(survivor_id) in report
+    assert str(Decimal("120")) in report
+    assert [record["id"] for record in dc_rate_service.list_dc_rates()] == [survivor_id]
+
+
+def test_urban_dc_and_fbr_duplicate_scan_requires_all_values_to_match(rate_database):
+    urban_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Urban Block", mauza=None, land_type="urban", locality="Block A",
+    ))
+    urban_ids = [
+        _insert_raw_dc_rate(urban_id, schedule_type="dc", rate_value=value)
+        for value in ("200", "200", "250")
+    ]
+    fbr_ids = [
+        _insert_raw_dc_rate(urban_id, schedule_type="fbr", rate_value="25", rate_unit="per_square_foot")
+        for _ in range(2)
+    ]
+
+    duplicate_ids = [record["id"] for record in dc_rate_service.find_duplicate_dc_rates()]
+
+    assert duplicate_ids == [urban_ids[1], fbr_ids[1]]
+
+
+@pytest.mark.parametrize("file_format", ["xlsx", "ods"])
+def test_duplicate_reports_support_spreadsheet_formats(rate_database, tmp_path, monkeypatch, file_format):
+    location_id, _ = dc_rate_service.create_location(**_location_values(
+        land_type="urban", name="Format Test", mauza=None,
+    ))
+    _insert_raw_dc_rate(location_id)
+    _insert_raw_dc_rate(location_id)
+    monkeypatch.setattr(dc_rate_service, "_documents_directory", lambda: tmp_path / "Documents")
+
+    removed_count, report_path = dc_rate_service.remove_duplicate_dc_rates_with_report(file_format)
+
+    assert removed_count == 1
+    assert report_path.suffix == f".{file_format}"
+    headers, rows = dc_rate_service.read_schedule_spreadsheet(report_path.read_bytes(), report_path.name)
+    assert "Duplicate of record ID" in headers
+    assert len(rows) == 1
+
+
+def test_duplicate_removal_rejects_unsupported_report_before_deleting(rate_database):
+    location_id, _ = dc_rate_service.create_location(**_location_values(land_type="urban"))
+    first = _insert_raw_dc_rate(location_id)
+    _insert_raw_dc_rate(location_id)
+
+    with pytest.raises(dc_rate_service.DCRateServiceError, match="Choose CSV"):
+        dc_rate_service.remove_duplicate_dc_rates_with_report("pdf")
+
+    assert len(dc_rate_service.list_dc_rates()) == 2
+
+
+def test_rural_urban_schedule_filters_and_cadastral_suggestions(rate_database):
+    rural_id, _ = dc_rate_service.create_location(**_location_values(
+        land_type="rural", square_no="12, 13", kila_no="4, 8", khasra_no="100-102",
+    ))
+    urban_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Urban Locality", mauza="Urban Locality", land_type="urban",
+        square_no="22", kila_no="2", khasra_no="200",
+    ))
+    dc_rate_service.create_dc_rate(location_id=rural_id, **_rate_values(schedule_type="dc"))
+    dc_rate_service.create_dc_rate(location_id=urban_id, **_rate_values(schedule_type="dc"))
+    dc_rate_service.create_dc_rate(location_id=urban_id, **_rate_values(
+        schedule_type="fbr", rate_value="250", rate_unit="per_square_foot",
+    ))
+
+    rural_rates = dc_rate_service.list_dc_rates(schedule_type="dc", land_type="rural")
+    urban_rates = dc_rate_service.list_dc_rates(schedule_type="dc", land_type="urban")
+    assert [row["location_id"] for row in rural_rates] == [rural_id]
+    assert [row["location_id"] for row in urban_rates] == [urban_id]
+    assert dc_rate_service.list_dc_rates(schedule_type="fbr")[0]["schedule_type"] == "fbr"
+    assert dc_rate_service.list_cadastral_values("square_no") == ["12", "13", "22"]
+    assert dc_rate_service.list_cadastral_values("square_no", search="1") == ["12", "13"]
+    assert dc_rate_service.list_cadastral_values("kila_no") == ["2", "4", "8"]
+    assert dc_rate_service.list_cadastral_values("khasra_no") == ["100", "101", "102", "200"]
+
+
 def test_schedule_export_supports_csv_xlsx_and_ods(rate_database):
     location_id, _ = dc_rate_service.create_location(**_location_values(
         land_type="rural", qanoongoi="Qanoongoi 2", patwar_circle="PC 4",

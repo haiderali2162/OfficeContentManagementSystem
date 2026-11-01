@@ -1,2 +1,5 @@
-still the responsiveness of the application is not as good as it should be because after clicking on the tab "DC / FBR rates", it takes some time to response. so fix it too by making any time taking processes to the background or whatever.
-also make tha mauza field search and selectable from the imported schedule for all the schedule.
+now i need a remove duplicate rows option if there exist any duplicates in a mauza. like the same file get imported more than onces.
+if the square no, kila no and khasra no if present are same under the mauza then look for the location and classification and unit. if all these values are same then consider it a duplicate and remove that row.
+for the urban and fbr if two same rows exist more than once for all columns the values are same consider it a duplicate and remove it.
+output all the removed values in excel/csv/ods/odf format in documents folder in case of any os like window/linux/mac.
+also there is an error while closing the app, the command prompt remains like the application is still running, if there is any issue in the app, please fix it. also.

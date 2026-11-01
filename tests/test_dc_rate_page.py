@@ -108,6 +108,11 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
     saved = [_rate_record()]
     last_filters = {}
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [{"id": 3, "name": "Test Mauza"}])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 2, "lowest": "1", "highest": "2",
+        "lowest_unit": "per_marla", "lowest_schedule": "dc",
+        "highest_unit": "per_marla", "highest_schedule": "dc",
+    })
     def list_rates(**kwargs):
         last_filters.clear()
         last_filters.update(kwargs)
@@ -132,12 +137,13 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
     by_label["DC / FBR schedule value"].value = "12500"
     by_label["Published year (optional)"].value = "2027"
     dialog.actions[-1].on_click(object())
+    asyncio.run(page.background_task)
 
     assert len(saved) == 2
     assert len(page.dialogs) == 0
     list_view = next(control for control in _walk(root) if isinstance(control, ft.ListView))
     assert len([control for control in list_view.controls if isinstance(control, ft.Container)]) == 2
-    assert any("2 rate record" in (control.value or "") for control in _walk(root)
+    assert any("Showing 2 rate" in (control.value or "") for control in _walk(root)
                if isinstance(control, ft.Text))
     assert last_filters["search"] == ""
     assert last_filters["schedule_type"] is None
@@ -195,14 +201,87 @@ def test_rate_card_shows_rate_and_location_text(monkeypatch):
 def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch):
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
     root = dc_rates.build_dc_rates_page(FakePage())
     controls = list(_walk(root))
     labels = {control.label for control in controls if isinstance(control, (ft.TextField, ft.Dropdown))}
-    assert {"Mauza", "Square no.", "Kila no.", "Rate unit", "Schedule"} <= labels
+    text_labels = {control.value for control in controls if isinstance(control, ft.Text)}
+    assert {"Mauza", "Square no.", "Kila no.", "Khasra no."} <= text_labels
+    assert {"Rate unit", "Schedule"} <= labels
+    autocompletes = [control for control in controls if isinstance(control, ft.AutoComplete)]
+    assert len(autocompletes) == 4
+    schedule = next(control for control in controls if isinstance(control, ft.Dropdown) and control.label == "Schedule")
+    assert [option.key for option in schedule.options] == ["dc_rural", "dc_urban", "fbr", "all"]
     extended = next(control for control in controls if isinstance(control, ft.ResponsiveRow)
                     and any(isinstance(child.content, ft.TextField) and child.content.label == "Search location, property, classification, or source"
                             for child in control.controls if isinstance(child, ft.Container)))
     assert extended.visible is False
+
+
+def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch):
+    cadastral_calls = []
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [_rate_record()])
+    monkeypatch.setattr(dc_rates, "list_mauza_names", lambda **_kwargs: ["Test Mauza", "Other Mauza"])
+    def list_cadastral(field_name, **kwargs):
+        cadastral_calls.append((field_name, kwargs.get("search", "")))
+        return ["12", "123"] if field_name == "square_no" else ["4"]
+    monkeypatch.setattr(dc_rates, "list_cadastral_values", list_cadastral)
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 2, "lowest": "10", "highest": "50",
+        "lowest_unit": "per_marla", "lowest_schedule": "dc",
+        "highest_unit": "per_square_foot", "highest_schedule": "fbr",
+    })
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page, defer_initial_load=True)
+    mauza = next(control for control in _walk(root) if isinstance(control, ft.AutoComplete))
+    assert mauza.suggestions == []
+    mauza.value = "Test Mauza"
+    asyncio.run(page.background_task)
+
+    assert [item.value for item in mauza.suggestions] == ["Test Mauza", "Other Mauza"]
+    square, kila, khasra = [control for control in _walk(root) if isinstance(control, ft.AutoComplete)][1:]
+    assert [option.value for option in square.suggestions] == ["12", "123"]
+    assert [option.value for option in kila.suggestions] == ["4"]
+    assert [option.value for option in khasra.suggestions] == ["4"]
+    summary = next(control for control in _walk(root)
+                   if isinstance(control, ft.Text) and "Lowest:" in (control.value or ""))
+    assert "Lowest: 10 Per marla" in summary.value
+    assert "Highest: 50 Per square foot" in summary.value
+
+    square.value = "12"
+    square.on_change(None)
+    asyncio.run(page.background_task)
+    assert ("square_no", "12") in cadastral_calls
+
+
+def test_duplicate_cleanup_dialog_previews_candidates_before_removal(monkeypatch):
+    record = {**_rate_record(), "duplicate_of": 6, "id": 7}
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "find_duplicate_dc_rates", lambda: [record])
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    duplicate_button = next(control for control in _walk(root)
+                            if isinstance(control, ft.OutlinedButton)
+                            and control.content == "Find / remove duplicates")
+
+    duplicate_button.on_click(None)
+    dialog = page.dialogs[-1]
+    scan_button = next(control for control in dialog.actions
+                       if isinstance(control, ft.OutlinedButton)
+                       and control.content == "Scan for duplicates")
+    scan_button.on_click(None)
+    asyncio.run(page.background_task)
+
+    remove_button = next(control for control in dialog.actions
+                         if isinstance(control, ft.Button)
+                         and str(control.content).startswith("Export and remove"))
+    assert remove_button.disabled is False
+    assert any("1 extra row(s)" in (control.value or "") for control in _walk(dialog.content)
+               if isinstance(control, ft.Text))
 
 
 def test_location_form_switches_rural_and_urban_fields(monkeypatch):
@@ -245,6 +324,9 @@ def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypa
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
     monkeypatch.setattr(dc_rates, "read_schedule_spreadsheet", lambda *_: (
         ["District", "Tehsil", "Mauza", "Location", "Rate"], []
     ))
@@ -285,6 +367,9 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
     monkeypatch.setattr(dc_rates, "read_schedule_spreadsheet", lambda *_: (
         ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location", "Square No", "Kila No", "DC Rate", "Unit"],
         [["Tehsil", "Qanoongoi", "Mauza", "Agricultural", "Farm", "1", "2", "100", "per kanal"]],
@@ -322,6 +407,9 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
     assert imported == []
     assert "running in the background" in status_text.value
 
+    asyncio.run(page.background_task)
+    # The import task schedules a separate refresh task after its database
+    # write; await that second task as well to avoid leaking test coroutines.
     asyncio.run(page.background_task)
 
     assert imported[0]["published_year"] == 2028

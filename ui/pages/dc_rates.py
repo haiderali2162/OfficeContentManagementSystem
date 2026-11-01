@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import flet as ft
 
@@ -16,12 +17,17 @@ from services.dc_rate_service import (
     export_schedule_records,
     get_dc_rate,
     import_dc_rate_records,
+    list_cadastral_values,
     list_dc_rates,
     list_locations,
+    list_mauza_names,
+    find_duplicate_dc_rates,
     preview_dc_rate_workbook,
     preview_mapped_schedule,
     read_schedule_spreadsheet,
+    remove_duplicate_dc_rates_with_report,
     suggested_column_mapping,
+    summarize_dc_rates,
     update_dc_rate,
 )
 
@@ -42,7 +48,12 @@ def _format_date(value: date | None, *, empty: str = "Not supplied") -> str:
     return value.isoformat() if value else empty
 
 
-def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> ft.Control:
+def build_dc_rates_page(
+    page: ft.Page,
+    *,
+    defer_initial_load: bool = False,
+    on_load_ready: Callable[[Callable[[], Awaitable[None]]], None] | None = None,
+) -> ft.Control:
     """Build rate controls and connect UI events to the rate service."""
     file_picker = ft.FilePicker()
     existing_picker = next(
@@ -54,13 +65,14 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
     else:
         file_picker = existing_picker
     import_in_progress = False
-    visible_rate_limit = 200
+    visible_rate_limit = 40
     visible_location_limit = 500
     location_picker_truncated = False
 
-    mauza_filter = ft.TextField(label="Mauza", width=190)
-    square_filter = ft.TextField(label="Square no.", width=130)
-    kila_filter = ft.TextField(label="Kila no.", width=130)
+    mauza_filter = ft.AutoComplete(width=220, suggestions_max_height=240)
+    square_filter = ft.AutoComplete(width=140, suggestions_max_height=220)
+    kila_filter = ft.AutoComplete(width=140, suggestions_max_height=220)
+    khasra_filter = ft.AutoComplete(width=150, suggestions_max_height=220)
     search_field = ft.TextField(
         label="Search location, property, classification, or source",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
@@ -86,9 +98,10 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
     )
     schedule_filter = ft.Dropdown(
         label="Schedule", width=145, value="all",
-        options=[ft.dropdown.Option("dc", "DC"),
+        options=[ft.dropdown.Option("dc_rural", "DC rural"),
+                 ft.dropdown.Option("dc_urban", "DC urban"),
                  ft.dropdown.Option("fbr", "FBR"),
-                 ft.dropdown.Option("all", "Both")],
+                 ft.dropdown.Option("all", "All")],
     )
     published_year_filter = ft.TextField(
         label="Published year (optional)",
@@ -97,7 +110,29 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
     )
     status_text = ft.Text("", size=12, color="#475569")
     result_count = ft.Text("", size=12, color="#64748B")
+    rate_summary = ft.Container(
+        padding=10,
+        bgcolor="#F8FAFC",
+        border=ft.Border.all(1, "#E2E8F0"),
+        border_radius=8,
+        content=ft.Text("Rate range appears after filtering by Mauza."),
+    )
     rate_list = ft.ListView(expand=True, spacing=8, padding=4)
+    load_more_button = ft.OutlinedButton("Load more rates", visible=False)
+    request_generation = 0
+    current_page_offset = 0
+    has_more_rates = False
+
+    def selected_schedule_filters() -> tuple[str | None, str | None]:
+        """Translate the user-facing schedule choice into database filters."""
+        selected = schedule_filter.value or "all"
+        if selected == "dc_rural":
+            return "dc", "rural"
+        if selected == "dc_urban":
+            return "dc", "urban"
+        if selected == "fbr":
+            return "fbr", None
+        return None, None
 
     def close_dialog():
         page.pop_dialog()
@@ -136,31 +171,52 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
             location_filter.value = "all"
         return locations
 
-    def refresh_rates(e=None, *, update_page: bool = True, records=None):
+    def refresh_rates(e=None, *, update_page: bool = True, records=None, append=False,
+                      summary=None, total_count=None, has_more=None):
         """Apply all visible filters and replace the scrollable rate cards."""
-        rate_list.controls.clear()
+        nonlocal has_more_rates, current_page_offset
+        if not append:
+            rate_list.controls.clear()
         try:
             raw_year = (published_year_filter.value or "").strip()
             published_year = int(raw_year) if raw_year else None
             if published_year is not None and not 1900 <= published_year <= 2200:
                 raise ValueError("Published year must be between 1900 and 2200.")
             selected_location = location_filter.value or "all"
+            schedule_type, land_type = selected_schedule_filters()
             if records is None:
                 records = list_dc_rates(
                     search=search_field.value or "", mauza=mauza_filter.value or "",
                     square_no=square_filter.value or "", kila_no=kila_filter.value or "",
-                    schedule_type=schedule_filter.value if schedule_filter.value != "all" else None,
+                    khasra_no=khasra_filter.value or "",
+                    schedule_type=schedule_type, land_type=land_type,
                     location_id=int(selected_location) if selected_location != "all" else None,
                     rate_unit=unit_filter.value if unit_filter.value != "all" else None,
                     published_year=published_year, limit=visible_rate_limit,
                 )
             displayed_records = records[:visible_rate_limit]
-            result_count.value = (
-                f"Showing {len(displayed_records)} of {len(records)} matching rate record(s)"
-                if len(records) > visible_rate_limit else f"{len(records)} rate record(s)"
-            )
+            current_page_offset = current_page_offset + len(displayed_records) if append else len(displayed_records)
+            has_more_rates = (len(records) > visible_rate_limit) if has_more is None else has_more
+            load_more_button.visible = has_more_rates
+            result_count.value = (f"Showing {current_page_offset} of {total_count} matching rates"
+                                  if total_count is not None else f"Showing {current_page_offset} rate(s)")
+            if summary is not None:
+                if not mauza_filter.value:
+                    summary_text = "Select a Mauza to see the lowest and highest matching rates."
+                elif not summary["count"]:
+                    summary_text = f"No rates found for Mauza '{mauza_filter.value}'."
+                else:
+                    unit_text = UNIT_LABELS.get(unit_filter.value, "all units") if unit_filter.value != "all" else "all units"
+                    low_unit = UNIT_LABELS.get(summary.get("lowest_unit"), summary.get("lowest_unit"))
+                    high_unit = UNIT_LABELS.get(summary.get("highest_unit"), summary.get("highest_unit"))
+                    summary_text = (
+                        f"{summary['count']:,} rate(s) · {unit_text} · "
+                        f"Lowest: {summary['lowest']} {low_unit} ({summary.get('lowest_schedule', '').upper()}) · "
+                        f"Highest: {summary['highest']} {high_unit} ({summary.get('highest_schedule', '').upper()})"
+                    )
+                rate_summary.content.value = summary_text
             status_text.value = ""
-            if not records:
+            if not records and not append:
                 rate_list.controls.append(
                     ft.Container(
                         padding=18,
@@ -181,11 +237,6 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
                 )
             for record in displayed_records:
                 add_rate_card(record)
-            if len(records) > visible_rate_limit:
-                status_text.value = (
-                    f"Showing the latest {visible_rate_limit} matching records. "
-                    "Use search or filters to narrow the list."
-                )
             if location_picker_truncated:
                 result_count.value += (
                     f" · location quick-filter shows {visible_location_limit}; "
@@ -199,6 +250,88 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
             status_text.value = f"Could not load DC rates: {exc}"
         if update_page:
             page.update()
+
+    def schedule_rates_refresh(_=None, *, append=False, suggestion_field=None):
+        """Debounce rapid edits, query on a worker, and render only the latest result."""
+        nonlocal request_generation
+        request_generation += 1
+        generation = request_generation
+        status_text.value = "Loading matching rates…"
+        page.update()
+
+        async def load_filtered_rates():
+            nonlocal request_generation
+            await asyncio.sleep(0.18)
+            if generation != request_generation:
+                return
+            raw_year = (published_year_filter.value or "").strip()
+            try:
+                year = int(raw_year) if raw_year else None
+                if year is not None and not 1900 <= year <= 2200:
+                    raise ValueError("Published year must be between 1900 and 2200.")
+                selected_location = location_filter.value or "all"
+                offset = current_page_offset if append else 0
+                schedule_type, land_type = selected_schedule_filters()
+                records, summary, mauza_names = await asyncio.gather(
+                    asyncio.to_thread(
+                        list_dc_rates,
+                        search=search_field.value or "", mauza=mauza_filter.value or "",
+                        square_no=square_filter.value or "", kila_no=kila_filter.value or "",
+                        khasra_no=khasra_filter.value or "",
+                        schedule_type=schedule_type, land_type=land_type,
+                        location_id=int(selected_location) if selected_location != "all" else None,
+                        rate_unit=unit_filter.value if unit_filter.value != "all" else None,
+                        published_year=year, limit=visible_rate_limit + 1, offset=offset,
+                    ),
+                    asyncio.to_thread(
+                        summarize_dc_rates,
+                        mauza=mauza_filter.value or "",
+                        rate_unit=unit_filter.value if unit_filter.value != "all" else None,
+                        schedule_type=schedule_type, land_type=land_type,
+                    ),
+                    asyncio.to_thread(list_mauza_names, search=mauza_filter.value or ""),
+                )
+                if generation != request_generation:
+                    return
+                completion_message = status_text.value
+                refresh_rates(records=records, append=append, summary=summary,
+                              has_more=len(records) > visible_rate_limit,
+                              update_page=False)
+                mauza_filter.suggestions = [
+                    ft.AutoCompleteSuggestion(key=name, value=name) for name in mauza_names
+                ]
+                cadastral_controls = {
+                    "square_no": square_filter,
+                    "kila_no": kila_filter,
+                    "khasra_no": khasra_filter,
+                }
+                if suggestion_field in cadastral_controls:
+                    control = cadastral_controls[suggestion_field]
+                    values = await asyncio.to_thread(
+                        list_cadastral_values,
+                        suggestion_field,
+                        search=control.value or "",
+                    )
+                    if generation != request_generation:
+                        return
+                    control.suggestions = [ft.AutoCompleteSuggestion(key=value, value=value) for value in values]
+                # Keep a recent save/import confirmation visible after its
+                # automatic background refresh has completed.
+                if completion_message and not completion_message.startswith("Loading"):
+                    status_text.value = completion_message
+            except (TypeError, ValueError) as exc:
+                result_count.value = ""
+                status_text.value = f"Check the filters: {exc}"
+            except Exception as exc:
+                result_count.value = ""
+                status_text.value = f"Could not load DC rates: {exc}"
+            page.update()
+
+        if hasattr(page, "run_task"):
+            page.run_task(load_filtered_rates)
+        else:
+            # Test adapters can still exercise the filters without Flet's loop.
+            refresh_rates()
 
     def show_rate_details(rate_id: int):
         record = get_dc_rate(rate_id)
@@ -373,7 +506,7 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
                 close_dialog()
                 refresh_locations()
                 location_filter.value = str(location_id)
-                refresh_rates()
+                schedule_rates_refresh()
                 status_text.value = (
                     "Location added." if created else "Matching location already existed; selected it."
                 )
@@ -572,7 +705,8 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
                 mauza_filter.value = ""
                 square_filter.value = ""
                 kila_filter.value = ""
-                refresh_rates()
+                khasra_filter.value = ""
+                schedule_rates_refresh()
                 status_text.value = f"{schedule_field.value.upper()} rate saved and shown below."
                 page.update()
             except (DCRateServiceError, ValueError, TypeError) as exc:
@@ -795,7 +929,8 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
                             # Database writes happen on a worker thread so a
                             # large schedule does not block Flet's UI event loop.
                             outcome = await asyncio.to_thread(import_dc_rate_records, import_records)
-                            refresh_locations()
+                            refreshed_locations = await asyncio.to_thread(list_locations)
+                            refresh_locations(refreshed_locations)
                             schedule_filter.value = "all"
                             location_filter.value = "all"
                             unit_filter.value = "all"
@@ -804,7 +939,8 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
                             mauza_filter.value = ""
                             square_filter.value = ""
                             kila_filter.value = ""
-                            refresh_rates()
+                            khasra_filter.value = ""
+                            schedule_rates_refresh()
                             status_text.value = (
                                 f"Imported {outcome['imported_count']:,} {schedule_name()} "
                                 f"rate(s) from {selected.name}."
@@ -857,13 +993,152 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
         raw_year = (published_year_filter.value or "").strip()
         year = int(raw_year) if raw_year else None
         selected_location = location_filter.value or "all"
+        schedule_type, land_type = selected_schedule_filters()
         return list_dc_rates(
             search=search_field.value or "",
-            schedule_type=schedule_filter.value if schedule_filter.value != "all" else None,
+            schedule_type=schedule_type,
+            land_type=land_type,
             location_id=int(selected_location) if selected_location != "all" else None,
             rate_unit=unit_filter.value if unit_filter.value != "all" else None,
             published_year=year,
+            mauza=mauza_filter.value or "",
+            square_no=square_filter.value or "",
+            kila_no=kila_filter.value or "",
+            khasra_no=khasra_filter.value or "",
         )
+
+    def open_duplicate_cleanup_dialog(_=None):
+        """Preview duplicates, then export their values before removing extras."""
+        report_format = ft.Dropdown(
+            label="Removed-row report format",
+            value="xlsx",
+            options=[
+                ft.dropdown.Option("xlsx", "Excel (.xlsx)"),
+                ft.dropdown.Option("csv", "CSV (.csv)"),
+                ft.dropdown.Option("ods", "OpenDocument spreadsheet (.ods)"),
+            ],
+            width=280,
+        )
+        scan_summary = ft.Text("Scan existing schedule records before removing anything.", size=12)
+        duplicate_list = ft.ListView(height=250, spacing=4)
+        remove_button = ft.Button("Export and remove duplicates", disabled=True)
+        scan_button = ft.OutlinedButton("Scan for duplicates")
+        scanned_count = 0
+
+        def show_duplicates(records):
+            nonlocal scanned_count
+            scanned_count = len(records)
+            duplicate_list.controls.clear()
+            if not records:
+                duplicate_list.controls.append(ft.Text("No duplicate schedule rows were found."))
+                scan_summary.value = "No duplicates found. Your records were not changed."
+                remove_button.disabled = True
+                remove_button.text = "Export and remove duplicates"
+            else:
+                scan_summary.value = (
+                    f"Found {scanned_count:,} extra row(s). The lowest record ID in each "
+                    "duplicate group will be kept. Removed rows are exported first."
+                )
+                for record in records[:100]:
+                    duplicate_list.controls.append(ft.Text(
+                        f"#{record['id']} (duplicate of #{record['duplicate_of']}) | "
+                        f"{record.get('schedule_type', '').upper()} | {record.get('mauza') or 'No Mauza'} | "
+                        f"Square {record.get('square_no') or '-'} | Kila {record.get('kila_no') or '-'} | "
+                        f"Khasra {record.get('khasra_no') or '-'} | "
+                        f"{record.get('classification') or record.get('property_type')} | "
+                        f"{record.get('rate_value')} {record.get('rate_unit')} | "
+                        f"Year {record.get('published_year') or 'unspecified'}",
+                        size=12, selectable=True,
+                    ))
+                if scanned_count > 100:
+                    duplicate_list.controls.append(ft.Text(
+                        f"Showing the first 100 of {scanned_count:,} extra rows.", size=11,
+                    ))
+                remove_button.disabled = False
+                remove_button.text = f"Export and remove {scanned_count:,} duplicate row(s)"
+            page.update()
+
+        async def run_scan():
+            scan_button.disabled = True
+            scan_summary.value = "Scanning schedule records in the background..."
+            page.update()
+            try:
+                records = await asyncio.to_thread(find_duplicate_dc_rates)
+                show_duplicates(records)
+            except Exception as exc:
+                scan_summary.value = f"Could not scan for duplicates: {exc}"
+                remove_button.disabled = True
+            finally:
+                scan_button.disabled = False
+                page.update()
+
+        def scan(_):
+            if hasattr(page, "run_task"):
+                page.run_task(run_scan)
+            else:
+                scan_button.disabled = True
+                try:
+                    show_duplicates(find_duplicate_dc_rates())
+                except Exception as exc:
+                    scan_summary.value = f"Could not scan for duplicates: {exc}"
+                finally:
+                    scan_button.disabled = False
+                    page.update()
+
+        async def run_removal():
+            remove_button.disabled = True
+            scan_summary.value = "Writing the report and removing duplicate rows..."
+            page.update()
+            try:
+                removed_count, report_path = await asyncio.to_thread(
+                    remove_duplicate_dc_rates_with_report, report_format.value
+                )
+                if removed_count and report_path:
+                    close_dialog()
+                    status_text.value = (
+                        f"Removed {removed_count:,} duplicate row(s). Full removed-row report: {report_path}"
+                    )
+                    schedule_rates_refresh()
+                else:
+                    scan_summary.value = "No duplicates remain. The database was not changed."
+                    remove_button.disabled = True
+                page.update()
+            except Exception as exc:
+                scan_summary.value = f"Duplicate removal failed; records were not removed: {exc}"
+                remove_button.disabled = False
+                page.update()
+
+        def remove_duplicates(_):
+            if scanned_count == 0:
+                return
+            if hasattr(page, "run_task"):
+                page.run_task(run_removal)
+            else:
+                scan_summary.value = "Background task support is required for safe duplicate removal."
+                page.update()
+
+        scan_button.on_click = scan
+        remove_button.on_click = remove_duplicates
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Find and remove duplicate schedule rows"),
+            content=ft.Column([
+                ft.Text(
+                    "Rural DC rows are grouped by Mauza, cadastral numbers, location, classification, and unit. "
+                    "Urban DC and FBR rows must match all schedule and location values. The first record is kept.",
+                    size=12,
+                ),
+                report_format,
+                scan_summary,
+                duplicate_list,
+            ], width=720, height=420, scroll=ft.ScrollMode.AUTO, spacing=8),
+            actions=[
+                ft.TextButton("Close", on_click=lambda _: close_dialog()),
+                scan_button,
+                remove_button,
+            ],
+        ))
+        page.update()
 
     def make_export_handler(file_format: str):
         """Export the currently filtered records in the selected spreadsheet format."""
@@ -886,14 +1161,17 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
             page.update()
         return export_schedule
 
-    search_field.on_change = refresh_rates
-    mauza_filter.on_change = refresh_rates
-    square_filter.on_change = refresh_rates
-    kila_filter.on_change = refresh_rates
-    schedule_filter.on_select = refresh_rates
-    location_filter.on_select = refresh_rates
-    unit_filter.on_select = refresh_rates
-    published_year_filter.on_change = refresh_rates
+    search_field.on_change = schedule_rates_refresh
+    mauza_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="mauza")
+    mauza_filter.on_select = schedule_rates_refresh
+    square_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="square_no")
+    kila_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="kila_no")
+    khasra_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="khasra_no")
+    schedule_filter.on_select = schedule_rates_refresh
+    location_filter.on_select = schedule_rates_refresh
+    unit_filter.on_select = schedule_rates_refresh
+    published_year_filter.on_change = schedule_rates_refresh
+    load_more_button.on_click = lambda _: schedule_rates_refresh(append=True)
 
     toolbar = ft.Row(
         controls=[
@@ -908,16 +1186,18 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
                 )
                 for file_format in ("csv", "xlsx", "ods")
             ],
-            ft.TextButton("Refresh", on_click=refresh_rates),
+            ft.OutlinedButton("Find / remove duplicates", on_click=open_duplicate_cleanup_dialog),
+            ft.TextButton("Refresh", on_click=schedule_rates_refresh),
         ],
         wrap=True,
         spacing=6,
         run_spacing=6,
     )
     filters = ft.ResponsiveRow([
-        ft.Container(mauza_filter, col={"xs": 12, "sm": 6, "md": 3}),
-        ft.Container(square_filter, col={"xs": 6, "sm": 3, "md": 2}),
-        ft.Container(kila_filter, col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(ft.Column([ft.Text("Mauza"), mauza_filter], spacing=2), col={"xs": 12, "sm": 6, "md": 3}),
+        ft.Container(ft.Column([ft.Text("Square no."), square_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(ft.Column([ft.Text("Kila no."), kila_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(ft.Column([ft.Text("Khasra no."), khasra_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(unit_filter, col={"xs": 12, "sm": 6, "md": 2}),
         ft.Container(schedule_filter, col={"xs": 12, "sm": 6, "md": 2}),
     ], run_spacing=4)
@@ -959,7 +1239,9 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
             extended_filter_button,
             extended_filters,
             ft.Row([result_count, status_text], wrap=True, spacing=12),
+            rate_summary,
             rate_list,
+            load_more_button,
         ],
         spacing=8,
         expand=True,
@@ -968,17 +1250,32 @@ def build_dc_rates_page(page: ft.Page, *, defer_initial_load: bool = False) -> f
         async def load_initial_data():
             """Populate the first bounded view without blocking page navigation."""
             try:
-                locations, records = await asyncio.gather(
+                locations, records, mauza_names, summary, squares, kilas, khasras = await asyncio.gather(
                     asyncio.to_thread(list_locations),
-                    asyncio.to_thread(list_dc_rates, limit=visible_rate_limit),
+                    asyncio.to_thread(list_dc_rates, limit=visible_rate_limit + 1),
+                    asyncio.to_thread(list_mauza_names, search=mauza_filter.value or ""),
+                    asyncio.to_thread(summarize_dc_rates),
+                    asyncio.to_thread(list_cadastral_values, "square_no"),
+                    asyncio.to_thread(list_cadastral_values, "kila_no"),
+                    asyncio.to_thread(list_cadastral_values, "khasra_no"),
                 )
                 refresh_locations(locations)
-                refresh_rates(update_page=False, records=records)
+                mauza_filter.suggestions = [
+                    ft.AutoCompleteSuggestion(key=name, value=name) for name in mauza_names
+                ]
+                for control, values in (
+                    (square_filter, squares), (kila_filter, kilas), (khasra_filter, khasras)
+                ):
+                    control.suggestions = [ft.AutoCompleteSuggestion(key=value, value=value) for value in values]
+                refresh_rates(update_page=False, records=records, summary=summary,
+                              has_more=len(records) > visible_rate_limit)
                 page.update()
             except Exception as exc:
                 status_text.value = f"Could not load valuation schedules: {exc}"
                 page.update()
-        if hasattr(page, "run_task"):
+        if on_load_ready is not None:
+            on_load_ready(load_initial_data)
+        elif hasattr(page, "run_task"):
             page.run_task(load_initial_data)
         else:
             # Minimal test/page adapters may not expose Flet's task scheduler.

@@ -686,9 +686,23 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
 
     # Keep existing DC/FBR maintenance available in the same page. Each tab
     # remains an independently built section with its own service callbacks.
+    # Keep the schedule tab truly lazy: its first query starts only when the
+    # user selects it, so valuation-page navigation has no competing I/O.
+    rate_page_loader: dict[str, Any] = {}
     rates_page = __import__("ui.pages.dc_rates", fromlist=["build_dc_rates_page"]).build_dc_rates_page(
-        page, defer_initial_load=True
+        page,
+        defer_initial_load=True,
+        on_load_ready=lambda loader: rate_page_loader.update(load=loader),
     )
+    rates_load_started = False
+
+    def on_valuation_tab_change(event):
+        nonlocal rates_load_started
+        if event.control.selected_index == 2 and not rates_load_started:
+            rates_load_started = True
+            loader = rate_page_loader.get("load")
+            if loader is not None:
+                page.run_task(loader)
     tabs = ft.Tabs(
         content=ft.Column([
             ft.TabBar(tabs=[ft.Tab(label="Calculate"), ft.Tab(label="Tax / fee rules"), ft.Tab(label="DC / FBR rates")]),
@@ -696,6 +710,7 @@ def build_valuation_page(page: ft.Page) -> ft.Control:
         ], spacing=0, expand=True),
         length=3,
         selected_index=0,
+        on_change=on_valuation_tab_change,
         expand=True,
     )
     root = ft.Column([
