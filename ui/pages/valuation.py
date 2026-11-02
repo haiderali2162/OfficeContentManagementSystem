@@ -156,21 +156,21 @@ def build_valuation_page(
     property_profile = ft.RadioGroup(value="rural", content=ft.Row([
         ft.Radio(value="rural", label="Rural"), ft.Radio(value="urban", label="Urban"),
     ], spacing=16))
-    district = ft.AutoComplete(width=220, suggestions_max_height=220)
-    tehsil = ft.AutoComplete(width=220, suggestions_max_height=220)
-    mauza = ft.AutoComplete(width=240, suggestions_max_height=220)
-    town = ft.AutoComplete(width=220, suggestions_max_height=220)
-    revenue_circle = ft.AutoComplete(width=220, suggestions_max_height=220)
-    property_area = ft.AutoComplete(width=220, suggestions_max_height=220)
-    schedule_location = ft.AutoComplete(width=240, suggestions_max_height=220)
-    square_no = ft.TextField(label="Square no.", width=150)
-    kila_no = ft.TextField(label="Kila no.", width=150)
+    district = ft.AutoComplete(data="district", width=220, suggestions_max_height=220)
+    tehsil = ft.AutoComplete(data="tehsil", width=220, suggestions_max_height=220)
+    mauza = ft.AutoComplete(data="mauza", width=240, suggestions_max_height=220)
+    town = ft.AutoComplete(data="town", width=220, suggestions_max_height=220)
+    revenue_circle = ft.AutoComplete(data="revenue_circle", width=220, suggestions_max_height=220)
+    property_area = ft.AutoComplete(data="property_area", width=220, suggestions_max_height=220)
+    schedule_location = ft.AutoComplete(data="schedule_location", width=240, suggestions_max_height=220)
+    square_no = ft.AutoComplete(data="square_no", width=150, suggestions_max_height=220)
+    kila_no = ft.AutoComplete(data="kila_no", width=150, suggestions_max_height=220)
     khasra_no = ft.TextField(label="Khasra no. (optional)", width=180)
     classification = ft.Dropdown(label="Classification (optional)", width=220, options=[
         ft.dropdown.Option("none", "All / not specified"),
     ])
     floor = ft.TextField(label="Floor (if applicable)", width=180)
-    dc_rate_unit = ft.Dropdown(label="DC rate unit (select explicitly)", width=220, options=[
+    dc_rate_unit = ft.Dropdown(label="DC rate unit", hint_text="Unit appears when a matching rate is found", width=240, options=[
         ft.dropdown.Option(unit, RATE_UNITS[unit]) for unit in DC_RATE_UNITS
     ])
     fbr_rate_unit = ft.Dropdown(label="FBR rate unit (if available)", width=220, options=[
@@ -180,10 +180,10 @@ def build_valuation_page(
     area_unit = ft.Dropdown(label="Area input unit", value="kmf", visible=False, options=[
         ft.dropdown.Option("kmf", "K-M-F")
     ])
-    dc_rate_choice = ft.Dropdown(label="Matched DC rate", width=360, options=[])
-    fbr_rate_choice = ft.Dropdown(label="Matched FBR rate (editable)", width=360, options=[])
-    location_match = ft.Dropdown(label="Matching schedule location", width=360, options=[], visible=False)
-    rate_match_status = ft.Text("Enter schedule fields to find matching DC and FBR rates.", size=12, color="#475569")
+    dc_rate_choice = ft.Dropdown(label="Matched DC rate", hint_text="No matching rate yet", expand=True, options=[], visible=False)
+    fbr_rate_choice = ft.Dropdown(label="Matched FBR rate (editable)", hint_text="No matching rate yet", expand=True, options=[], visible=False)
+    location_match = ft.Dropdown(label="Choose matching schedule location", expand=True, options=[], visible=False)
+    rate_match_status = ft.Text("Enter schedule details to find matching DC and FBR rates.", size=12, color="#475569")
     marla_setting = ft.Dropdown(label="Square feet per marla", value="272", width=210, options=[
         ft.dropdown.Option("272", "272 sq ft"), ft.dropdown.Option("225", "225 sq ft")
     ])
@@ -279,7 +279,11 @@ def build_valuation_page(
             for item in locations:
                 if str(item.get("land_type") or "urban").casefold() != property_profile.value:
                     continue
-                if any(other_key != key and _text_value(other_control)
+                # Square choices depend on the selected Mauza/address, while
+                # Kila choices depend on both that context and the selected
+                # square. Do not let a stale Kila hide valid square choices.
+                excluded = {"square_no", "kila_no"} if key == "square_no" else {key}
+                if any(other_key not in excluded and _text_value(other_control)
                        and not _location_field_matches(item, other_key, _text_value(other_control))
                        for other_key, other_control in active):
                     continue
@@ -319,7 +323,11 @@ def build_valuation_page(
             rate_records["dc"], rate_records["fbr"] = [], []
             dc_rate_choice.options, fbr_rate_choice.options = [], []
             dc_rate_choice.value, fbr_rate_choice.value = None, None
-            rate_match_status.value = "No matching schedule location yet. Complete the location fields."
+            dc_rate_unit.options, fbr_rate_unit.options = [], []
+            dc_rate_unit.value, fbr_rate_unit.value = None, None
+            dc_rate_unit.visible = dc_rate_choice.visible = False
+            fbr_rate_unit.visible = fbr_rate_choice.visible = False
+            rate_match_status.value = "No schedule location matches these details. Check the selected Mauza, square and Kila."
             page.update()
             return
 
@@ -335,11 +343,13 @@ def build_valuation_page(
             rows = [row for row in all_rates if row.get("schedule_type") == schedule]
             units = sorted({row["rate_unit"] for row in rows})
             unit_control.options = [ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units]
+            unit_control.visible = bool(units) and (schedule == "dc" or property_profile.value == "urban")
             if unit_control.value not in units:
                 unit_control.value = units[0] if len(units) == 1 else None
             rows = [row for row in rows if not unit_control.value or row["rate_unit"] == unit_control.value]
             rate_records[schedule] = rows
             rate_control.options = [ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows]
+            rate_control.visible = bool(rows) and (schedule == "dc" or property_profile.value == "urban")
             if rate_control.value not in {str(row["id"]) for row in rows}:
                 rate_control.value = str(rows[0]["id"]) if len(rows) == 1 else None
         classes = sorted({str(row.get("classification")) for row in all_rates if row.get("classification")})
@@ -353,7 +363,11 @@ def build_valuation_page(
             location.value = str(selected_dc["location_id"])
             rate_match_status.value = f"DC rate found: {_rate_label(selected_dc)}"
         else:
-            rate_match_status.value = f"{len(rate_records['dc'])} matching DC rate(s); choose a unit or rate if needed."
+            rate_match_status.value = (
+                "The location matches, but no active DC rate was found for today's date."
+                if not rate_records["dc"] else
+                f"{len(rate_records['dc'])} DC rate(s) found. Choose a unit and rate to continue."
+            )
         page.update()
 
     for control in (district, tehsil, mauza, town, revenue_circle, property_area,
@@ -362,6 +376,21 @@ def build_valuation_page(
         control.on_change = refresh_rate_matches
         if isinstance(control, ft.AutoComplete):
             control.on_select = refresh_rate_matches
+
+    def on_mauza_change(_=None):
+        # A new Mauza invalidates cadastral choices from the prior record.
+        square_no.value = ""
+        kila_no.value = ""
+        refresh_rate_matches()
+
+    def on_square_change(_=None):
+        # Kila suggestions are scoped to the selected square.
+        kila_no.value = ""
+        refresh_rate_matches()
+
+    mauza.on_change = on_mauza_change
+    square_no.on_change = on_square_change
+    square_no.on_select = on_square_change
     property_profile.on_change = refresh_rate_matches
     dc_rate_choice.on_select = refresh_rate_matches
     fbr_rate_choice.on_select = refresh_rate_matches
@@ -843,8 +872,8 @@ def build_valuation_page(
             ft.Container(ft.ResponsiveRow([
                 ft.Container(ft.Column([ft.Text("Tehsil"), tehsil]), col={"xs": 12, "md": 4}),
                 ft.Container(ft.Column([ft.Text("Location"), schedule_location]), col={"xs": 12, "md": 4}),
-                ft.Container(square_no, col={"xs": 12, "md": 2}),
-                ft.Container(kila_no, col={"xs": 12, "md": 2}),
+                ft.Container(ft.Column([ft.Text("Square no. (optional)"), square_no], spacing=3), col={"xs": 12, "md": 2}),
+                ft.Container(ft.Column([ft.Text("Kila no. (optional)"), kila_no], spacing=3), col={"xs": 12, "md": 2}),
             ], run_spacing=5), col=12),
             ft.Container(location_match, col={"xs": 12, "md": 6}),
             ft.Container(dc_rate_unit, col={"xs": 12, "md": 4}),
@@ -874,7 +903,9 @@ def build_valuation_page(
     formula_list.controls.append(ft.Text("Loading saved formulas…", color="#64748B"))
 
     rule_status = ft.Text("", size=12, color="#475569")
-    rules_list = ft.ListView(expand=True, spacing=6)
+    # A bounded list keeps the rules panel from stretching into an empty
+    # surface when there are few records; the list itself scrolls as needed.
+    rules_list = ft.ListView(height=280, spacing=8, padding=4)
 
     def refresh_rules(rules=None):
         rules_list.controls.clear()
@@ -912,16 +943,8 @@ def build_valuation_page(
         rate = ft.TextField(label="Rate / percent", value=str(existing.get("rate_value") or ""), width=180)
         fixed = ft.TextField(label="Fixed amount", value=str(existing.get("fixed_amount") or ""), width=180)
         rate_unit_field = ft.TextField(label="Rate unit (required for per-unit)", value=existing.get("rate_unit") or "", width=220)
-        effective_from = ft.TextField(label="Effective from", value=str(existing.get("effective_from") or date.today().isoformat()), width=180)
-        effective_to = ft.TextField(label="Effective to (optional)", value=str(existing.get("effective_to") or ""), width=180)
         minimum = ft.TextField(label="Minimum charge", value=str(existing.get("minimum_amount") or ""), width=180)
         maximum = ft.TextField(label="Maximum charge", value=str(existing.get("maximum_amount") or ""), width=180)
-        source = ft.TextField(label="Source reference", value=existing.get("source_reference") or "", width=380)
-        source_date = ft.TextField(label="Source date", value=str(existing.get("source_date") or ""), width=180)
-        verification = ft.Dropdown(label="Verification", value=existing.get("verification_status", "unverified"), width=180, options=[
-            ft.dropdown.Option("unverified", "Unverified"), ft.dropdown.Option("verified", "Verified")
-        ])
-        verified_by = ft.TextField(label="Verified by", value=existing.get("verified_by") or "", width=220)
         conditions = ft.TextField(
             label="Eligibility / payer / base JSON", multiline=True,
             value=existing.get("eligibility_conditions_json") or '{"base":"transferred_value","payer":"buyer"}',
@@ -969,23 +992,49 @@ def build_valuation_page(
                     "rate_value": (rate.value or "").strip() or None,
                     "fixed_amount": (fixed.value or "").strip() or None,
                     "rate_unit": rate_unit_field.value,
-                    "effective_from": effective_from.value,
-                    "effective_to": effective_to.value,
+                    # The compact dialog hides schedule metadata. Existing
+                    # metadata is preserved on edit; new rules start today
+                    # and remain unverified until reviewed elsewhere.
+                    "effective_from": existing.get("effective_from") or date.today(),
+                    "effective_to": existing.get("effective_to"),
                     "minimum_amount": (minimum.value or "").strip() or None,
                     "maximum_amount": (maximum.value or "").strip() or None,
                     "eligibility_conditions_json": conditions.value,
-                    "source_reference": source.value,
-                    "source_date": (source_date.value or "").strip() or None,
-                    "verification_status": verification.value,
-                    "verified_by": verified_by.value,
+                    "source_reference": existing.get("source_reference"),
+                    "source_date": existing.get("source_date"),
+                    "verification_status": existing.get("verification_status") or "unverified",
+                    "verified_by": existing.get("verified_by"),
                 }
                 if existing.get("id"):
                     update_tax_fee_rule(rule_id=existing["id"], **values)
                 else:
                     create_tax_fee_rule(**values)
-                page.pop_dialog()
                 refresh_rules()
-                rule_status.value = "Rule saved. It applies according to its dates and eligibility configuration."
+                rule_status.value = "Rule saved. Applicable rules are included in the next deed cost calculation."
+                if existing.get("id"):
+                    page.pop_dialog()
+                else:
+                    # Keep Add open for consecutive entries, but reset every
+                    # input so the next rule cannot inherit stale values.
+                    rule_name.value = ""
+                    category.value = ""
+                    rule_jurisdiction.value = "Punjab"
+                    method.value = "percentage"
+                    rate.value = ""
+                    fixed.value = ""
+                    rate_unit_field.value = ""
+                    minimum.value = ""
+                    maximum.value = ""
+                    conditions.value = '{"base":"transferred_value","payer":"buyer"}'
+                    update_rule_method()
+                notification = ft.SnackBar(
+                    content=ft.Text("Tax / fee rule saved successfully."), duration=2500
+                )
+                if hasattr(page, "show_dialog"):
+                    page.show_dialog(notification)
+                else:
+                    notification.open = True
+                    page.snack_bar = notification
                 page.update()
             except (TaxRuleError, ValueError, TypeError) as exc:
                 error.value = str(exc)
@@ -1008,12 +1057,19 @@ def build_valuation_page(
                     ft.OutlinedButton("236K", on_click=lambda _: use_percentage_preset("236K")),
                     ft.OutlinedButton("Fixed service charge", on_click=use_fixed_preset),
                 ], wrap=True),
-                ft.Row([rule_name, category, rule_jurisdiction], wrap=True),
-                ft.Row([method, rate, fixed, rate_unit_field], wrap=True),
-                ft.Row([effective_from, effective_to, minimum, maximum], wrap=True),
-                ft.Row([source, source_date, verification, verified_by], wrap=True),
+                ft.ResponsiveRow([
+                    ft.Container(rule_name, col={"xs": 12, "md": 4}),
+                    ft.Container(category, col={"xs": 12, "md": 4}),
+                    ft.Container(rule_jurisdiction, col={"xs": 12, "md": 4}),
+                    ft.Container(method, col={"xs": 12, "md": 4}),
+                    ft.Container(rate, col={"xs": 12, "md": 4}),
+                    ft.Container(fixed, col={"xs": 12, "md": 4}),
+                    ft.Container(rate_unit_field, col={"xs": 12, "md": 4}),
+                    ft.Container(minimum, col={"xs": 12, "md": 4}),
+                    ft.Container(maximum, col={"xs": 12, "md": 4}),
+                ], run_spacing=8),
                 conditions, error,
-            ], tight=True, scroll=ft.ScrollMode.AUTO, width=700, height=570, spacing=8),
+            ], tight=True, scroll=ft.ScrollMode.AUTO, width=720, height=540, spacing=10),
             actions=[ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()), ft.Button("Save rule", on_click=save)],
         ))
 
@@ -1031,7 +1087,7 @@ def build_valuation_page(
         ft.Text("Formula fields are numeric inputs shown on Calculate. Formulas are dated and default to unverified. Example: area * 2.5% + 2000.", size=12, color="#64748B"),
         custom_fields_status,
         formula_list,
-    ], expand=True)
+    ], expand=True, spacing=10, scroll=ft.ScrollMode.AUTO)
     rules_list.controls.append(ft.Text("Loading tax and fee rules…", color="#64748B"))
 
     # Keep existing DC/FBR maintenance available in the same page. Each tab

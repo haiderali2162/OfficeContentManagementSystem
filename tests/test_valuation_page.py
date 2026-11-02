@@ -1,5 +1,6 @@
 """The valuation page control tree builds against the installed Flet API."""
 
+import asyncio
 import flet as ft
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ class FakePage:
         self.services = []
         self.controls = []
         self.dialogs = []
+        self.popped_dialogs = 0
 
     def update(self):
         return None
@@ -23,7 +25,17 @@ class FakePage:
         return None
 
     def pop_dialog(self):
-        return None
+        self.popped_dialogs += 1
+
+
+def walk_controls(control):
+    """Walk nested Flet controls for focused UI interaction assertions."""
+    yield control
+    for child in getattr(control, "controls", ()) or ():
+        yield from walk_controls(child)
+    content = getattr(control, "content", None)
+    if isinstance(content, ft.Control):
+        yield from walk_controls(content)
 
 
 def test_valuation_page_builds_with_tabs_and_existing_rate_management(monkeypatch):
@@ -144,4 +156,98 @@ def test_add_tax_rule_opens_dialog_with_supported_flet_controls(monkeypatch):
     assert len(page.dialogs) == 1
     assert isinstance(page.dialogs[0], ft.AlertDialog)
     assert page.dialogs[0].title.value == "Add tax/fee rule"
+
+
+def test_saving_tax_rule_hides_metadata_clears_form_and_shows_snackbar(monkeypatch):
+    monkeypatch.setattr(valuation, "list_locations", lambda: [])
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    saved = []
+    monkeypatch.setattr(valuation, "create_tax_fee_rule", lambda **values: saved.append(values) or 42)
+
+    page = FakePage()
+    root = valuation.build_valuation_page(page)
+    rule_page = root.controls[2].content.controls[1].controls[1]
+    add_rule = rule_page.controls[2].controls[0]
+    add_rule.on_click(SimpleNamespace(control=add_rule))
+    form_dialog = page.dialogs[0]
+    form_controls = list(walk_controls(form_dialog.content))
+    labels = [control.label for control in form_controls if isinstance(control, ft.TextField)]
+    assert not any(label in {"Source reference", "Source date", "Effective from",
+                             "Effective to (optional)", "Verified by"} for label in labels)
+    assert not any(isinstance(control, ft.Dropdown) and control.label == "Verification"
+                   for control in form_controls)
+
+    fields = {control.label: control for control in form_controls if isinstance(control, ft.TextField)}
+    fields["Rule name"].value = "Example stamp"
+    fields["Category"].value = "stamp"
+    fields["Rate / percent"].value = "2"
+    save_button = form_dialog.actions[-1]
+    save_button.on_click(SimpleNamespace(control=save_button))
+
+    assert saved[0]["verification_status"] == "unverified"
+    assert saved[0]["effective_from"] is not None
+    assert fields["Rule name"].value == ""
+    assert fields["Category"].value == ""
+    assert fields["Rate / percent"].value == ""
+    assert page.popped_dialogs == 0  # Add dialog remains ready for the next rule.
+    assert isinstance(page.dialogs[-1], ft.SnackBar)
+
+
+def test_square_and_kila_suggestions_follow_selected_mauza_and_square(monkeypatch):
+    location_row = {
+        "id": 7, "name": "Chak 1", "district": "District A", "tehsil": "Tehsil A",
+        "land_type": "rural", "mauza": "Chak 1", "locality": "", "square_no": "15, 16",
+        "kila_no": "1, 2", "committee_town": "", "revenue_circle": "",
+        "property_area": "", "khasra_no": "",
+    }
+    rates = {
+        "dc": [{"id": 11, "location_id": 7, "schedule_type": "dc", "rate_unit": "per_kanal",
+                "rate_value": "100", "classification": "Residential", "property_type": "Residential",
+                "mauza": "Chak 1", "effective_from": valuation.date(2020, 1, 1), "effective_to": None}],
+        "fbr": [],
+    }
+    monkeypatch.setattr(valuation, "list_locations", lambda: [location_row])
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(valuation, "list_dc_rates", lambda *, location_id, schedule_type, **_kwargs: rates[schedule_type])
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    # Use control metadata so the test exercises the same handlers as user input.
+    square = next(control for control in controls if isinstance(control, ft.AutoComplete) and control.data == "square_no")
+    kila = next(control for control in controls if isinstance(control, ft.AutoComplete) and control.data == "kila_no")
+    mauza = next(control for control in controls if isinstance(control, ft.AutoComplete) and control.data == "mauza")
+    district = next(control for control in controls if isinstance(control, ft.AutoComplete) and control.data == "district")
+    tehsil = next(control for control in controls if isinstance(control, ft.AutoComplete) and control.data == "tehsil")
+    district.value, tehsil.value = "District A", "Tehsil A"
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    square_hints = {suggestion.value for suggestion in square.suggestions}
+    assert {"15", "16"}.issubset(square_hints)
+    unit = next(control for control in controls if isinstance(control, ft.Dropdown)
+                and control.label == "DC rate unit")
+    rate = next(control for control in controls if isinstance(control, ft.Dropdown)
+                and control.label == "Matched DC rate")
+    assert [option.key for option in unit.options] == ["per_kanal"]
+    assert len(rate.options) == 1
+
+    square.value = "15"
+    square.on_change(SimpleNamespace(control=square))
+    assert {suggestion.value for suggestion in kila.suggestions} >= {"1", "2"}
 
