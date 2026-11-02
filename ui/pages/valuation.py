@@ -903,16 +903,23 @@ def build_valuation_page(
     formula_list.controls.append(ft.Text("Loading saved formulas…", color="#64748B"))
 
     rule_status = ft.Text("", size=12, color="#475569")
-    # A bounded list keeps the rules panel from stretching into an empty
-    # surface when there are few records; the list itself scrolls as needed.
-    rules_list = ft.ListView(height=280, spacing=8, padding=4)
+    # Keep the viewport collapsed when empty. It grows with the rows up to a
+    # scrollable limit so an empty list cannot leave a gray block on the page.
+    rules_list = ft.ListView(data="tax_fee_rules", height=1, spacing=8, padding=4, visible=False)
+    rules_empty_state = ft.Text("Loading tax and fee rules…", size=12, color="#64748B")
 
     def refresh_rules(rules=None):
         rules_list.controls.clear()
         try:
             rules = list_tax_fee_rules() if rules is None else rules
             if not rules:
-                rules_list.controls.append(ft.Text("No tax or fee rules yet. Add rules from verified sources or mark manually entered rules unverified.", color="#64748B"))
+                rules_list.visible = False
+                rules_list.height = 1
+                rules_empty_state.value = "No tax or fee rules saved yet."
+                rules_empty_state.color = "#64748B"
+                rules_empty_state.visible = True
+                page.update()
+                return
             for rule in rules:
                 details = f"{rule['jurisdiction']} · {rule['category']} · {rule['calculation_method']} · {rule.get('verification_status', 'unverified').upper()}"
                 if rule["calculation_method"] == "fixed_amount":
@@ -929,8 +936,18 @@ def build_valuation_page(
                         ft.TextButton("Edit", on_click=lambda _, record=rule: open_rule_dialog(record)),
                     ], wrap=True),
                 ))
+            # One compact row is enough for one rule; larger collections grow
+            # to a capped viewport and scroll independently of the page.
+            rules_list.height = min(300, max(104, len(rules) * 112))
+            rules_list.visible = True
+            rules_empty_state.visible = False
         except Exception as exc:
-            rules_list.controls.append(ft.Text(f"Could not load rules: {exc}", color="#B91C1C"))
+            rules_list.visible = False
+            rules_list.height = 1
+            rules_empty_state.value = f"Could not load rules: {exc}"
+            rules_empty_state.color = "#B91C1C"
+            rules_empty_state.visible = True
+        page.update()
 
     def open_rule_dialog(existing: dict[str, Any] | None = None):
         existing = existing or {}
@@ -1078,6 +1095,7 @@ def build_valuation_page(
         ft.Text("Enter rules from their official source. Verification requires a source and reviewer. The calculator reports estimates and missing eligibility inputs.", size=12, color="#9A3412"),
         ft.Row([ft.Button("Add rule", on_click=lambda _: open_rule_dialog()), ft.TextButton("Refresh", on_click=lambda _: refresh_rules()), rule_status], wrap=True),
         rules_list,
+        rules_empty_state,
         ft.Divider(),
         ft.Row([
             ft.Text("Custom registry formulas", size=18, weight=ft.FontWeight.BOLD, expand=True),
@@ -1088,7 +1106,6 @@ def build_valuation_page(
         custom_fields_status,
         formula_list,
     ], expand=True, spacing=10, scroll=ft.ScrollMode.AUTO)
-    rules_list.controls.append(ft.Text("Loading tax and fee rules…", color="#64748B"))
 
     # Keep existing DC/FBR maintenance available in the same page. Each tab
     # remains an independently built section with its own service callbacks.

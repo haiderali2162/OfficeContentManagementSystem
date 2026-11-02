@@ -251,3 +251,41 @@ def test_square_and_kila_suggestions_follow_selected_mauza_and_square(monkeypatc
     square.on_change(SimpleNamespace(control=square))
     assert {suggestion.value for suggestion in kila.suggestions} >= {"1", "2"}
 
+
+def test_empty_rule_list_collapses_and_grows_only_for_saved_rules(monkeypatch):
+    rule_rows = []
+    monkeypatch.setattr(valuation, "list_locations", lambda: [])
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: rule_rows)
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    rules_list = next(control for control in controls
+                      if isinstance(control, ft.ListView) and control.data == "tax_fee_rules")
+    empty_state = next(control for control in controls
+                       if isinstance(control, ft.Text) and control.value == "No tax or fee rules saved yet.")
+    assert rules_list.visible is False
+    assert empty_state.visible is True
+
+    rule_rows.append({
+        "id": 1, "name": "Example", "jurisdiction": "Punjab", "category": "fee",
+        "calculation_method": "fixed_amount", "fixed_amount": "100", "currency_code": "PKR",
+        "effective_from": valuation.date.today(), "effective_to": None,
+        "verification_status": "unverified",
+    })
+    rule_page = root.controls[2].content.controls[1].controls[1]
+    refresh_button = rule_page.controls[2].controls[1]
+    refresh_button.on_click(SimpleNamespace(control=refresh_button))
+    assert rules_list.visible is True
+    assert rules_list.height == 112
+    assert empty_state.visible is False
+
