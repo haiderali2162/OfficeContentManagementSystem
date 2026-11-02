@@ -166,6 +166,87 @@ def test_large_location_set_keeps_quick_filter_bounded(monkeypatch):
                for control in _walk(root) if isinstance(control, ft.Text))
 
 
+def test_qanoongoi_choices_are_unique_and_cascade_to_mauza_suggestions(monkeypatch):
+    locations = [
+        {"id": 1, "name": "Location A", "qanoongoi": "Qanoongoi A"},
+        {"id": 2, "name": "Location B", "qanoongoi": " qanoongoi a "},
+        {"id": 3, "name": "Location C", "qanoongoi": "Qanoongoi B"},
+        {"id": 4, "name": "Location D", "qanoongoi": ""},
+    ]
+    calls = []
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: locations)
+    monkeypatch.setattr(
+        dc_rates, "list_dc_rates",
+        lambda **kwargs: calls.append(("rates", kwargs)) or [],
+    )
+    monkeypatch.setattr(
+        dc_rates, "summarize_dc_rates",
+        lambda **_: {
+            "count": 0, "lowest": None, "highest": None,
+            "lowest_square": None, "highest_square": None,
+            "lowest_kila": None, "highest_kila": None,
+        },
+    )
+    monkeypatch.setattr(
+        dc_rates, "list_mauza_names",
+        lambda **kwargs: calls.append(("mauza", kwargs)) or ["Location A"],
+    )
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    qanoongoi = next(
+        control for control in _walk(root)
+        if isinstance(control, ft.AutoComplete) and control.data == "qanoongoi"
+    )
+    mauza = next(
+        control for control in _walk(root)
+        if isinstance(control, ft.AutoComplete) and control.data == "mauza"
+    )
+
+    assert [item.value for item in qanoongoi.suggestions] == [
+        "Qanoongoi A", "Qanoongoi B",
+    ]
+    mauza.value = "Old Mauza"
+    qanoongoi.value = "Qanoongoi A"
+    qanoongoi.on_change(None)
+    asyncio.run(page.background_task)
+
+    assert mauza.value == ""
+    rate_filters = [kwargs for kind, kwargs in calls if kind == "rates"][-1]
+    mauza_filters = [kwargs for kind, kwargs in calls if kind == "mauza"][-1]
+    assert rate_filters["qanoongoi"] == "Qanoongoi A"
+    assert mauza_filters["qanoongoi"] == "Qanoongoi A"
+
+
+def test_area_summary_dialog_shows_hierarchy_counts(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_location_hierarchy", lambda: [{
+        "district": "District A",
+        "tehsil": "Tehsil A",
+        "qanoongoi": "Qanoongoi A",
+        "mauza_count": 3,
+        "tehsil_count": 1,
+        "qanoongoi_count": 2,
+    }])
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    summary_button = next(
+        control for control in root.controls[2].controls
+        if isinstance(control, ft.OutlinedButton) and control.content == "Area summary"
+    )
+    summary_button.on_click(None)
+
+    dialog = page.dialogs[-1]
+    assert dialog.title.value == "District / Tehsil / Qanoongoi summary"
+    assert any("1 district(s) · 1 tehsil(s) · 1 qanoongoi(s)" in (control.value or "")
+               for control in _walk(dialog.content) if isinstance(control, ft.Text))
+    table = next(control for control in _walk(dialog.content)
+                 if isinstance(control, ft.DataTable))
+    assert [[cell.content.value for cell in row.cells] for row in table.rows] == [[
+        "District A", "1", "Tehsil A", "2", "Qanoongoi A", "3",
+    ]]
+
+
 def test_edit_button_passes_the_rate_id_explicitly(monkeypatch):
     record = _rate_record()
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [{"id": 3, "name": "Test Mauza"}])
@@ -219,10 +300,10 @@ def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch)
     controls = list(_walk(root))
     labels = {control.label for control in controls if isinstance(control, (ft.TextField, ft.Dropdown))}
     text_labels = {control.value for control in controls if isinstance(control, ft.Text)}
-    assert {"Mauza", "Square no.", "Kila no.", "Khasra no."} <= text_labels
+    assert {"Qanoongoi", "Mauza", "Square no.", "Kila no.", "Khasra no."} <= text_labels
     assert {"Rate unit", "Schedule"} <= labels
     autocompletes = [control for control in controls if isinstance(control, ft.AutoComplete)]
-    assert len(autocompletes) == 4
+    assert len(autocompletes) == 5
     schedule = next(control for control in controls if isinstance(control, ft.Dropdown) and control.label == "Schedule")
     assert [option.key for option in schedule.options] == ["dc_rural", "dc_urban", "fbr", "all"]
     search = next(control for control in controls if isinstance(control, ft.TextField)
@@ -456,7 +537,9 @@ def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch)
     cadastral_calls = []
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [_rate_record()])
-    monkeypatch.setattr(dc_rates, "list_mauza_names", lambda **_kwargs: ["Test Mauza", "Other Mauza"])
+    def list_mauza_names(**_kwargs):
+        return ["Test Mauza", "Other Mauza"]
+    monkeypatch.setattr(dc_rates, "list_mauza_names", list_mauza_names)
     def list_cadastral(field_name, **kwargs):
         cadastral_calls.append((field_name, kwargs.get("search", "")))
         return ["12", "123"] if field_name == "square_no" else ["4"]
@@ -468,13 +551,23 @@ def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch)
     })
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page, defer_initial_load=True)
-    mauza = next(control for control in _walk(root) if isinstance(control, ft.AutoComplete))
+    qanoongoi = next(
+        control for control in _walk(root)
+        if isinstance(control, ft.AutoComplete) and control.data == "qanoongoi"
+    )
+    mauza = next(
+        control for control in _walk(root)
+        if isinstance(control, ft.AutoComplete) and control.data == "mauza"
+    )
     assert mauza.suggestions == []
     mauza.value = "Test Mauza"
     asyncio.run(page.background_task)
 
     assert [item.value for item in mauza.suggestions] == ["Test Mauza", "Other Mauza"]
-    square, kila, khasra = [control for control in _walk(root) if isinstance(control, ft.AutoComplete)][1:]
+    square, kila, khasra = [
+        control for control in _walk(root)
+        if isinstance(control, ft.AutoComplete) and control not in (qanoongoi, mauza)
+    ]
     assert [option.value for option in square.suggestions] == ["12", "123"]
     assert [option.value for option in kila.suggestions] == ["4"]
     assert [option.value for option in khasra.suggestions] == ["4"]

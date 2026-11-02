@@ -44,6 +44,7 @@ from services.dc_rate_service import (
     remove_duplicate_dc_rates_with_report,
     suggested_column_mapping,
     summarize_dc_rates,
+    summarize_location_hierarchy,
     summarize_mauza_cadastral_selection,
     search_khewats,
     summarize_mauza_references,
@@ -77,6 +78,16 @@ def _cadastral_label(record: dict) -> str:
     ))
 
 
+def _unique_location_values(locations: list[dict], field: str) -> list[str]:
+    """Return trimmed, case-insensitively unique values for a location field."""
+    values = {}
+    for location in locations:
+        value = " ".join(str(location.get(field) or "").split())
+        if value:
+            values.setdefault(value.casefold(), value)
+    return sorted(values.values(), key=str.casefold)
+
+
 def build_dc_rates_page(
     page: ft.Page,
     *,
@@ -98,7 +109,12 @@ def build_dc_rates_page(
     visible_location_limit = 500
     location_picker_truncated = False
 
-    mauza_filter = ft.AutoComplete(width=220, suggestions_max_height=240)
+    qanoongoi_filter = ft.AutoComplete(
+        width=200, suggestions_max_height=240, data="qanoongoi"
+    )
+    mauza_filter = ft.AutoComplete(
+        width=220, suggestions_max_height=240, data="mauza"
+    )
     square_filter = ft.AutoComplete(width=140, suggestions_max_height=220)
     kila_filter = ft.AutoComplete(width=140, suggestions_max_height=220)
     khasra_filter = ft.AutoComplete(width=150, suggestions_max_height=220)
@@ -170,6 +186,10 @@ def build_dc_rates_page(
         """Reload location choices used by the filter and rate editor."""
         nonlocal location_picker_truncated
         locations = list_locations() if locations is None else locations
+        qanoongoi_filter.suggestions = [
+            ft.AutoCompleteSuggestion(key=value, value=value)
+            for value in _unique_location_values(locations, "qanoongoi")
+        ]
         visible_locations = locations[:visible_location_limit]
         location_picker_truncated = len(locations) > visible_location_limit
         location_filter.options = [
@@ -216,6 +236,7 @@ def build_dc_rates_page(
             if records is None:
                 records = list_dc_rates(
                     search=search_field.value or "", mauza=mauza_filter.value or "",
+                    qanoongoi=qanoongoi_filter.value or "",
                     square_no=square_filter.value or "", kila_no=kila_filter.value or "",
                     khasra_no=khasra_filter.value or "",
                     schedule_type=schedule_type, land_type=land_type,
@@ -313,6 +334,7 @@ def build_dc_rates_page(
                     asyncio.to_thread(
                         list_dc_rates,
                         search=search_field.value or "", mauza=mauza_filter.value or "",
+                        qanoongoi=qanoongoi_filter.value or "",
                         square_no=square_filter.value or "", kila_no=kila_filter.value or "",
                         khasra_no=khasra_filter.value or "",
                         schedule_type=schedule_type, land_type=land_type,
@@ -323,10 +345,15 @@ def build_dc_rates_page(
                     asyncio.to_thread(
                         summarize_dc_rates,
                         mauza=mauza_filter.value or "",
+                        qanoongoi=qanoongoi_filter.value or "",
                         rate_unit=unit_filter.value if unit_filter.value != "all" else None,
                         schedule_type=schedule_type, land_type=land_type,
                     ),
-                    asyncio.to_thread(list_mauza_names, search=mauza_filter.value or ""),
+                    asyncio.to_thread(
+                        list_mauza_names,
+                        search=mauza_filter.value or "",
+                        qanoongoi=qanoongoi_filter.value or "",
+                    ),
                 )
                 if generation != request_generation:
                     return
@@ -746,6 +773,7 @@ def build_dc_rates_page(
                 unit_filter.value = "all"
                 published_year_filter.value = ""
                 search_field.value = ""
+                qanoongoi_filter.value = ""
                 mauza_filter.value = ""
                 square_filter.value = ""
                 kila_filter.value = ""
@@ -980,6 +1008,7 @@ def build_dc_rates_page(
                             unit_filter.value = "all"
                             published_year_filter.value = ""
                             search_field.value = ""
+                            qanoongoi_filter.value = ""
                             mauza_filter.value = ""
                             square_filter.value = ""
                             kila_filter.value = ""
@@ -1046,6 +1075,7 @@ def build_dc_rates_page(
             rate_unit=unit_filter.value if unit_filter.value != "all" else None,
             published_year=year,
             mauza=mauza_filter.value or "",
+            qanoongoi=qanoongoi_filter.value or "",
             square_no=square_filter.value or "",
             kila_no=kila_filter.value or "",
             khasra_no=khasra_filter.value or "",
@@ -1927,7 +1957,14 @@ def build_dc_rates_page(
         ))
         page.update()
 
+    def qanoongoi_changed(event):
+        """Reset a Mauza that belonged to the previous Qanoongoi selection."""
+        mauza_filter.value = ""
+        schedule_rates_refresh(event)
+
     search_field.on_change = schedule_rates_refresh
+    qanoongoi_filter.on_change = qanoongoi_changed
+    qanoongoi_filter.on_select = qanoongoi_changed
     mauza_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="mauza")
     mauza_filter.on_select = schedule_rates_refresh
     square_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="square_no")
@@ -2068,6 +2105,78 @@ def build_dc_rates_page(
         run_search()
         page.update()
 
+    def open_hierarchy_summary_dialog(_=None):
+        """Show district, Tehsil, Qanoongoi, and Mauza counts from the database."""
+        try:
+            rows = summarize_location_hierarchy()
+        except Exception as exc:
+            status_text.value = f"Could not load area summary: {exc}"
+            page.update()
+            return
+        if not rows:
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Area summary"),
+                content=ft.Text("No location records are available to summarize."),
+                actions=[ft.TextButton("Close", on_click=lambda _: close_dialog())],
+            ))
+            return
+        district_count = len({row["district"] for row in rows})
+        tehsil_count = len({
+            (row["district"], row["tehsil"]) for row in rows if row["tehsil"]
+        })
+        qanoongoi_count = len({
+            (row["district"], row["tehsil"], row["qanoongoi"])
+            for row in rows if row["qanoongoi"]
+        })
+        table = ft.DataTable(
+            columns=[
+                ft.DataColumn(label=ft.Text("District")),
+                ft.DataColumn(label=ft.Text("Tehsils in district")),
+                ft.DataColumn(label=ft.Text("Tehsil")),
+                ft.DataColumn(label=ft.Text("Qanoongoi in tehsil")),
+                ft.DataColumn(label=ft.Text("Qanoongoi")),
+                ft.DataColumn(label=ft.Text("Mauzas in Qanoongoi")),
+            ],
+            rows=[
+                ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(row["district"] or "Not recorded")),
+                    ft.DataCell(ft.Text(str(row["tehsil_count"]))),
+                    ft.DataCell(ft.Text(row["tehsil"] or "Not recorded")),
+                    ft.DataCell(ft.Text(str(row["qanoongoi_count"]))),
+                    ft.DataCell(ft.Text(row["qanoongoi"] or "Not recorded")),
+                    ft.DataCell(ft.Text(str(row["mauza_count"]))),
+                ])
+                for row in rows
+            ],
+            column_spacing=18,
+            horizontal_margin=8,
+        )
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("District / Tehsil / Qanoongoi summary"),
+            content=ft.Column(
+                controls=[
+                    ft.Text(
+                        f"{district_count} district(s) · {tehsil_count} tehsil(s) · "
+                        f"{qanoongoi_count} qanoongoi(s)",
+                        size=12,
+                        color="#475569",
+                    ),
+                    ft.Column(
+                        controls=[ft.Row([table], scroll=ft.ScrollMode.AUTO)],
+                        height=390,
+                        scroll=ft.ScrollMode.AUTO,
+                    ),
+                ],
+                width=940,
+                height=500,
+                spacing=8,
+            ),
+            actions=[ft.TextButton("Close", on_click=lambda _: close_dialog())],
+        ))
+        page.update()
+
     import_export_button = ft.TextButton("Show import / export")
     filter_button = ft.TextButton("Show filters")
 
@@ -2089,6 +2198,7 @@ def build_dc_rates_page(
             ft.OutlinedButton("Find / remove duplicates", on_click=open_duplicate_cleanup_dialog),
             ft.OutlinedButton("Select squares / Kilas", on_click=open_cadastral_selection_dialog),
             ft.OutlinedButton("View Khewats", on_click=open_khewat_search_dialog),
+            ft.OutlinedButton("Tehsil Details", on_click=open_hierarchy_summary_dialog),
             filter_button,
             import_export_button,
             ft.TextButton("Refresh", on_click=schedule_rates_refresh),
@@ -2124,6 +2234,7 @@ def build_dc_rates_page(
         visible=False,
     )
     filters = ft.ResponsiveRow([
+        ft.Container(ft.Column([ft.Text("Qanoongoi"), qanoongoi_filter], spacing=2), col={"xs": 12, "sm": 6, "md": 3}),
         ft.Container(ft.Column([ft.Text("Mauza"), mauza_filter], spacing=2), col={"xs": 12, "sm": 6, "md": 3}),
         ft.Container(ft.Column([ft.Text("Square no."), square_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(ft.Column([ft.Text("Kila no."), kila_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
@@ -2201,8 +2312,15 @@ def build_dc_rates_page(
                 locations, records, mauza_names, summary, squares, kilas, khasras = await asyncio.gather(
                     asyncio.to_thread(list_locations),
                     asyncio.to_thread(list_dc_rates, limit=visible_rate_limit + 1),
-                    asyncio.to_thread(list_mauza_names, search=mauza_filter.value or ""),
-                    asyncio.to_thread(summarize_dc_rates),
+                    asyncio.to_thread(
+                        list_mauza_names,
+                        search=mauza_filter.value or "",
+                        qanoongoi=qanoongoi_filter.value or "",
+                    ),
+                    asyncio.to_thread(
+                        summarize_dc_rates,
+                        qanoongoi=qanoongoi_filter.value or "",
+                    ),
                     asyncio.to_thread(list_cadastral_values, "square_no"),
                     asyncio.to_thread(list_cadastral_values, "kila_no"),
                     asyncio.to_thread(list_cadastral_values, "khasra_no"),

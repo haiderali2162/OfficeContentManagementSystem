@@ -162,6 +162,18 @@ def _text(value: Any) -> str | None:
     return normalized or None
 
 
+def _apply_qanoongoi_filter(statement, qanoongoi: str):
+    """Match a Qanoongoi filter case-insensitively against trimmed DB text."""
+    term = _text(qanoongoi)
+    if term:
+        statement = statement.where(
+            func.lower(func.trim(PropertyLocation.qanoongoi)).like(
+                f"%{term.casefold()}%"
+            )
+        )
+    return statement
+
+
 def _reference_values(value: Any) -> list[str]:
     """Expand square/Kila/Khasra lists and inclusive numeric ranges to tokens."""
     normalized = _text(value)
@@ -717,7 +729,9 @@ def list_locations() -> list[dict[str, Any]]:
         ]
 
 
-def list_mauza_names(*, search: str = "", limit: int = 50) -> list[str]:
+def list_mauza_names(
+    *, search: str = "", qanoongoi: str = "", limit: int = 50
+) -> list[str]:
     """Return distinct Mauza values that have at least one DC or FBR rate."""
     statement = (
         select(PropertyLocation.mauza)
@@ -728,9 +742,74 @@ def list_mauza_names(*, search: str = "", limit: int = 50) -> list[str]:
     )
     if search.strip():
         statement = statement.where(PropertyLocation.mauza.ilike(f"%{search.strip()}%"))
+    statement = _apply_qanoongoi_filter(statement, qanoongoi)
     statement = statement.limit(max(1, limit))
     with SessionLocal() as session:
         return list(session.scalars(statement).all())
+
+
+def summarize_location_hierarchy() -> list[dict[str, Any]]:
+    """Summarize Tehsils and Qanoongoi per district with Mauza counts.
+
+    Blank administrative values are returned as empty strings so the UI can
+    label them as unrecorded without hiding their Mauza rows.
+    """
+    district_key = func.lower(func.trim(func.coalesce(PropertyLocation.district, "")))
+    tehsil_key = func.lower(func.trim(func.coalesce(PropertyLocation.tehsil, "")))
+    qanoongoi_key = func.lower(func.trim(func.coalesce(PropertyLocation.qanoongoi, "")))
+    mauza_key = func.lower(func.trim(PropertyLocation.mauza))
+    statement = (
+        select(
+            district_key.label("district_key"),
+            func.min(func.trim(PropertyLocation.district)).label("district"),
+            tehsil_key.label("tehsil_key"),
+            func.min(func.trim(PropertyLocation.tehsil)).label("tehsil"),
+            qanoongoi_key.label("qanoongoi_key"),
+            func.min(func.trim(PropertyLocation.qanoongoi)).label("qanoongoi"),
+            func.count(func.distinct(mauza_key)).label("mauza_count"),
+        )
+        .where(
+            PropertyLocation.mauza.is_not(None),
+            func.trim(PropertyLocation.mauza) != "",
+        )
+        .group_by(district_key, tehsil_key, qanoongoi_key)
+    )
+    with SessionLocal() as session:
+        rows = session.execute(statement).all()
+
+    tehsils_by_district: dict[str, set[str]] = {}
+    qanoongoi_by_tehsil: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        if row.tehsil_key:
+            tehsils_by_district.setdefault(row.district_key, set()).add(
+                row.tehsil_key
+            )
+        if row.qanoongoi_key:
+            qanoongoi_by_tehsil.setdefault(
+                (row.district_key, row.tehsil_key), set()
+            ).add(row.qanoongoi_key)
+
+    summary = [
+        {
+            "district": row.district or "",
+            "tehsil": row.tehsil or "",
+            "qanoongoi": row.qanoongoi or "",
+            "mauza_count": int(row.mauza_count),
+            "tehsil_count": len(tehsils_by_district.get(row.district_key, set())),
+            "qanoongoi_count": len(
+                qanoongoi_by_tehsil.get((row.district_key, row.tehsil_key), set())
+            ),
+        }
+        for row in rows
+    ]
+    summary.sort(
+        key=lambda item: (
+            item["district"].casefold(),
+            item["tehsil"].casefold(),
+            item["qanoongoi"].casefold(),
+        )
+    )
+    return summary
 
 
 MAUZA_CONTEXT_FIELDS = (
@@ -1488,16 +1567,17 @@ def list_cadastral_values(
 
 
 def summarize_dc_rates(
-    *, mauza: str = "", rate_unit: str | None = None,
+    *, mauza: str = "", qanoongoi: str = "", rate_unit: str | None = None,
     schedule_type: str | None = None, land_type: str | None = None,
 ) -> dict[str, Any]:
-    """Aggregate rate extremes for the selected Mauza, unit, and schedule."""
+    """Aggregate rate extremes for the selected location filters."""
     statement = (
         select(DCValuationRate.id)
         .join(PropertyLocation, DCValuationRate.location_id == PropertyLocation.id)
     )
     if mauza.strip():
         statement = statement.where(PropertyLocation.mauza.ilike(f"%{mauza.strip()}%"))
+    statement = _apply_qanoongoi_filter(statement, qanoongoi)
     if rate_unit:
         statement = statement.where(DCValuationRate.rate_unit == rate_unit)
     if schedule_type in {"dc", "fbr"}:
@@ -1667,6 +1747,7 @@ def list_dc_rates(
     effective_on: date | None = None,
     published_year: int | None = None,
     mauza: str = "",
+    qanoongoi: str = "",
     square_no: str = "",
     kila_no: str = "",
     khasra_no: str = "",
@@ -1676,8 +1757,9 @@ def list_dc_rates(
 ) -> list[dict[str, Any]]:
     statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
     search = search.strip()
-    if (mauza.strip() or square_no.strip() or kila_no.strip() or khasra_no.strip()
-            or land_type in {"rural", "urban"} or (search and not search.isdigit())):
+    if (mauza.strip() or qanoongoi.strip() or square_no.strip() or kila_no.strip()
+            or khasra_no.strip() or land_type in {"rural", "urban"}
+            or (search and not search.isdigit())):
         statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
@@ -1702,6 +1784,7 @@ def list_dc_rates(
         statement = statement.where(
             PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
         )
+    statement = _apply_qanoongoi_filter(statement, qanoongoi)
     # Cadastral fields are stored as token lists; query candidates in SQLite,
     # then validate whole tokens below so (for example) 2 does not match 12.
     for field_name, term in (

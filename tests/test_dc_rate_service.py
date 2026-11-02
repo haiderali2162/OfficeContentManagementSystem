@@ -481,6 +481,50 @@ def test_schedule_summary_reports_empty_results(rate_database):
     }
 
 
+def test_qanoongoi_filters_and_location_hierarchy_summary(rate_database):
+    alpha_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Alpha", mauza="Alpha", district="District A", tehsil="Tehsil A",
+        qanoongoi="Qanoongoi One",
+    ))
+    beta_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Beta", mauza="Beta", district="District A", tehsil="Tehsil A",
+        qanoongoi="Qanoongoi Two",
+    ))
+    gamma_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Gamma", mauza="Gamma", district="District A", tehsil="Tehsil B",
+        qanoongoi="qanoongoi one",
+    ))
+    unassigned_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Delta", mauza="Delta", district="District A", tehsil="Tehsil B",
+        qanoongoi="",
+    ))
+    for location_id in (alpha_id, beta_id, gamma_id, unassigned_id):
+        dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+
+    one_rates = dc_rate_service.list_dc_rates(qanoongoi="ONE")
+    assert {record["location_id"] for record in one_rates} == {alpha_id, gamma_id}
+    assert dc_rate_service.list_mauza_names(qanoongoi="one") == ["Alpha", "Gamma"]
+    assert dc_rate_service.list_mauza_names(qanoongoi="Two") == ["Beta"]
+    assert dc_rate_service.summarize_dc_rates(qanoongoi="one")["count"] == 2
+    assert dc_rate_service.list_dc_rates(qanoongoi="not present") == []
+
+    hierarchy = dc_rate_service.summarize_location_hierarchy()
+    assert len(hierarchy) == 4
+    tehsil_a = next(
+        row for row in hierarchy
+        if row["tehsil"] == "Tehsil A" and row["qanoongoi"] == "Qanoongoi One"
+    )
+    assert tehsil_a["mauza_count"] == 1
+    assert tehsil_a["tehsil_count"] == 2
+    assert tehsil_a["qanoongoi_count"] == 2
+    unassigned = next(
+        row for row in hierarchy
+        if row["tehsil"] == "Tehsil B" and row["qanoongoi"] == ""
+    )
+    assert unassigned["mauza_count"] == 1
+    assert unassigned["qanoongoi_count"] == 1
+
+
 def test_mauza_cadastral_selection_summary_and_khewat_assignment(rate_database):
     context_values = _location_values(
         mauza="Selection Mauza", name="Selection Mauza", district="Selection District",

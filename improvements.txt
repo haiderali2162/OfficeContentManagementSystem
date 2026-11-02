@@ -1,11 +1,3 @@
-on the "add tax/fee rule" dialog, make the following changes:
-	1. remove source reference, source date, verified, verified by fields, effective from, effective to. as these are unnecessary fields.
-	2. if a rule is successfully saved, show a snackbar and clear the fields.
-	3. all these rules must be used to calculate the total valuation of a deed.
-	4. under the "add rule" button there is a large gray box, it does not show anything, please fix it and make it responsive.
-
-on the calculate page make the following changes:
-	1. square no does not shows hint or list of available square no in the selected mauza so make it available, also under the selected square in killa no show the relevent killa no hints also.
-	2. dc rate unit field is not showing anything fix it also.
-	3. matched dc rate is also not working, it is not showing anything,fix it also.
-	4. under these, there is a white bar which does not show any thing, fix it.
+1. I changed the name to "tehsil details" from "area details". i need you to fix the table a bit. tehsils in district count is wrong like it is currently showing 1 even though there are more then 1 tehsil for a district so fix it so that the exact count is visible.
+2. the qanoongoi and mauza are working perfectly fine but the square no and killa no has some issue. for example for qanoongoi jandiala there is a mauza named madar and i searched for square no 10. the input field should provide hints and show available lists which it almost do the main problem is in killa field, it should show the killas availble in that specific square.
+3. third thing is that i think the 
