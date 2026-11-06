@@ -6,8 +6,29 @@ from types import SimpleNamespace
 from types import SimpleNamespace
 
 import flet as ft
+import pytest
 
+from services.dc_rate_duplicate_service import BUILTIN_PROFILES, profile_to_dict
 from ui.pages import dc_rates
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cadastral_settings(monkeypatch):
+    """Keep UI tests away from the live settings/database."""
+    saved_modes = []
+    monkeypatch.setattr(dc_rates, "get_cadastral_storage_mode", lambda: "ranges")
+    monkeypatch.setattr(
+        dc_rates, "set_cadastral_storage_mode", lambda mode: saved_modes.append(mode)
+    )
+    return saved_modes
+
+
+def _mock_duplicate_profiles(monkeypatch):
+    monkeypatch.setattr(
+        dc_rates,
+        "list_duplicate_rule_profiles",
+        lambda **_: [profile_to_dict(profile) for profile in BUILTIN_PROFILES],
+    )
 
 
 class FakePage:
@@ -37,6 +58,13 @@ def _walk(control):
     content = getattr(control, "content", None)
     if isinstance(content, ft.Control):
         yield from _walk(content)
+
+
+def _page_column(root):
+    """Return the scrollable page column when a busy overlay wraps it."""
+    if isinstance(root, ft.Stack) and root.controls:
+        return root.controls[0]
+    return root
 
 
 def _rate_record():
@@ -79,7 +107,7 @@ def test_add_button_event_is_not_used_as_rate_id(monkeypatch):
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
 
-    add_button = root.controls[2].controls[0]
+    add_button = _page_column(root).controls[2].controls[0]
     add_button.on_click(object())
 
     assert page.dialogs
@@ -129,7 +157,7 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
 
     assert root.expand is True
     assert root.width is None
-    root.controls[2].controls[0].on_click(object())
+    _page_column(root).controls[2].controls[0].on_click(object())
     dialog = page.dialogs[-1]
     fields = [control for control in _walk(dialog.content) if isinstance(control, (ft.TextField, ft.Dropdown))]
     by_label = {control.label: control for control in fields}
@@ -220,31 +248,46 @@ def test_qanoongoi_choices_are_unique_and_cascade_to_mauza_suggestions(monkeypat
 def test_area_summary_dialog_shows_hierarchy_counts(monkeypatch):
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
-    monkeypatch.setattr(dc_rates, "summarize_location_hierarchy", lambda: [{
-        "district": "District A",
-        "tehsil": "Tehsil A",
-        "qanoongoi": "Qanoongoi A",
-        "mauza_count": 3,
-        "tehsil_count": 1,
-        "qanoongoi_count": 2,
-    }])
+    monkeypatch.setattr(dc_rates, "summarize_location_hierarchy", lambda: [
+        {
+            "district": "District A",
+            "tehsil": "Tehsil A",
+            "qanoongoi": "Qanoongoi A",
+            "mauza_count": 3,
+            "tehsil_count": 2,
+            "qanoongoi_count": 2,
+        },
+        {
+            "district": "District A",
+            "tehsil": "Tehsil B",
+            "qanoongoi": "Qanoongoi B",
+            "mauza_count": 4,
+            "tehsil_count": 2,
+            "qanoongoi_count": 1,
+        },
+    ])
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
     summary_button = next(
-        control for control in root.controls[2].controls
-        if isinstance(control, ft.OutlinedButton) and control.content == "Area summary"
+        control for control in _page_column(root).controls[2].controls
+        if isinstance(control, ft.OutlinedButton) and control.content == "Tehsil Details"
     )
     summary_button.on_click(None)
 
     dialog = page.dialogs[-1]
-    assert dialog.title.value == "District / Tehsil / Qanoongoi summary"
-    assert any("1 district(s) · 1 tehsil(s) · 1 qanoongoi(s)" in (control.value or "")
+    assert dialog.title.value == "Tehsil details"
+    assert any("1 district(s) · 2 tehsil(s) · 2 qanoongoi(s)" in (control.value or "")
                for control in _walk(dialog.content) if isinstance(control, ft.Text))
-    table = next(control for control in _walk(dialog.content)
-                 if isinstance(control, ft.DataTable))
-    assert [[cell.content.value for cell in row.cells] for row in table.rows] == [[
-        "District A", "1", "Tehsil A", "2", "Qanoongoi A", "3",
+    tables = [control for control in _walk(dialog.content) if isinstance(control, ft.DataTable)]
+    assert len(tables) == 2
+    district_table, detail_table = tables
+    assert [[cell.content.value for cell in row.cells] for row in district_table.rows] == [[
+        "District A", "2", "2",
     ]]
+    assert [[cell.content.value for cell in row.cells] for row in detail_table.rows] == [
+        ["District A", "Tehsil A", "Qanoongoi A", "3"],
+        ["District A", "Tehsil B", "Qanoongoi B", "4"],
+    ]
 
 
 def test_edit_button_passes_the_rate_id_explicitly(monkeypatch):
@@ -331,7 +374,7 @@ def test_filter_and_import_export_sections_toggle_independently(monkeypatch):
     })
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
-    toolbar = root.controls[2]
+    toolbar = _page_column(root).controls[2]
     filter_button = next(control for control in toolbar.controls
                          if isinstance(control, ft.TextButton) and control.content == "Show filters")
     import_export_button = next(control for control in toolbar.controls
@@ -399,7 +442,7 @@ def test_cadastral_selection_dialog_summarizes_and_saves_slash_khewat(monkeypatc
 
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
-    selection_button = next(control for control in root.controls[2].controls
+    selection_button = next(control for control in _page_column(root).controls[2].controls
                             if isinstance(control, ft.OutlinedButton)
                             and control.content == "Select squares / Kilas")
     selection_button.on_click(None)
@@ -508,7 +551,7 @@ def test_main_khewat_search_filters_and_opens_saved_record(monkeypatch):
 
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
-    view_button = next(control for control in root.controls[2].controls
+    view_button = next(control for control in _page_column(root).controls[2].controls
                        if isinstance(control, ft.OutlinedButton) and control.content == "View Khewats")
     view_button.on_click(None)
     search_dialog = page.dialogs[-1]
@@ -582,11 +625,61 @@ def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch)
     assert ("square_no", "12") in cadastral_calls
 
 
-def test_duplicate_cleanup_dialog_previews_candidates_before_removal(monkeypatch):
-    record = {**_rate_record(), "duplicate_of": 6, "id": 7}
+def test_square_change_clears_kila_and_narrows_its_suggestions(monkeypatch):
+    cadastral_calls = []
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
-    monkeypatch.setattr(dc_rates, "find_duplicate_dc_rates", lambda: [record])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
+    monkeypatch.setattr(dc_rates, "list_mauza_names", lambda **_: [])
+
+    def list_cadastral(field_name, **kwargs):
+        cadastral_calls.append((field_name, kwargs))
+        if field_name == "square_no":
+            return ["10", "11"]
+        if field_name == "kila_no" and kwargs.get("square_no") == "10":
+            return ["1", "2"]
+        return []
+
+    monkeypatch.setattr(dc_rates, "list_cadastral_values", list_cadastral)
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page, defer_initial_load=True)
+    asyncio.run(page.background_task)
+    qanoongoi, mauza, square, kila, _ = [
+        control for control in _walk(root)
+        if isinstance(control, ft.AutoComplete)
+    ]
+
+    qanoongoi.value = "Jandiala"
+    mauza.value = "Madar"
+    kila.value = "9"
+    square.value = "10"
+    square.on_change(None)
+    asyncio.run(page.background_task)
+
+    assert kila.value == ""
+    assert [option.value for option in kila.suggestions] == ["1", "2"]
+    assert any(
+        field_name == "kila_no"
+        and kwargs.get("qanoongoi") == "Jandiala"
+        and kwargs.get("mauza") == "Madar"
+        and kwargs.get("square_no") == "10"
+        for field_name, kwargs in cadastral_calls
+    )
+
+
+def test_duplicate_cleanup_dialog_previews_candidates_before_removal(monkeypatch):
+    record = {**_rate_record(), "duplicate_of": 6, "id": 7}
+    _mock_duplicate_profiles(monkeypatch)
+    scanned_rules = []
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(
+        dc_rates,
+        "find_duplicate_dc_rates",
+        lambda rule: scanned_rules.append(rule) or [record],
+    )
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
     duplicate_button = next(control for control in _walk(root)
@@ -595,11 +688,19 @@ def test_duplicate_cleanup_dialog_previews_candidates_before_removal(monkeypatch
 
     duplicate_button.on_click(None)
     dialog = page.dialogs[-1]
+    rule_dropdown = next(
+        control for control in _walk(dialog.content)
+        if isinstance(control, ft.Dropdown)
+        and control.label == "Duplicate rule (required)"
+    )
+    rule_dropdown.value = "default:rural_dc_overlap"
     scan_button = next(control for control in dialog.actions
                        if isinstance(control, ft.OutlinedButton)
                        and control.content == "Scan for duplicates")
     scan_button.on_click(None)
     asyncio.run(page.background_task)
+
+    assert scanned_rules == ["default:rural_dc_overlap"]
 
     remove_button = next(control for control in dialog.actions
                          if isinstance(control, ft.Button)
@@ -614,7 +715,7 @@ def test_location_form_switches_rural_and_urban_fields(monkeypatch):
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
-    root.controls[2].controls[2].on_click(object())
+    _page_column(root).controls[2].controls[2].on_click(object())
     dialog = page.dialogs[-1]
     controls = list(_walk(dialog.content))
     land_type = next(
@@ -641,20 +742,30 @@ def test_location_form_switches_rural_and_urban_fields(monkeypatch):
     assert urban.visible is False
 
 
+def _sheet(headers, rows, name="Sheet1"):
+    return {
+        "name": name,
+        "headers": headers,
+        "rows": rows,
+        "row_numbers": list(range(2, len(rows) + 2)),
+    }
+
+
 def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypatch):
     class FakePicker:
         async def pick_files(self, **_kwargs):
             return [SimpleNamespace(bytes=b"test", path=None, name="schedule.csv")]
 
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    _mock_duplicate_profiles(monkeypatch)
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
     })
-    monkeypatch.setattr(dc_rates, "read_schedule_spreadsheet", lambda *_: (
-        ["District", "Tehsil", "Mauza", "Location", "Rate"], []
-    ))
+    monkeypatch.setattr(dc_rates, "read_schedule_sheets", lambda *_: [
+        _sheet(["District", "Tehsil", "Mauza", "Location", "Rate"], [])
+    ])
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
 
@@ -693,15 +804,20 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
             return [SimpleNamespace(bytes=b"test", path=None, name="bulk.csv")]
 
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    _mock_duplicate_profiles(monkeypatch)
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
     })
-    monkeypatch.setattr(dc_rates, "read_schedule_spreadsheet", lambda *_: (
-        ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location", "Square No", "Kila No", "DC Rate", "Unit"],
-        [["Tehsil", "Qanoongoi", "Mauza", "Agricultural", "Farm", "1", "2", "100", "per kanal"]],
-    ))
+    monkeypatch.setattr(dc_rates, "read_schedule_sheets", lambda *_: [
+        _sheet(
+            ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location",
+             "Square No", "Kila No", "DC Rate", "Unit"],
+            [["Tehsil", "Qanoongoi", "Mauza", "Agricultural", "Farm",
+              "1", "2", "100", "per kanal"]],
+        )
+    ])
     candidate = {
         "row": 2,
         "location": {"name": "Mauza"},
@@ -710,12 +826,21 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
         "rate_value": 100,
         "rate_unit": "per_kanal",
     }
-    monkeypatch.setattr(dc_rates, "preview_mapped_schedule", lambda *_: {
-        "valid_records": [candidate], "issues": [], "rows_read": 1,
-    })
+    preview_calls = []
+    monkeypatch.setattr(dc_rates, "preview_mapped_schedule", lambda *_, **kwargs: (
+        preview_calls.append(kwargs)
+        or {
+            "valid_records": [candidate],
+            "issues": [],
+            "warnings": [],
+            "rows_read": 1,
+            "duplicate_rule": {"name": "Rural DC - same cadastral row (overlap)"},
+        }
+    ))
     imported = []
-    monkeypatch.setattr(dc_rates, "import_dc_rate_records", lambda records: (
-        imported.extend(records) or {"imported_count": len(records), "issues": []}
+    monkeypatch.setattr(dc_rates, "import_dc_rate_records", lambda records, **kwargs: (
+        imported.extend(records)
+        or {"imported_count": len(records), "issues": [], "warnings": []}
     ))
 
     page = FakePage()
@@ -725,8 +850,23 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
                          and control.content == "Import CSV / Excel / ODS")
     asyncio.run(import_button.on_click())
     mapping_dialog = page.dialogs[-1]
+    assert not any(
+        isinstance(control, ft.Dropdown)
+        and control.label == "Duplicate rule (required)"
+        for control in _walk(mapping_dialog.content)
+    )
+    assert any(
+        isinstance(control, ft.Text)
+        and "removed only when" in (control.value or "")
+        for control in _walk(mapping_dialog.content)
+    )
     mapping_dialog.actions[-1].on_click(None)
     review_dialog = page.dialogs[-1]
+    assert preview_calls[-1]["duplicate_policy"] == "check_now"
+    assert preview_calls[-1]["storage_mode"] == "ranges"
+    assert preview_calls[-1]["duplicate_rule"] == dc_rates.EXACT_ALL_REFERENCE
+    assert preview_calls[-1]["row_numbers"] == [2]
+    assert preview_calls[-1]["row_sheets"] == ["Sheet1"]
     year_field = next(control for control in _walk(review_dialog.content)
                       if isinstance(control, ft.TextField)
                       and control.label == "Published year for this import (optional)")
@@ -746,3 +886,99 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
     assert imported[0]["published_year"] == 2028
     assert imported[0]["effective_from"] == date(2028, 1, 1)
     assert "Imported 1 Rural DC rate(s)" in status_text.value
+
+
+def test_import_mapping_shows_automatic_exact_duplicate_rule(monkeypatch):
+    class FakePicker:
+        async def pick_files(self, **_kwargs):
+            return [SimpleNamespace(bytes=b"test", path=None, name="schedule.csv")]
+
+    monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    _mock_duplicate_profiles(monkeypatch)
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
+    monkeypatch.setattr(dc_rates, "read_schedule_sheets", lambda *_: [
+        _sheet(
+            ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location",
+             "DC Rate", "Unit"],
+            [["Tehsil", "Qanoongoi", "Mauza", "Agricultural", "Farm",
+              "100", "per kanal"]],
+        )
+    ])
+    preview_calls = []
+    monkeypatch.setattr(dc_rates, "preview_mapped_schedule", lambda *_, **kwargs: (
+        preview_calls.append(kwargs)
+        or {
+            "valid_records": [],
+            "issues": [],
+            "warnings": [],
+            "rows_read": 1,
+            "expanded_rows": 1,
+            "duplicates_removed": 0,
+            "invalid_rows": 0,
+            "duplicate_rule": {"name": "Any schedule - all columns exactly identical"},
+        }
+    ))
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    import_button = next(control for control in _walk(root)
+                         if isinstance(control, ft.OutlinedButton)
+                         and control.content == "Import CSV / Excel / ODS")
+
+    asyncio.run(import_button.on_click())
+    dialog = page.dialogs[-1]
+    assert not any(
+        isinstance(control, ft.Dropdown)
+        and control.label == "Duplicate rule (required)"
+        for control in _walk(dialog.content)
+    )
+    assert any(
+        isinstance(control, ft.Text)
+        and "removed only when" in (control.value or "")
+        for control in _walk(dialog.content)
+    )
+    dialog.actions[-1].on_click(None)
+
+    assert len(preview_calls) == 1
+    assert preview_calls[0]["duplicate_policy"] == "check_now"
+    assert preview_calls[0]["storage_mode"] == "ranges"
+    assert preview_calls[0]["duplicate_rule"] == dc_rates.EXACT_ALL_REFERENCE
+    assert len(page.dialogs) == 1
+    assert any(
+        "Any schedule - all columns exactly identical" in (control.value or "")
+        for control in _walk(page.dialogs[-1].content)
+        if isinstance(control, ft.Text)
+    )
+
+
+def test_duplicate_rules_dialog_lists_rules_and_opens_editor(monkeypatch):
+    _mock_duplicate_profiles(monkeypatch)
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    rules_button = next(control for control in _walk(root)
+                        if isinstance(control, ft.OutlinedButton)
+                        and control.content == "Duplicate rules")
+
+    rules_button.on_click(None)
+    dialog = page.dialogs[-1]
+    assert dialog.title.value == "Duplicate detection rules"
+    text_values = {
+        control.value for control in _walk(dialog.content)
+        if isinstance(control, ft.Text)
+    }
+    assert "Rural DC - same cadastral row (overlap)" in text_values
+    assert any("Built-in" in (value or "") for value in text_values)
+
+    dialog.actions[-1].on_click(None)
+    editor = page.dialogs[-1]
+    assert editor.title.value == "New duplicate rule"
+    labels = {
+        control.label for control in _walk(editor.content)
+        if isinstance(control, ft.Dropdown)
+    }
+    assert {"Schedule scope", "Effective-date matching", "When a duplicate is found"} <= labels

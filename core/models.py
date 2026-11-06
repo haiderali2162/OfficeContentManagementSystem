@@ -388,6 +388,49 @@ class DCValuationRate(Base):
     )
 
 
+class DCRateDuplicateProfile(Base):
+    """A saved custom policy for identifying duplicate DC rates."""
+
+    __tablename__ = "dc_rate_duplicate_profiles"
+    __table_args__ = (
+        CheckConstraint(
+            "schedule_scope IN ('rural_dc', 'urban_dc', 'fbr', 'any')",
+            name="ck_dc_duplicate_profile_scope",
+        ),
+        CheckConstraint(
+            "date_mode IN ('overlap', 'exact', 'ignore')",
+            name="ck_dc_duplicate_profile_date_mode",
+        ),
+        CheckConstraint(
+            "import_action IN ('skip', 'import')",
+            name="ck_dc_duplicate_profile_import_action",
+        ),
+        UniqueConstraint("name", name="uq_dc_duplicate_profile_name"),
+        Index("ix_dc_duplicate_profile_scope", "schedule_scope"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    schedule_scope: Mapped[str] = mapped_column(
+        String(20), default="any", server_default="any", nullable=False
+    )
+    match_fields_json: Mapped[str] = mapped_column(Text, nullable=False)
+    date_mode: Mapped[str] = mapped_column(
+        String(10), default="overlap", server_default="overlap", nullable=False
+    )
+    import_action: Mapped[str] = mapped_column(
+        String(10), default="skip", server_default="skip", nullable=False
+    )
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now,
+        nullable=False,
+    )
+
+
 class PropertyKhewat(Base):
     """A Khewat number and its square/Kila references within a Mauza."""
 
@@ -743,4 +786,26 @@ class ValuationEstimateCharge(Base):
     estimate: Mapped[ValuationEstimate] = relationship(back_populates="charges")
 
 
+class AppSetting(Base):
+    """A small persistent key/value store for user preferences.
+
+    Values are stored as JSON text so future preferences can be added without
+    another schema change. Keys are namespaced (for example
+    ``dc_rates.cadastral_storage``) to keep page/tab preferences separate.
+    """
+
+    __tablename__ = "app_settings"
+    __table_args__ = (
+        UniqueConstraint("setting_key", name="uq_app_setting_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    setting_key: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import flet as ft
+import pytest
 from types import SimpleNamespace
 
 from ui.pages import dc_rates
@@ -38,8 +39,14 @@ def walk_controls(control):
         yield from walk_controls(content)
 
 
+@pytest.fixture(autouse=True)
+def isolate_valuation_schedule_queries(monkeypatch):
+    """Keep page tests independent from the live schedule database."""
+    monkeypatch.setattr(valuation, "list_location_hint_values", lambda **_kwargs: {})
+    monkeypatch.setattr(valuation, "find_schedule_location_matches", lambda **_kwargs: [])
+
+
 def test_valuation_page_builds_with_tabs_and_existing_rate_management(monkeypatch):
-    monkeypatch.setattr(valuation, "list_locations", lambda: [])
     monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
@@ -70,7 +77,6 @@ def test_dc_fbr_rates_load_is_scheduled_only_when_tab_is_selected(monkeypatch):
             self.scheduled.append(handler.__code__.co_firstlineno)
             handler().close()
 
-    monkeypatch.setattr(valuation, "list_locations", lambda: [])
     monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
@@ -101,7 +107,6 @@ def test_dc_fbr_rates_load_is_scheduled_only_when_tab_is_selected(monkeypatch):
 
 
 def test_app_shell_hides_shared_header_only_on_rates_tab(monkeypatch):
-    monkeypatch.setattr(valuation, "list_locations", lambda: [])
     monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
@@ -136,7 +141,6 @@ def test_app_shell_hides_shared_header_only_on_rates_tab(monkeypatch):
 
 
 def test_add_tax_rule_opens_dialog_with_supported_flet_controls(monkeypatch):
-    monkeypatch.setattr(valuation, "list_locations", lambda: [])
     monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
@@ -159,7 +163,6 @@ def test_add_tax_rule_opens_dialog_with_supported_flet_controls(monkeypatch):
 
 
 def test_saving_tax_rule_hides_metadata_clears_form_and_shows_snackbar(monkeypatch):
-    monkeypatch.setattr(valuation, "list_locations", lambda: [])
     monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
@@ -212,13 +215,18 @@ def test_square_and_kila_suggestions_follow_selected_mauza_and_square(monkeypatc
                 "mauza": "Chak 1", "effective_from": valuation.date(2020, 1, 1), "effective_to": None}],
         "fbr": [],
     }
-    monkeypatch.setattr(valuation, "list_locations", lambda: [location_row])
+    monkeypatch.setattr(valuation, "find_schedule_location_matches", lambda **_: [location_row])
+    monkeypatch.setattr(valuation, "list_location_hint_values", lambda **_: {
+        "district": ["District A"], "tehsil": ["Tehsil A"], "mauza": ["Chak 1"],
+        "locality": [], "square_no": ["15", "16"], "kila_no": ["1", "2"],
+        "committee_town": [], "revenue_circle": [], "property_area": [], "khasra_no": [],
+    })
     monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
     monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
-    monkeypatch.setattr(valuation, "list_dc_rates", lambda *, location_id, schedule_type, **_kwargs: rates[schedule_type])
+    monkeypatch.setattr(valuation, "list_dc_rates", lambda *, location_ids=None, schedule_type, **_kwargs: rates[schedule_type])
     monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
 
@@ -252,9 +260,40 @@ def test_square_and_kila_suggestions_follow_selected_mauza_and_square(monkeypatc
     assert {suggestion.value for suggestion in kila.suggestions} >= {"1", "2"}
 
 
+def test_valuation_mauza_hints_query_current_database(monkeypatch):
+    hint_calls = []
+
+    def current_hints(**kwargs):
+        hint_calls.append(kwargs)
+        return {"mauza": ["Newly Imported Mauza"]}
+
+    monkeypatch.setattr(valuation, "list_location_hint_values", current_hints)
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    mauza = next(
+        control for control in walk_controls(root)
+        if isinstance(control, ft.AutoComplete) and control.data == "mauza"
+    )
+    mauza.value = "New"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    assert hint_calls[-1]["context"]["mauza"] == "New"
+    assert {suggestion.value for suggestion in mauza.suggestions} == {"Newly Imported Mauza"}
+
+
 def test_empty_rule_list_collapses_and_grows_only_for_saved_rules(monkeypatch):
     rule_rows = []
-    monkeypatch.setattr(valuation, "list_locations", lambda: [])
     monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
     monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: rule_rows)
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])

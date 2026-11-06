@@ -17,7 +17,11 @@ import flet as ft
 
 from core.area_engine import AreaSettings
 from core.models import DC_RATE_UNITS
-from services.dc_rate_service import list_locations, list_dc_rates
+from services.dc_rate_service import (
+    find_schedule_location_matches,
+    list_dc_rates,
+    list_location_hint_values,
+)
 from services.estimate_service import (
     get_estimate,
     list_client_choices,
@@ -75,9 +79,8 @@ def build_valuation_page(
     on_rates_tab_change: Callable[[bool], None] | None = None,
 ) -> ft.Control:
     """Build the estimate workflow plus the existing rates and tax-rule pages."""
-    # Populate these lists asynchronously after the lightweight control tree is
-    # attached; event handlers continue to use the same shared choice cache.
-    locations: list[dict[str, Any]] = []
+    # Populate this list asynchronously after the lightweight control tree is
+    # attached; schedule location hints are queried directly from the database.
     clients: list[dict[str, Any]] = []
 
     status = ft.Text("", size=12, color="#475569")
@@ -142,11 +145,6 @@ def build_valuation_page(
                 page.update()
         return export
 
-    location = ft.Dropdown(label="Resolved location", visible=False, options=[
-        ft.dropdown.Option(str(item["id"]), " · ".join(str(v) for v in (
-            item.get("name"), item.get("district"), item.get("tehsil"), item.get("land_type")
-        ) if v)) for item in locations
-    ])
     client = ft.Dropdown(label="Client (optional)", width=250, value="none", options=[
         ft.dropdown.Option("none", "No client linked"),
         *[ft.dropdown.Option(str(item["id"]), item["name"]) for item in clients],
@@ -223,34 +221,10 @@ def build_valuation_page(
 
     rate_records: dict[str, list[dict[str, Any]]] = {"dc": [], "fbr": []}
 
+    hint_generation = 0
+
     def _text_value(control) -> str:
         return (control.value or "").strip()
-
-    def _value_matches(candidate: Any, query: str) -> bool:
-        return not query or query.casefold() in str(candidate or "").casefold()
-
-    def _reference_matches(candidate: Any, query: str) -> bool:
-        """Match cadastral identifiers as whole tokens (2 must not match 12)."""
-        if not query:
-            return True
-        tokens = {
-            part.strip().casefold()
-            for part in str(candidate or "").replace(";", ",").split(",")
-            if part.strip()
-        }
-        return query.casefold() in tokens
-
-    def _location_field_matches(item: dict[str, Any], key: str, query: str) -> bool:
-        if key == "locality":
-            # Schedule imports may put a location in either the named
-            # location or its finer locality/detail column.
-            return not query or any(
-                _value_matches(item.get(field), query)
-                for field in ("locality", "name")
-            )
-        if key in {"square_no", "kila_no", "khasra_no"}:
-            return _reference_matches(item.get(key), query)
-        return _value_matches(item.get(key), query)
 
     def _active_location_fields():
         if property_profile.value == "rural":
@@ -260,41 +234,76 @@ def build_valuation_page(
                 ("property_area", property_area), ("locality", schedule_location),
                 ("square_no", square_no), ("kila_no", kila_no), ("khasra_no", khasra_no)]
 
-    def matching_locations():
-        active_fields = _active_location_fields()
-        matches = []
-        for item in locations:
-            if str(item.get("land_type") or "urban").casefold() != property_profile.value:
-                continue
-            if all(_location_field_matches(item, key, _text_value(control))
-                   for key, control in active_fields):
-                matches.append(item)
-        return matches
+    def _location_context() -> dict[str, str]:
+        return {
+            key: _text_value(control)
+            for key, control in _active_location_fields()
+        }
 
-    def refresh_location_hints(_=None):
-        """Filter type-ahead suggestions from schedule-backed location values."""
+    def _apply_location_hints(values_by_field: dict[str, list[str]]) -> None:
+        for key, control in _active_location_fields():
+            control.suggestions = [
+                ft.AutoCompleteSuggestion(key=value, value=value)
+                for value in values_by_field.get(key, [])
+            ]
+
+    def refresh_location_hints() -> None:
+        """Load schedule-backed type-ahead values directly from the database."""
         active = _active_location_fields()
-        for key, control in active:
-            candidates = []
-            for item in locations:
-                if str(item.get("land_type") or "urban").casefold() != property_profile.value:
-                    continue
-                # Square choices depend on the selected Mauza/address, while
-                # Kila choices depend on both that context and the selected
-                # square. Do not let a stale Kila hide valid square choices.
-                excluded = {"square_no", "kila_no"} if key == "square_no" else {key}
-                if any(other_key not in excluded and _text_value(other_control)
-                       and not _location_field_matches(item, other_key, _text_value(other_control))
-                       for other_key, other_control in active):
-                    continue
-                raw = item.get(key)
-                values = [part.strip() for part in str(raw or "").replace(";", ",").split(",") if part.strip()]
-                if key == "locality":
-                    values.extend((str(item.get("name") or "").strip(),))
-                query = _text_value(control)
-                candidates.extend(value for value in values if value and _value_matches(value, query))
-            control.suggestions = [ft.AutoCompleteSuggestion(key=value, value=value)
-                                   for value in sorted(set(candidates), key=str.casefold)[:100]]
+        try:
+            values_by_field = list_location_hint_values(
+                land_type=property_profile.value,
+                context=_location_context(),
+                fields=[key for key, _control in active],
+                limit=100,
+            )
+        except Exception as exc:
+            status.value = f"Could not load location suggestions: {exc}"
+            page.update()
+            return
+        _apply_location_hints(values_by_field)
+        page.update()
+
+    def schedule_location_hint_refresh() -> None:
+        """Debounce keystroke queries so only the latest input reaches the DB."""
+        nonlocal hint_generation
+        hint_generation += 1
+        generation = hint_generation
+
+        async def load_hints():
+            await asyncio.sleep(0.15)
+            if generation != hint_generation:
+                return
+            active = _active_location_fields()
+            try:
+                values_by_field = await asyncio.to_thread(
+                    list_location_hint_values,
+                    land_type=property_profile.value,
+                    context=_location_context(),
+                    fields=[key for key, _control in active],
+                    limit=100,
+                )
+            except Exception as exc:
+                if generation == hint_generation:
+                    status.value = f"Could not load location suggestions: {exc}"
+                    page.update()
+                return
+            if generation != hint_generation:
+                return
+            _apply_location_hints(values_by_field)
+            page.update()
+
+        if hasattr(page, "run_task"):
+            page.run_task(load_hints)
+        else:
+            refresh_location_hints()
+
+    def matching_locations():
+        return find_schedule_location_matches(
+            land_type=property_profile.value,
+            context=_location_context(),
+            limit=200,
+        )
 
     def _rate_label(rate: dict[str, Any]) -> str:
         place = rate.get("mauza") or rate.get("property_area") or rate.get("committee_town") or rate.get("location_name") or "Location"
@@ -303,7 +312,6 @@ def build_valuation_page(
 
     def refresh_rate_matches(_=None):
         """Fetch active schedule rows and preselect unique unit/rate matches."""
-        refresh_location_hints()
         lookup_value = _text_value(mauza) if property_profile.value == "rural" else (
             _text_value(property_area) or _text_value(town)
         )
@@ -331,8 +339,10 @@ def build_valuation_page(
             page.update()
             return
 
-        all_rates = [row for item in candidates for schedule in ("dc", "fbr")
-                     for row in list_dc_rates(location_id=int(item["id"]), schedule_type=schedule,
+        candidate_ids = [int(item["id"]) for item in candidates]
+        all_rates = [row for schedule in ("dc", "fbr")
+                     for row in list_dc_rates(location_ids=candidate_ids,
+                                              schedule_type=schedule,
                                               effective_on=transaction_date)]
         if classification.value not in (None, "", "none"):
             all_rates = [row for row in all_rates if str(row.get("classification") or "").casefold()
@@ -360,7 +370,6 @@ def build_valuation_page(
         selected_dc = next((row for row in rate_records["dc"]
                             if str(row["id"]) == dc_rate_choice.value), None)
         if selected_dc:
-            location.value = str(selected_dc["location_id"])
             rate_match_status.value = f"DC rate found: {_rate_label(selected_dc)}"
         else:
             rate_match_status.value = (
@@ -370,28 +379,33 @@ def build_valuation_page(
             )
         page.update()
 
+    def refresh_location_state(_=None):
+        schedule_location_hint_refresh()
+        refresh_rate_matches()
+
     for control in (district, tehsil, mauza, town, revenue_circle, property_area,
                     schedule_location, square_no, kila_no, khasra_no, classification,
                     dc_rate_unit, fbr_rate_unit, location_match):
-        control.on_change = refresh_rate_matches
+        control.on_change = refresh_location_state
         if isinstance(control, ft.AutoComplete):
-            control.on_select = refresh_rate_matches
+            control.on_select = refresh_location_state
 
     def on_mauza_change(_=None):
         # A new Mauza invalidates cadastral choices from the prior record.
         square_no.value = ""
         kila_no.value = ""
-        refresh_rate_matches()
+        refresh_location_state()
 
     def on_square_change(_=None):
         # Kila suggestions are scoped to the selected square.
         kila_no.value = ""
-        refresh_rate_matches()
+        refresh_location_state()
 
     mauza.on_change = on_mauza_change
+    mauza.on_select = on_mauza_change
     square_no.on_change = on_square_change
     square_no.on_select = on_square_change
-    property_profile.on_change = refresh_rate_matches
+    property_profile.on_change = refresh_location_state
     dc_rate_choice.on_select = refresh_rate_matches
     fbr_rate_choice.on_select = refresh_rate_matches
 
@@ -487,8 +501,7 @@ def build_valuation_page(
                             if str(row["id"]) == dc_rate_choice.value), None)
             if dc_rate is None:
                 raise ValuationError("Complete the location fields and choose a matching DC schedule rate.")
-            selected_location = next(item for item in locations
-                                     if int(item["id"]) == int(dc_rate["location_id"]))
+            selected_location = dc_rate
             selected_mauza = (_text_value(mauza) if property_profile.value == "rural"
                               else selected_location.get("mauza") or selected_location.get("name") or "").strip()
             if not selected_mauza:
@@ -818,9 +831,9 @@ def build_valuation_page(
         page.update()
 
     # These controls form one shared chain: profile-specific location fields
-    # narrow the cached schedule locations, the rate selectors expose the
-    # matching DC/FBR rows, and Calculate passes those exact rows to the
-    # valuation service rather than asking it to guess from a partial address.
+    # query schedule-backed locations, the rate selectors expose the matching
+    # DC/FBR rows, and Calculate passes those exact rows to the valuation
+    # service rather than asking it to guess from a partial address.
     rural_fields_panel = ft.ResponsiveRow([
         ft.Container(ft.Column([ft.Text("District"), district]), col={"xs": 12, "md": 4}),
         ft.Container(ft.Column([ft.Text("Mauza (type to search schedules)"), mauza]), col={"xs": 12, "md": 4}),
@@ -1155,19 +1168,14 @@ def build_valuation_page(
     async def load_initial_data():
         """Fetch page data on worker threads so navigation stays responsive."""
         try:
-            loaded_locations, loaded_clients, estimates, rules, formulas, custom_fields = await asyncio.gather(
-                asyncio.to_thread(list_locations),
+            loaded_clients, estimates, rules, formulas, custom_fields = await asyncio.gather(
                 asyncio.to_thread(list_client_choices),
                 asyncio.to_thread(list_estimates, limit=100),
                 asyncio.to_thread(list_tax_fee_rules),
                 asyncio.to_thread(list_registry_fee_formulas),
                 asyncio.to_thread(list_registry_fee_custom_fields),
             )
-            locations.extend(loaded_locations)
             clients.extend(loaded_clients)
-            location.options = [ft.dropdown.Option(str(item["id"]), " · ".join(
-                str(value) for value in (item.get("name"), item.get("district"), item.get("tehsil"), item.get("land_type")) if value
-            )) for item in locations]
             client.options = [ft.dropdown.Option("none", "No client linked"), *[
                 ft.dropdown.Option(str(item["id"]), item["name"]) for item in clients
             ]]

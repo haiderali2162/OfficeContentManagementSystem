@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 import csv
+import itertools
 import os
 import sys
 import re
@@ -25,6 +26,7 @@ from core.models import (
     PropertyKhewat,
     PropertyLocation,
 )
+from services import dc_rate_duplicate_service as duplicate_rules
 
 
 class DCRateServiceError(ValueError):
@@ -105,12 +107,20 @@ RATE_HEADERS = {
     "qanungoi": "qanoongoi",
     "patwar_circle": "patwar_circle",
     "mauza": "mauza",
+    "mouza": "mauza",
+    "mauza_name": "mauza",
+    "mouza_name": "mauza",
+    "village": "mauza",
+    "village_name": "mauza",
+    "mauza_village": "mauza",
+    "village_mauza": "mauza",
     "hadbast": "hadbast_number",
     "hadbast_number": "hadbast_number",
     "square_no": "square_no",
     "square_number": "square_no",
     "kila_no": "kila_no",
     "killa_no": "kila_no",
+    "killa_number": "kila_no",
     "khasra_no": "khasra_no",
     "khasra_number": "khasra_no",
     "locality": "locality",
@@ -139,12 +149,16 @@ RATE_HEADERS = {
     "rate_unit": "rate_unit",
     "unit": "rate_unit",
     "effective_from": "effective_from",
+    "effective_to": "effective_to",
     "published_year": "published_year",
     "publish_year": "published_year",
     "schedule_year": "published_year",
     "year": "published_year",
     "source": "source_reference",
     "source_reference": "source_reference",
+    "source_date": "source_date",
+    "verification_status": "verification_status",
+    "verified_by": "verified_by",
 }
 REQUIRED_RATE_COLUMNS = {
     "location_name",
@@ -204,6 +218,90 @@ def _reference_values(value: Any) -> list[str]:
 def _normalize_reference(value: Any) -> str | None:
     tokens = _reference_values(value)
     return ", ".join(tokens) if tokens else None
+
+
+REFERENCE_STORAGE_MODES = ("ranges", "individual")
+
+
+def _canonical_reference(value: Any) -> str | None:
+    """Compact Square/Kila/Khasra input into canonical range segments.
+
+    ``1-5;6;7-9,10,11-13,15`` becomes ``1-13, 15`` and reversed ranges are
+    normalized. This is used when the user chooses to keep cadastral values as
+    ranges in the database, avoiding one row per value.
+    """
+    normalized = _text(value)
+    if not normalized:
+        return None
+    numeric: set[int] = set()
+    other: list[str] = []
+    for segment in re.split(r"[,;]", normalized):
+        segment = segment.strip()
+        if not segment:
+            continue
+        interval = re.fullmatch(r"(\d+)\s*-\s*(\d+)", segment)
+        if interval:
+            start, end = sorted(int(part) for part in interval.groups())
+            if end - start > 100_000:
+                raise DCRateServiceError(
+                    "A square, Kila, or Khasra range cannot exceed 100,001 values."
+                )
+            numeric.update(range(start, end + 1))
+        elif segment.isdigit():
+            numeric.add(int(segment))
+        elif segment not in other:
+            other.append(segment)
+    ranges: list[list[int]] = []
+    for number in sorted(numeric):
+        if ranges and ranges[-1][1] + 1 == number:
+            ranges[-1][1] = number
+        else:
+            ranges.append([number, number])
+    parts = [
+        str(start) if start == end else f"{start}-{end}"
+        for start, end in ranges
+    ]
+    parts.extend(other)
+    return ", ".join(parts) if parts else None
+
+
+_MAX_EXPORTED_ROWS = 250_000
+
+
+MAX_EXPANDED_ROWS_PER_SOURCE = 5_000
+MAX_EXPANDED_ROWS_PER_IMPORT = 250_000
+_EXPANDABLE_REFERENCE_FIELDS = ("square_no", "kila_no", "khasra_no")
+
+
+def _expand_location_values(
+    location: dict[str, Any], *, source_row: int | None = None
+) -> list[dict[str, Any]]:
+    """Expand square/Kila/Khasra tokens into one record per combination.
+
+    A missing field is treated as a single empty value, so a row with only a
+    Khasra range still expands. Every non-cadastral value is copied unchanged.
+    """
+    token_lists: list[list[str | None]] = []
+    for field in _EXPANDABLE_REFERENCE_FIELDS:
+        tokens = _reference_values(location.get(field))
+        token_lists.append(tokens or [None])
+    combinations = 1
+    for tokens in token_lists:
+        combinations *= len(tokens)
+    if combinations > MAX_EXPANDED_ROWS_PER_SOURCE:
+        row_label = f"Row {source_row} " if source_row is not None else "This row "
+        raise DCRateServiceError(
+            f"{row_label}expands to {combinations:,} cadastral records. Split the "
+            f"square, Kila, or Khasra range so one source row expands to at most "
+            f"{MAX_EXPANDED_ROWS_PER_SOURCE:,} records."
+        )
+    expanded: list[dict[str, Any]] = []
+    for combination in itertools.product(*token_lists):
+        item = dict(location)
+        for field, value in zip(_EXPANDABLE_REFERENCE_FIELDS, combination):
+            item[field] = value
+        expanded.append(item)
+    return expanded
 
 
 def _normalize_rate_unit(value: Any) -> str:
@@ -281,16 +379,25 @@ def _date(value: Any, label: str, *, required: bool = False) -> date | None:
         raise DCRateServiceError(f"{label} must use YYYY-MM-DD format.") from None
 
 
-def _location_data(values: dict[str, Any]) -> dict[str, str | None]:
+def _location_data(
+    values: dict[str, Any], *, reference_mode: str = "individual"
+) -> dict[str, str | None]:
     name = _text(values.get("name", values.get("location_name")))
     if not name:
         raise DCRateServiceError("Location name is required.")
     location = {field: _text(values.get(field)) for field in LOCATION_FIELDS}
     location["name"] = name
-    # The structured location fields are scalar database columns. Store ranges
-    # as a canonical comma-separated list of individual identifiers.
+    if reference_mode not in REFERENCE_STORAGE_MODES:
+        raise DCRateServiceError(
+            "Cadastral storage must be 'ranges' or 'individual'."
+        )
     for field in ("square_no", "kila_no", "khasra_no"):
-        location[field] = _normalize_reference(values.get(field))
+        if reference_mode == "ranges":
+            # Keep a compact range such as "1-5, 8" instead of expanding it.
+            location[field] = _canonical_reference(values.get(field))
+        else:
+            # Legacy/requested mode: store every token for direct matching.
+            location[field] = _normalize_reference(values.get(field))
     return location
 
 
@@ -344,12 +451,10 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
     if year is not None and not 1900 <= year <= 2200:
         raise DCRateServiceError("Published year must be between 1900 and 2200.")
     start = _date(values.get("effective_from"), "Effective from")
-    if year is not None:
-        start = date(year, 1, 1)
     if start is None:
         # effective_from is retained as a required legacy storage column. A
         # missing schedule year remains NULL so later valuation can flag it.
-        start = date.today()
+        start = date(year, 1, 1) if year is not None else date.today()
     elif year is None:
         year = start.year
     end = _date(values.get("effective_to"), "Effective to")
@@ -397,19 +502,6 @@ def _rate_data(values: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _rate_identity(rate: dict[str, Any], location_key: tuple[str, ...]) -> tuple[Any, ...]:
-    return (
-        rate.get("schedule_type", "dc"),
-        location_key,
-        rate["property_type"].casefold(),
-        (rate.get("classification") or "").casefold(),
-        (rate.get("floor") or "").casefold(),
-        rate["rate_unit"],
-        rate["effective_from"],
-        rate["effective_to"],
-    )
-
-
 def _periods_overlap(
     first_start: date,
     first_end: date | None,
@@ -427,8 +519,10 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
     return {
         "id": rate.id,
         "location_id": rate.location_id,
+        "name": location.name if location else "Unassigned",
         "location_name": location.name if location else "Unassigned",
         "location_notes": location.notes if location else None,
+        "notes": location.notes if location else None,
         "location_created_at": location.created_at if location else None,
         "location_updated_at": location.updated_at if location else None,
         "province": location.province if location else None,
@@ -468,68 +562,98 @@ def _record_dict(rate: DCValuationRate) -> dict[str, Any]:
     }
 
 
-def _duplicate_value(value: Any) -> Any:
-    """Normalize text for duplicate identity while preserving typed values."""
-    if isinstance(value, str):
-        return " ".join(value.split()).casefold()
-    return value
+def _flat_rate_record(
+    rate_values: dict[str, Any], location_values: dict[str, Any]
+) -> dict[str, Any]:
+    """Combine normalized location and schedule values for duplicate matching."""
+    return {**location_values, **rate_values}
 
 
-def _duplicate_key(rate: DCValuationRate) -> tuple[Any, ...]:
-    """Build the explicit rural key or strict full-row key requested by the UI."""
-    location = rate.location
-    if rate.schedule_type == "dc" and location and (location.land_type or "").casefold() == "rural":
-        # Rural DC schedules identify a row within its Mauza by cadastral
-        # numbers, location, classification, and unit. Administrative context
-        # avoids colliding with similarly named Mauzas in other districts.
-        location_key = tuple(_duplicate_value(getattr(location, field)) for field in (
-            "province", "district", "tehsil", "qanoongoi", "patwar_circle",
-            "mauza", "square_no", "kila_no", "khasra_no", "name", "locality",
-        ))
-        return (
-            "rural_dc", location_key,
-            _duplicate_value(rate.classification or rate.property_type),
-            _duplicate_value(rate.rate_unit),
-        )
-
-    # Urban DC and FBR rows are duplicates only when all source values match.
-    # Surrogate IDs and audit timestamps differ on repeated inserts, so exclude
-    # those while retaining every substantive schedule and location column.
-    rate_values = tuple(
-        (column.name, _duplicate_value(getattr(rate, column.name)))
-        for column in DCValuationRate.__table__.columns
-        if column.name not in {"id", "location_id", "created_at", "updated_at"}
-    )
-    location_values = tuple(
-        (column.name, _duplicate_value(getattr(location, column.name)) if location else None)
-        for column in PropertyLocation.__table__.columns
-        if column.name not in {"id", "created_at", "updated_at"}
-    )
-    return "strict", rate_values, location_values
-
-
-def _duplicate_rate_groups(session) -> list[list[DCValuationRate]]:
-    rows = session.scalars(
-        select(DCValuationRate)
-        .options(joinedload(DCValuationRate.location))
-        .order_by(DCValuationRate.id)
-    ).unique().all()
-    grouped: dict[tuple[Any, ...], list[DCValuationRate]] = {}
-    for rate in rows:
-        grouped.setdefault(_duplicate_key(rate), []).append(rate)
-    return [group for group in grouped.values() if len(group) > 1]
-
-
-def find_duplicate_dc_rates() -> list[dict[str, Any]]:
-    """List duplicate rows that would be removed, preserving the first row."""
+def list_duplicate_rule_profiles(
+    *, schedule_scope: str | None = None
+) -> list[dict[str, Any]]:
+    """Return selectable built-in and saved custom duplicate rules."""
     with SessionLocal() as session:
-        duplicate_rows: list[dict[str, Any]] = []
-        for group in _duplicate_rate_groups(session):
-            survivor_id = group[0].id
-            for duplicate in group[1:]:
-                record = _record_dict(duplicate)
-                record["duplicate_of"] = survivor_id
-                duplicate_rows.append(record)
+        return [
+            duplicate_rules.profile_to_dict(profile)
+            for profile in duplicate_rules.list_profiles(
+                session, schedule_scope=schedule_scope
+            )
+        ]
+
+
+def create_duplicate_rule_profile(
+    *,
+    name: str,
+    schedule_scope: str,
+    match_fields: list[str],
+    date_mode: str,
+    import_action: str,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Create and save a custom duplicate-rule profile."""
+    with SessionLocal.begin() as session:
+        profile = duplicate_rules.create_custom_profile(
+            session,
+            name=name,
+            schedule_scope=schedule_scope,
+            match_fields=match_fields,
+            date_mode=date_mode,
+            import_action=import_action,
+            description=description,
+        )
+        return duplicate_rules.profile_to_dict(profile)
+
+
+def update_duplicate_rule_profile(
+    profile_id: int,
+    *,
+    name: str,
+    schedule_scope: str,
+    match_fields: list[str],
+    date_mode: str,
+    import_action: str,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Update and save a custom duplicate-rule profile."""
+    with SessionLocal.begin() as session:
+        profile = duplicate_rules.update_custom_profile(
+            session,
+            profile_id,
+            name=name,
+            schedule_scope=schedule_scope,
+            match_fields=match_fields,
+            date_mode=date_mode,
+            import_action=import_action,
+            description=description,
+        )
+        return duplicate_rules.profile_to_dict(profile)
+
+
+def delete_duplicate_rule_profile(profile_id: int) -> None:
+    """Delete a custom duplicate-rule profile."""
+    with SessionLocal.begin() as session:
+        duplicate_rules.delete_custom_profile(session, profile_id)
+
+
+def find_duplicate_dc_rates(duplicate_rule: str) -> list[dict[str, Any]]:
+    """List rows removed by the selected rule, preserving the lowest record ID."""
+    with SessionLocal() as session:
+        profile = duplicate_rules.get_profile(session, duplicate_rule)
+        rates = session.scalars(
+            select(DCValuationRate)
+            .options(joinedload(DCValuationRate.location))
+            .order_by(DCValuationRate.id)
+        ).unique().all()
+        records_by_id = {rate.id: _record_dict(rate) for rate in rates}
+        pairs = duplicate_rules.find_duplicate_pairs(
+            list(records_by_id.values()), profile
+        )
+        duplicate_rows = []
+        for survivor, duplicate in pairs:
+            record = dict(duplicate)
+            record["duplicate_of"] = survivor.get("id")
+            duplicate_rows.append(record)
         return duplicate_rows
 
 
@@ -557,8 +681,10 @@ def _documents_directory() -> Path:
     return Path.home() / "Documents"
 
 
-def remove_duplicate_dc_rates_with_report(file_format: str) -> tuple[int, Path | None]:
-    """Export duplicate row values to Documents, then remove the extra rows.
+def remove_duplicate_dc_rates_with_report(
+    file_format: str, duplicate_rule: str
+) -> tuple[int, Path | None]:
+    """Export rows selected by one rule, then remove the extra rows.
 
     If report generation fails, no database rows are deleted. The lowest ID in
     each duplicate group is retained, and SQLAlchemy's SET NULL policy keeps
@@ -570,11 +696,21 @@ def remove_duplicate_dc_rates_with_report(file_format: str) -> tuple[int, Path |
     report_path: Path | None = None
     try:
         with SessionLocal.begin() as session:
-            groups = _duplicate_rate_groups(session)
+            profile = duplicate_rules.get_profile(session, duplicate_rule)
+            rates = session.scalars(
+                select(DCValuationRate)
+                .options(joinedload(DCValuationRate.location))
+                .order_by(DCValuationRate.id)
+            ).unique().all()
+            records_by_id = {rate.id: _record_dict(rate) for rate in rates}
+            pairs = duplicate_rules.find_duplicate_pairs(
+                list(records_by_id.values()), profile
+            )
             duplicates = [
-                (survivor, duplicate)
-                for group in groups
-                for survivor, duplicate in ((group[0], row) for row in group[1:])
+                (survivor, rates_by_id)
+                for survivor, duplicate in pairs
+                for rates_by_id in (session.get(DCValuationRate, duplicate["id"]),)
+                if rates_by_id is not None
             ]
             if not duplicates:
                 return 0, None
@@ -582,7 +718,7 @@ def remove_duplicate_dc_rates_with_report(file_format: str) -> tuple[int, Path |
             report_records = []
             for survivor, duplicate in duplicates:
                 record = _record_dict(duplicate)
-                record["duplicate_of"] = survivor.id
+                record["duplicate_of"] = survivor.get("id")
                 report_records.append(record)
             payload = export_schedule_records(report_records, file_format)
 
@@ -653,9 +789,23 @@ SCHEDULE_EXPORT_COLUMNS = (
 
 
 def export_schedule_records(
-    records: list[dict[str, Any]], file_format: str, fields: list[str] | None = None
+    records: list[dict[str, Any]],
+    file_format: str,
+    fields: list[str] | None = None,
+    *,
+    reference_mode: str = "stored",
 ) -> bytes:
-    """Serialize the selected schedule dimensions to CSV, XLSX, or ODS bytes."""
+    """Serialize the selected schedule dimensions to CSV, XLSX, or ODS bytes.
+
+    ``reference_mode`` controls Square/Kila/Khasra values:
+    ``stored`` keeps database values unchanged, ``ranges`` compacts them into
+    range segments, and ``individual`` expands each range into one exported row
+    per combination. The export mode never changes stored data.
+    """
+    if reference_mode not in {"stored", "ranges", "individual"}:
+        raise DCRateServiceError(
+            "Export reference mode must be 'stored', 'ranges', or 'individual'."
+        )
     columns_by_key = dict(SCHEDULE_EXPORT_COLUMNS)
     selected = fields or [key for key, _label in SCHEDULE_EXPORT_COLUMNS]
     unknown = set(selected) - columns_by_key.keys()
@@ -669,7 +819,30 @@ def export_schedule_records(
             return ""
         return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
-    rows = [[cell(record, key) for key in selected] for record in records]
+    export_records: list[dict[str, Any]] = []
+    for record in records:
+        if reference_mode == "stored":
+            export_records.append(record)
+            continue
+        if reference_mode == "ranges":
+            transformed = dict(record)
+            for field in _EXPANDABLE_REFERENCE_FIELDS:
+                transformed[field] = _canonical_reference(record.get(field))
+            export_records.append(transformed)
+            continue
+        # Expand the range into individual rows while keeping every other
+        # column (including the same rate) on each exported row.
+        for expanded in _expand_location_values(record):
+            export_records.append({**record, **{
+                field: expanded.get(field) for field in _EXPANDABLE_REFERENCE_FIELDS
+            }})
+        if len(export_records) > _MAX_EXPORTED_ROWS:
+            raise DCRateServiceError(
+                f"This export expands to more than {_MAX_EXPORTED_ROWS:,} rows. "
+                "Export fewer records or keep ranges."
+            )
+
+    rows = [[cell(record, key) for key in selected] for record in export_records]
     output = BytesIO()
     if file_format == "csv":
         text_output = StringIO(newline="")
@@ -710,6 +883,71 @@ def export_schedule_records(
     raise DCRateServiceError("Choose CSV, XLSX, or ODS for export.")
 
 
+def export_import_issues(issues: list[dict[str, Any]]) -> bytes:
+    """Return a UTF-8 CSV report of skipped/invalid/deduplicated import rows.
+
+    Every reported source row keeps its worksheet name (when available),
+    original row number, issue kind, reason, suggested fix, and raw values so
+    nothing is silently lost during an import.
+    """
+    output = StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([
+        "Worksheet", "Source row", "Issue", "Reason", "Suggested fix",
+        "Source values",
+    ])
+    for issue in issues:
+        source_values = issue.get("source_values") or []
+        if isinstance(source_values, (list, tuple)):
+            source_text = " | ".join("" if value is None else str(value) for value in source_values)
+        else:
+            source_text = str(source_values)
+        writer.writerow([
+            issue.get("sheet") or "",
+            issue.get("row") or "",
+            issue.get("kind") or "",
+            issue.get("message") or "",
+            issue.get("fix") or "",
+            source_text,
+        ])
+    return output.getvalue().encode("utf-8-sig")
+
+
+
+LOCATION_HINT_FIELDS = (
+    "district",
+    "tehsil",
+    "mauza",
+    "committee_town",
+    "revenue_circle",
+    "property_area",
+    "locality",
+    "square_no",
+    "kila_no",
+    "khasra_no",
+)
+_LOCATION_HINT_COLUMNS = {
+    "district": PropertyLocation.district,
+    "tehsil": PropertyLocation.tehsil,
+    "mauza": PropertyLocation.mauza,
+    "committee_town": PropertyLocation.committee_town,
+    "revenue_circle": PropertyLocation.revenue_circle,
+    "property_area": PropertyLocation.property_area,
+    "locality": PropertyLocation.locality,
+    "square_no": PropertyLocation.square_no,
+    "kila_no": PropertyLocation.kila_no,
+    "khasra_no": PropertyLocation.khasra_no,
+}
+_LOCATION_REFERENCE_FIELDS = frozenset({"square_no", "kila_no", "khasra_no"})
+
+
+def _location_dict(location: PropertyLocation) -> dict[str, Any]:
+    return {
+        "id": location.id,
+        **{field: getattr(location, field) for field in LOCATION_FIELDS},
+    }
+
+
 def list_locations() -> list[dict[str, Any]]:
     with SessionLocal() as session:
         locations = session.scalars(
@@ -720,13 +958,193 @@ def list_locations() -> list[dict[str, Any]]:
                 PropertyLocation.id,
             )
         ).all()
-        return [
-            {
-                "id": location.id,
-                **{field: getattr(location, field) for field in LOCATION_FIELDS},
+        return [_location_dict(location) for location in locations]
+
+
+def _apply_location_land_type(statement, land_type: str | None):
+    """Apply the calculator's rural/urban convention to a location query."""
+    if land_type in {"rural", "urban"}:
+        # Legacy locations without a type were treated as urban by the page.
+        statement = statement.where(
+            func.lower(
+                func.trim(func.coalesce(PropertyLocation.land_type, "urban"))
+            ) == land_type
+        )
+    return statement
+
+
+def _apply_location_context(statement, context: dict[str, Any] | None):
+    """Apply non-empty location inputs using the same substring semantics as hints."""
+    for field_name, raw_value in (context or {}).items():
+        value = _text(raw_value)
+        if not value or field_name not in _LOCATION_HINT_COLUMNS:
+            continue
+        pattern = f"%{value}%"
+        if field_name == "locality":
+            statement = statement.where(or_(
+                PropertyLocation.locality.ilike(pattern),
+                PropertyLocation.name.ilike(pattern),
+            ))
+        else:
+            statement = statement.where(
+                _LOCATION_HINT_COLUMNS[field_name].ilike(pattern)
+            )
+    return statement
+
+
+def _apply_location_hint_search(statement, field_name: str, raw_value: Any):
+    value = _text(raw_value)
+    if not value:
+        return statement
+    pattern = f"%{value}%"
+    if field_name == "locality":
+        return statement.where(or_(
+            PropertyLocation.locality.ilike(pattern),
+            PropertyLocation.name.ilike(pattern),
+        ))
+    return statement.where(_LOCATION_HINT_COLUMNS[field_name].ilike(pattern))
+
+
+def _location_matches_context(location: dict[str, Any], context: dict[str, Any]) -> bool:
+    """Validate a candidate with exact cadastral tokens after broad SQL filtering."""
+    for field_name, raw_value in context.items():
+        value = _text(raw_value)
+        if not value or field_name not in _LOCATION_HINT_COLUMNS:
+            continue
+        if field_name == "locality":
+            if not any(
+                value.casefold() in str(location.get(field) or "").casefold()
+                for field in ("locality", "name")
+            ):
+                return False
+            continue
+        if field_name in _LOCATION_REFERENCE_FIELDS:
+            try:
+                requested = set(_reference_values(value))
+                stored = set(_reference_values(location.get(field_name)))
+            except DCRateServiceError:
+                return False
+            if not requested.intersection(stored):
+                return False
+            continue
+        if value.casefold() not in str(location.get(field_name) or "").casefold():
+            return False
+    return True
+
+
+def list_location_hint_values(
+    *,
+    land_type: str | None = None,
+    context: dict[str, Any] | None = None,
+    fields: list[str] | tuple[str, ...] | None = None,
+    limit: int = 100,
+) -> dict[str, list[str]]:
+    """Return schedule-backed type-ahead values from the current database."""
+    requested = [
+        field for field in (fields or LOCATION_HINT_FIELDS)
+        if field in _LOCATION_HINT_COLUMNS
+    ]
+    context = dict(context or {})
+    hint_limit = max(1, limit)
+    result: dict[str, list[str]] = {}
+    with SessionLocal() as session:
+        for field_name in requested:
+            # A stale child value must not hide valid Square choices.
+            field_context = {
+                key: value for key, value in context.items()
+                if key != field_name
+                and not (field_name == "square_no" and key == "kila_no")
             }
-            for location in locations
-        ]
+            search_value = context.get(field_name)
+            if field_name == "locality":
+                statements = []
+                for column in (PropertyLocation.locality, PropertyLocation.name):
+                    statement = (
+                        select(column.label("value"))
+                        .join(
+                            DCValuationRate,
+                            DCValuationRate.location_id == PropertyLocation.id,
+                        )
+                        .where(column.is_not(None), func.trim(column) != "")
+                    )
+                    statement = _apply_location_land_type(statement, land_type)
+                    statement = _apply_location_context(statement, field_context)
+                    statement = _apply_location_hint_search(
+                        statement, field_name, search_value
+                    )
+                    statements.append(statement)
+                statement = statements[0].union(statements[1]).order_by("value")
+                values = session.scalars(
+                    statement.limit(hint_limit * 3)
+                ).all()
+            else:
+                column = _LOCATION_HINT_COLUMNS[field_name]
+                statement = (
+                    select(column)
+                    .join(
+                        DCValuationRate,
+                        DCValuationRate.location_id == PropertyLocation.id,
+                    )
+                    .where(column.is_not(None), func.trim(column) != "")
+                )
+                statement = _apply_location_land_type(statement, land_type)
+                statement = _apply_location_context(statement, field_context)
+                statement = _apply_location_hint_search(
+                    statement, field_name, search_value
+                )
+                values = session.scalars(
+                    statement.distinct().order_by(column).limit(hint_limit * 3)
+                ).all()
+
+            cleaned = []
+            seen = set()
+            for value in values:
+                text_value = str(value or "").strip()
+                key = text_value.casefold()
+                if text_value and key not in seen:
+                    seen.add(key)
+                    cleaned.append(text_value)
+            cleaned.sort(key=str.casefold)
+            result[field_name] = cleaned[:hint_limit]
+    return result
+
+
+def find_schedule_location_matches(
+    *,
+    land_type: str | None = None,
+    context: dict[str, Any] | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return schedule-backed locations matching the current calculator inputs."""
+    context = dict(context or {})
+    hint_limit = max(1, limit)
+    statement = (
+        select(PropertyLocation)
+        .join(
+            DCValuationRate,
+            DCValuationRate.location_id == PropertyLocation.id,
+        )
+        .distinct()
+    )
+    statement = _apply_location_land_type(statement, land_type)
+    statement = _apply_location_context(statement, context)
+    statement = statement.order_by(
+        PropertyLocation.district,
+        PropertyLocation.tehsil,
+        PropertyLocation.mauza,
+        PropertyLocation.name,
+        PropertyLocation.id,
+    )
+    with SessionLocal() as session:
+        candidates = session.scalars(
+            statement.limit(max(500, hint_limit * 5))
+        ).unique().all()
+    matches = []
+    for location in candidates:
+        record = _location_dict(location)
+        if _location_matches_context(record, context):
+            matches.append(record)
+    return matches[:hint_limit]
 
 
 def list_mauza_names(
@@ -1535,9 +1953,11 @@ def _mauza_cadastral_values_in_session(session, context: dict[str, Any], field_n
 
 
 def list_cadastral_values(
-    field_name: str, *, search: str = "", limit: int = 50,
+    field_name: str, *, search: str = "", qanoongoi: str = "", mauza: str = "",
+    square_no: str = "", kila_no: str = "", schedule_type: str | None = None,
+    land_type: str | None = None, location_id: int | None = None, limit: int = 50,
 ) -> list[str]:
-    """Return matching Square, Kila, or Khasra tokens present in saved schedules."""
+    """Return cadastral tokens from schedules matching the selected parent context."""
     fields = {
         "square_no": PropertyLocation.square_no,
         "kila_no": PropertyLocation.kila_no,
@@ -1546,23 +1966,43 @@ def list_cadastral_values(
     field = fields.get(field_name)
     if field is None:
         raise DCRateServiceError("Choose Square no., Kila no., or Khasra no. for suggestions.")
+    active_contexts = [
+        (filter_name, fields[filter_name], term)
+        for filter_name, term in (("square_no", square_no), ("kila_no", kila_no))
+        if filter_name != field_name and _text(term)
+    ]
     statement = (
-        select(field)
+        select(field, *(column for _, column, _ in active_contexts))
         .join(DCValuationRate, DCValuationRate.location_id == PropertyLocation.id)
         .where(field.is_not(None), field != "")
         .distinct()
     )
+    if mauza.strip():
+        statement = statement.where(PropertyLocation.mauza.ilike(f"%{mauza.strip()}%"))
+    statement = _apply_qanoongoi_filter(statement, qanoongoi)
+    if schedule_type in {"dc", "fbr"}:
+        statement = statement.where(DCValuationRate.schedule_type == schedule_type)
+    if land_type in {"rural", "urban"}:
+        statement = statement.where(PropertyLocation.land_type == land_type)
+    if location_id is not None:
+        statement = statement.where(DCValuationRate.location_id == location_id)
     query = search.strip()
     if query:
         statement = statement.where(field.ilike(f"%{query}%"))
+    requested_tokens = [set(_reference_values(term)) for _, _, term in active_contexts]
     with SessionLocal() as session:
-        stored_values = session.scalars(statement).all()
-    tokens = {
-        token
-        for stored_value in stored_values
-        for token in _reference_values(stored_value)
-        if not query or token.casefold().startswith(query.casefold())
-    }
+        stored_rows = session.execute(statement).all()
+    tokens = set()
+    for stored_row in stored_rows:
+        context_values = stored_row[1:]
+        if any(
+            not requested.intersection(_reference_values(stored_value))
+            for requested, stored_value in zip(requested_tokens, context_values)
+        ):
+            continue
+        for token in _reference_values(stored_row[0]):
+            if not query or token.casefold().startswith(query.casefold()):
+                tokens.add(token)
     return sorted(tokens, key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else token.casefold()))[:max(1, limit)]
 
 
@@ -1643,9 +2083,11 @@ def summarize_dc_rates(
     }
 
 
-def create_location(**values: Any) -> tuple[int, bool]:
+def create_location(
+    *, reference_mode: str = "individual", **values: Any
+) -> tuple[int, bool]:
     """Return (location ID, created); exact duplicates reuse the location."""
-    normalized = _location_data(values)
+    normalized = _location_data(values, reference_mode=reference_mode)
     with SessionLocal.begin() as session:
         for existing in session.scalars(select(PropertyLocation)).all():
             existing_data = {field: getattr(existing, field) for field in LOCATION_FIELDS}
@@ -1737,11 +2179,36 @@ def get_dc_rate(rate_id: int) -> dict[str, Any] | None:
         return _record_dict(record) if record else None
 
 
+def _reference_sql_conditions(column, term: str) -> list[Any]:
+    """Broad SQL candidate conditions for an individual or range reference.
+
+    The Python pass below performs the exact token/range intersection. This
+    helper must remain a superset so an overlapping range query such as ``2-4``
+    is not excluded by the SQL prefilter before it can match stored ``1-3``.
+    """
+    term = term.strip()
+    conditions: list[Any] = [column.ilike(f"%{term}%")]
+    try:
+        tokens = _reference_values(term)
+    except DCRateServiceError:
+        tokens = []
+    bare = re.sub(r"[,;\s]", "", term)
+    looks_numeric = bool(bare) and bool(re.fullmatch(r"\d+(?:-\d+)?", bare))
+    for token in tokens:
+        conditions.append(column.ilike(f"%{token}%"))
+    if looks_numeric:
+        # Stored range rows may contain the query value without literally
+        # containing it (for example stored "1-9" queried with "5").
+        conditions.append(column.like("%-%"))
+    return conditions
+
+
 def list_dc_rates(
     *,
     search: str = "",
     schedule_type: str | None = None,
     location_id: int | None = None,
+    location_ids: list[int] | tuple[int, ...] | None = None,
     rate_unit: str | None = None,
     verification_status: str | None = None,
     effective_on: date | None = None,
@@ -1758,12 +2225,15 @@ def list_dc_rates(
     statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
     search = search.strip()
     if (mauza.strip() or qanoongoi.strip() or square_no.strip() or kila_no.strip()
-            or khasra_no.strip() or land_type in {"rural", "urban"}
-            or (search and not search.isdigit())):
+            or khasra_no.strip() or land_type in {"rural", "urban"} or search):
         statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
-    if location_id is not None:
+    if location_ids is not None:
+        statement = statement.where(
+            DCValuationRate.location_id.in_([int(value) for value in location_ids])
+        )
+    elif location_id is not None:
         statement = statement.where(DCValuationRate.location_id == location_id)
     if land_type in {"rural", "urban"}:
         statement = statement.where(PropertyLocation.land_type == land_type)
@@ -1785,15 +2255,22 @@ def list_dc_rates(
             PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
         )
     statement = _apply_qanoongoi_filter(statement, qanoongoi)
-    # Cadastral fields are stored as token lists; query candidates in SQLite,
-    # then validate whole tokens below so (for example) 2 does not match 12.
+    # Cadastral fields are stored as token lists or compact ranges; query a
+    # broad superset in SQLite, then validate whole tokens/ranges below so
+    # (for example) 2 does not match 12 and overlapping ranges still match.
     for field_name, term in (
         ("square_no", square_no), ("kila_no", kila_no), ("khasra_no", khasra_no)
     ):
         if term.strip():
             field = getattr(PropertyLocation, field_name)
-            statement = statement.where(field.ilike(f"%{term.strip()}%"))
-    if search and not search.isdigit():
+            statement = statement.where(or_(
+                *_reference_sql_conditions(field, term)
+            ))
+    if search:
+        # Numeric terms need the same SQL prefilter as text terms so a bulky
+        # schedule is not loaded into Python for token validation. The Python
+        # pass below still enforces exact cadastral tokens after this broad
+        # substring candidate filter.
         searchable_rate_fields = (
             DCValuationRate.property_type, DCValuationRate.classification,
             DCValuationRate.floor, DCValuationRate.schedule_type,
@@ -1807,32 +2284,44 @@ def list_dc_rates(
             PropertyLocation.mauza, PropertyLocation.hadbast_number,
             PropertyLocation.serial_no, PropertyLocation.locality,
         )
+        reference_columns = (
+            PropertyLocation.square_no, PropertyLocation.kila_no,
+            PropertyLocation.khasra_no,
+        )
+        reference_conditions = []
+        for column in reference_columns:
+            reference_conditions.extend(_reference_sql_conditions(column, search))
         statement = statement.where(or_(
             *(field.ilike(f"%{search}%") for field in searchable_rate_fields),
             *(field.ilike(f"%{search}%") for field in searchable_location_fields),
-            PropertyLocation.square_no.ilike(f"%{search}%"),
-            PropertyLocation.kila_no.ilike(f"%{search}%"),
-            PropertyLocation.khasra_no.ilike(f"%{search}%"),
+            *reference_conditions,
         ))
     statement = statement.order_by(
         DCValuationRate.effective_from.desc(), DCValuationRate.id.desc()
     )
     # Whole-token reference validation and legacy range expansion happen in
-    # Python below, so paginate those filtered results only after validation.
+    # Python below, so paginate only unfiltered listing in SQL. Searching
+    # streams candidates in schedule order and stops as soon as the requested
+    # page is full; the SQL prefilter is a superset of valid token matches.
     has_reference_filter = any((square_no.strip(), kila_no.strip(), khasra_no.strip()))
-    sql_pagination = limit is not None and not has_reference_filter
-    apply_sql_pagination = sql_pagination and (not search or not search.isdigit())
+    sql_pagination = limit is not None and not has_reference_filter and not search
     with SessionLocal() as session:
-        if apply_sql_pagination:
+        if sql_pagination:
             statement = statement.limit(max(1, limit)).offset(max(0, offset))
-        rows = session.scalars(statement).unique().all()
         if not search and not has_reference_filter:
-            return [_record_dict(row) for row in rows]
+            # The location relationship is many-to-one, so joined eager loads
+            # do not duplicate rows and chunked streaming is safe here.
+            return [
+                _record_dict(row)
+                for row in session.scalars(statement).yield_per(256)
+            ]
 
         search_key = search.casefold()
         reference_fields = ("square_no", "kila_no", "khasra_no")
+        start = max(0, offset)
+        stop = None if limit is None else start + max(1, limit)
         matches: list[dict[str, Any]] = []
-        for row in rows:
+        for row in session.scalars(statement).yield_per(256):
             record = _record_dict(row)
             try:
                 square_match = not square_no.strip() or bool(set(_reference_values(square_no)).intersection(
@@ -1862,21 +2351,20 @@ def list_dc_rates(
             ]
             if search_key and any(search_key in str(value).casefold() for value in text_values if value):
                 matches.append(record)
-                continue
-            try:
-                requested_tokens = set(_reference_values(search))
-                found = any(
-                    requested_tokens.intersection(_reference_values(record.get(field)))
-                    for field in reference_fields
-                )
-            except DCRateServiceError:
-                found = False
-            if not search_key or found:
-                matches.append(record)
-        if apply_sql_pagination:
-            return matches
-        start = max(0, offset)
-        return matches[start : start + limit] if limit is not None else matches
+            else:
+                try:
+                    requested_tokens = set(_reference_values(search))
+                    found = any(
+                        requested_tokens.intersection(_reference_values(record.get(field)))
+                        for field in reference_fields
+                    )
+                except DCRateServiceError:
+                    found = False
+                if not search_key or found:
+                    matches.append(record)
+            if stop is not None and len(matches) >= stop:
+                break
+        return matches[start:] if limit is not None else matches
 
 
 def _header_key(value: Any) -> str:
@@ -1884,19 +2372,72 @@ def _header_key(value: Any) -> str:
     return normalized.strip("_")
 
 
-def read_schedule_spreadsheet(file_bytes: bytes, filename: str) -> tuple[list[str], list[list[Any]]]:
-    """Read tabular values from CSV, XLSX or ODS without changing source data."""
+def _sheet_from_rows(
+    name: str, rows: list[tuple[int, list[Any]]]
+) -> dict[str, Any] | None:
+    """Build a sheet record with accurate source row numbers."""
+    nonempty = [
+        (row_number, list(values))
+        for row_number, values in rows
+        if any(value is not None and str(value).strip() for value in values)
+    ]
+    if not nonempty:
+        return None
+    _header_row, header_values = nonempty[0]
+    headers = [str(value or "").strip() for value in header_values]
+    data = nonempty[1:]
+    return {
+        "name": name,
+        "headers": headers,
+        "rows": [values for _row_number, values in data],
+        "row_numbers": [row_number for row_number, _values in data],
+    }
+
+
+def read_schedule_sheets(
+    file_bytes: bytes, filename: str
+) -> list[dict[str, Any]]:
+    """Read every non-empty worksheet from a CSV, XLSX, or ODS workbook.
+
+    Reading only the active sheet silently dropped whole villages in
+    multi-sheet workbooks. Every sheet is returned with its own headers, rows,
+    and original row numbers so the importer can import and report all of them.
+    """
     extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    sheets: list[dict[str, Any]] = []
     if extension == "csv":
+        decoded = None
+        for encoding in ("utf-8-sig", "cp1252"):
+            try:
+                decoded = file_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if decoded is None:
+            raise DCRateServiceError(
+                "Could not decode this CSV file. Save it as UTF-8 and try again."
+            )
         try:
-            lines = file_bytes.decode("utf-8-sig").splitlines()
-            rows = list(csv.reader(lines))
-        except (UnicodeDecodeError, csv.Error) as exc:
+            rows = list(csv.reader(decoded.splitlines()))
+        except csv.Error as exc:
             raise DCRateServiceError(f"Could not read CSV file: {exc}") from exc
+        sheet = _sheet_from_rows(
+            Path(filename).stem or "CSV", list(enumerate(rows, start=1))
+        )
+        if sheet:
+            sheets.append(sheet)
     elif extension == "xlsx":
         try:
-            workbook = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
-            rows = list(workbook.active.iter_rows(values_only=True))
+            workbook = load_workbook(
+                BytesIO(file_bytes), read_only=True, data_only=True
+            )
+            for worksheet in workbook.worksheets:
+                rows = list(enumerate(
+                    worksheet.iter_rows(values_only=True), start=1
+                ))
+                sheet = _sheet_from_rows(worksheet.title, rows)
+                if sheet:
+                    sheets.append(sheet)
             workbook.close()
         except Exception as exc:
             raise DCRateServiceError(f"Could not open Excel workbook: {exc}") from exc
@@ -1904,33 +2445,84 @@ def read_schedule_spreadsheet(file_bytes: bytes, filename: str) -> tuple[list[st
         try:
             from odf.opendocument import load as load_ods
             from odf.table import Table, TableCell, TableRow
-            from odf.text import P
             from odf import teletype
+
             document = load_ods(BytesIO(file_bytes))
-            sheets = document.spreadsheet.getElementsByType(Table)
-            if not sheets:
+            tables = document.spreadsheet.getElementsByType(Table)
+            if not tables:
                 raise DCRateServiceError("The ODS file has no worksheet.")
-            rows = []
-            for row in sheets[0].getElementsByType(TableRow):
-                values = []
-                for cell in row.getElementsByType(TableCell):
-                    repeat = int(cell.getAttribute("numbercolumnsrepeated") or 1)
-                    raw = cell.getAttribute("datevalue") or cell.getAttribute("value")
-                    if raw is None:
-                        raw = teletype.extractText(cell)
-                    values.extend([raw] * min(repeat, 256))
-                rows.append(values)
+            for table in tables:
+                rows: list[tuple[int, list[Any]]] = []
+                for row_number, row in enumerate(
+                    table.getElementsByType(TableRow), start=1
+                ):
+                    values = []
+                    for cell in row.getElementsByType(TableCell):
+                        repeat = int(cell.getAttribute("numbercolumnsrepeated") or 1)
+                        raw = cell.getAttribute("datevalue") or cell.getAttribute("value")
+                        if raw is None:
+                            raw = teletype.extractText(cell)
+                        values.extend([raw] * min(repeat, 256))
+                    rows.append((row_number, values))
+                sheet = _sheet_from_rows(
+                    table.getAttribute("name") or f"Sheet {len(sheets) + 1}",
+                    rows,
+                )
+                if sheet:
+                    sheets.append(sheet)
         except DCRateServiceError:
             raise
         except Exception as exc:
             raise DCRateServiceError(f"Could not open ODS workbook: {exc}") from exc
     else:
         raise DCRateServiceError("Choose a CSV, XLSX, or ODS spreadsheet.")
-    rows = [list(row) for row in rows if any(value is not None and str(value).strip() for value in row)]
-    if not rows:
+    if not sheets:
         raise DCRateServiceError("The selected spreadsheet is empty.")
-    headers = [str(value or "").strip() for value in rows[0]]
-    return headers, rows[1:]
+    return sheets
+
+
+def group_schedule_sheets(
+    sheets: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Group worksheets that share the same normalized header row.
+
+    Sheets with identical columns can be imported together under one mapping.
+    Sheets with different columns remain separate choices so no column is
+    guessed or silently ignored.
+    """
+    groups: dict[tuple[str, ...], dict[str, Any]] = {}
+    for sheet in sheets:
+        key = tuple(_header_key(header) for header in sheet["headers"])
+        group = groups.get(key)
+        if group is None:
+            group = {
+                "key": key,
+                "headers": sheet["headers"],
+                "sheets": [],
+                "rows": [],
+                "row_numbers": [],
+                "row_sheets": [],
+            }
+            groups[key] = group
+        group["sheets"].append(sheet["name"])
+        group["rows"].extend(sheet["rows"])
+        group["row_numbers"].extend(sheet["row_numbers"])
+        group["row_sheets"].extend([sheet["name"]] * len(sheet["rows"]))
+    return list(groups.values())
+
+
+def read_schedule_spreadsheet(
+    file_bytes: bytes, filename: str
+) -> tuple[list[str], list[list[Any]]]:
+    """Backward-compatible reader for one header layout.
+
+    Prefer :func:`read_schedule_sheets` in the UI so every worksheet can be
+    reviewed and imported. This helper combines all sheets that share the first
+    sheet's headers, preserving the previous two-value return.
+    """
+    groups = group_schedule_sheets(read_schedule_sheets(file_bytes, filename))
+    first = groups[0]
+    return first["headers"], first["rows"]
 
 
 def suggested_column_mapping(headers: list[str]) -> dict[str, int]:
@@ -1942,6 +2534,15 @@ def suggested_column_mapping(headers: list[str]) -> dict[str, int]:
             target = "locality"
         if target and target not in mapping:
             mapping[target] = index
+    # Some official files label the village column with wording that is not an
+    # exact alias, such as "Name of Village" or "Mauza / Village". Match those
+    # tokens explicitly so a whole village is not silently left unmapped.
+    if "mauza" not in mapping:
+        for index, header in enumerate(headers):
+            key = _header_key(header)
+            if any(token in key for token in ("mauza", "mouza", "village")):
+                mapping["mauza"] = index
+                break
     # The current official schedule exports usually expose Mauza and Location,
     # but not a separate display-name column for the database location record.
     if "location_name" not in mapping:
@@ -1952,10 +2553,264 @@ def suggested_column_mapping(headers: list[str]) -> dict[str, int]:
     return mapping
 
 
-def preview_mapped_schedule(
-    headers: list[str], rows: list[list[Any]], mapping: dict[str, int], schedule_type: str
+def _preview_import_items(
+    items: list[dict[str, Any]],
+    *,
+    duplicate_policy: str = "check_now",
+    duplicate_rule: str | None = None,
+    storage_mode: str = "ranges",
+    initial_issues: list[dict[str, Any]] | None = None,
+    initial_invalid_rows: int = 0,
 ) -> dict[str, Any]:
-    """Normalize a rural/urban DC or FBR profile and validate it without writes."""
+    """Validate prepared import rows and apply the chosen duplicate policy.
+
+    ``items`` each contain a source row number, optional worksheet name, raw
+    location/rate values, and the raw source values used in reports. Rows whose
+    required profile fields are blank are supplied through ``initial_issues``
+    by the caller so their accurate source row numbers are preserved.
+    """
+    if duplicate_policy not in {"check_now", "import_all"}:
+        raise DCRateServiceError("Choose whether to check duplicates now or later.")
+    if storage_mode not in REFERENCE_STORAGE_MODES:
+        raise DCRateServiceError("Cadastral storage must be 'ranges' or 'individual'.")
+    with SessionLocal() as session:
+        profile = duplicate_rules.get_profile(
+            session,
+            duplicate_rule or duplicate_rules.EXACT_ALL_REFERENCE,
+        )
+    issues: list[dict[str, Any]] = list(initial_issues or [])
+    warnings: list[dict[str, Any]] = []
+    invalid_rows = initial_invalid_rows
+    candidates: list[dict[str, Any]] = []
+    workbook_index = duplicate_rules.DuplicateIndex(profile)
+    expanded_rows = 0
+    workbook_duplicates = 0
+    database_duplicates = 0
+    duplicates_kept = 0
+
+    def attach_sheet(issue: dict[str, Any], sheet: str | None) -> dict[str, Any]:
+        if sheet:
+            issue.setdefault("sheet", sheet)
+        return issue
+
+    def duplicate_issue(
+        row_number: int,
+        prior: dict[str, Any],
+        source_values: list[str],
+        location: dict[str, Any],
+        *,
+        where: str,
+        sheet: str | None,
+    ) -> dict[str, Any]:
+        cadastral = " / ".join(
+            value
+            for value in (
+                location.get("square_no"),
+                location.get("kila_no"),
+                location.get("khasra_no"),
+            )
+            if value
+        ) or "same cadastral reference"
+        if prior.get("id") is not None:
+            match_text = f"existing record #{prior['id']}"
+        else:
+            match_text = f"row {prior.get('row')} in this import"
+        return attach_sheet({
+            "row": row_number,
+            "kind": f"exact duplicate in {where}",
+            "message": (
+                f"All compared columns exactly match {match_text} "
+                f"({cadastral}). This duplicate is removed; the first row is kept."
+            ),
+            "source_values": source_values,
+            "allowed_by_rule": False,
+        }, sheet)
+
+    def duplicate_warning(
+        row_number: int,
+        prior: dict[str, Any],
+        source_values: list[str],
+        *,
+        where: str,
+        sheet: str | None,
+    ) -> dict[str, Any]:
+        if prior.get("id") is not None:
+            match_text = f"existing record #{prior['id']}"
+        else:
+            match_text = f"row {prior.get('row')} in this import"
+        return attach_sheet({
+            "row": row_number,
+            "kind": f"exact duplicate in {where} (kept for later cleanup)",
+            "message": (
+                f"All compared columns exactly match {match_text}. It will be "
+                "imported now and can be removed later with the duplicate tools."
+            ),
+            "source_values": source_values,
+            "allowed_by_rule": True,
+        }, sheet)
+
+    for item in items:
+        row_number = int(item["row"])
+        sheet = item.get("sheet")
+        source_values = item.get("source_values", [])
+        try:
+            location = _location_data(
+                item.get("location_values") or {}, reference_mode=storage_mode
+            )
+            rate = _rate_data(item.get("rate_values") or {})
+            if storage_mode == "ranges":
+                # One compact record represents the whole range.
+                expanded_locations = [location]
+            else:
+                expanded_locations = _expand_location_values(
+                    location, source_row=row_number
+                )
+            new_expanded_total = expanded_rows + len(expanded_locations)
+            if new_expanded_total > MAX_EXPANDED_ROWS_PER_IMPORT:
+                raise DCRateServiceError(
+                    f"This import expands to more than "
+                    f"{MAX_EXPANDED_ROWS_PER_IMPORT:,} cadastral records. "
+                    "Split the schedule into smaller files or keep ranges."
+                )
+            expanded_rows = new_expanded_total
+            seen_combinations: set[tuple[Any, ...]] = set()
+            for expanded_index, expanded_location in enumerate(
+                expanded_locations, start=1
+            ):
+                flat = _flat_rate_record(rate, expanded_location)
+                combination_key = duplicate_rules.record_key(flat, profile)
+                if combination_key in seen_combinations:
+                    continue
+                seen_combinations.add(combination_key)
+                prior = workbook_index.find(flat)
+                if prior is not None:
+                    if duplicate_policy == "check_now":
+                        workbook_duplicates += 1
+                        issues.append(duplicate_issue(
+                            row_number,
+                            prior,
+                            source_values,
+                            expanded_location,
+                            where="workbook",
+                            sheet=sheet,
+                        ))
+                    else:
+                        duplicates_kept += 1
+                        warnings.append(duplicate_warning(
+                            row_number,
+                            prior,
+                            source_values,
+                            where="workbook",
+                            sheet=sheet,
+                        ))
+                    # Exact duplicates are already represented by the first row;
+                    # a later cleanup can only keep one copy.
+                    if duplicate_policy == "check_now":
+                        continue
+                workbook_index.add({**flat, "row": row_number})
+                candidates.append({
+                    "row": row_number,
+                    "source_row": row_number,
+                    "sheet": sheet,
+                    "expanded_index": expanded_index,
+                    "expanded_count": len(expanded_locations),
+                    "location": expanded_location,
+                    "source_values": source_values,
+                    **rate,
+                })
+        except DCRateServiceError as exc:
+            invalid_rows += 1
+            issues.append(attach_sheet({
+                "row": row_number,
+                "kind": "invalid",
+                "message": str(exc),
+                "source_values": source_values,
+            }, sheet))
+
+    db_index = duplicate_rules.DuplicateIndex(profile)
+    with SessionLocal() as session:
+        rates = session.scalars(
+            select(DCValuationRate)
+            .options(joinedload(DCValuationRate.location))
+            .order_by(DCValuationRate.id)
+        ).unique().all()
+        for rate in rates:
+            db_index.add(_record_dict(rate))
+
+    new_candidates = []
+    for candidate in candidates:
+        flat = _flat_rate_record(
+            dict(candidate),
+            candidate.get("location") or {},
+        )
+        duplicate = db_index.find(flat)
+        if duplicate is not None:
+            if duplicate_policy == "check_now":
+                database_duplicates += 1
+                issues.append(duplicate_issue(
+                    candidate["row"],
+                    dict(duplicate),
+                    candidate.get("source_values", []),
+                    candidate.get("location") or {},
+                    where="database",
+                    sheet=candidate.get("sheet"),
+                ))
+                continue
+            duplicates_kept += 1
+            warnings.append(duplicate_warning(
+                candidate["row"],
+                dict(duplicate),
+                candidate.get("source_values", []),
+                where="database",
+                sheet=candidate.get("sheet"),
+            ))
+        new_candidates.append(candidate)
+        db_index.add({**flat, "row": candidate["row"], "id": None})
+
+    for issue in issues:
+        issue.setdefault(
+            "fix", _import_fix_suggestion(issue["message"], issue["kind"])
+        )
+    for warning in warnings:
+        warning.setdefault(
+            "fix",
+            "This row is imported now. Use 'Find / remove duplicates' after the "
+            "import to remove exact copies according to a rule.",
+        )
+    return {
+        "valid_records": new_candidates,
+        "issues": sorted(issues, key=lambda issue: issue["row"]),
+        "warnings": sorted(warnings, key=lambda warning: warning["row"]),
+        "duplicate_rule": duplicate_rules.profile_to_dict(profile),
+        "duplicate_policy": duplicate_policy,
+        "storage_mode": storage_mode,
+        "expanded_rows": expanded_rows,
+        "duplicates_removed": workbook_duplicates + database_duplicates,
+        "duplicates_kept": duplicates_kept,
+        "workbook_duplicates": workbook_duplicates,
+        "database_duplicates": database_duplicates,
+        "invalid_rows": invalid_rows,
+    }
+
+
+def preview_mapped_schedule(
+    headers: list[str],
+    rows: list[list[Any]],
+    mapping: dict[str, int],
+    schedule_type: str,
+    *,
+    duplicate_policy: str = "check_now",
+    duplicate_rule: str | None = None,
+    storage_mode: str = "ranges",
+    row_numbers: list[int] | None = None,
+    row_sheets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Normalize a rural/urban DC or FBR profile and validate it without writes.
+
+    ``duplicate_policy='check_now'`` removes exact duplicates immediately using
+    ``duplicate_rule`` (all columns by default). ``import_all`` imports every
+    row and reports exact duplicates as warnings so they can be cleaned later.
+    """
     profiles = {"rural_dc": "rural", "urban_dc": "urban", "fbr": "urban"}
     if schedule_type not in profiles:
         raise DCRateServiceError("Select Rural DC, Urban DC, or FBR schedule.")
@@ -1993,64 +2848,148 @@ def preview_mapped_schedule(
     if "rate_unit" not in mapping:
         # The FBR template defines this amount as value per square foot.
         mapping["rate_unit"] = -1
+    if duplicate_policy == "check_now":
+        with SessionLocal() as session:
+            selected_profile = duplicate_rules.get_profile(
+                session, duplicate_rule or duplicate_rules.EXACT_ALL_REFERENCE
+            )
+        try:
+            duplicate_rules.validate_profile_scope(
+                selected_profile,
+                schedule_type=normalized_schedule,
+                land_type=land_type,
+            )
+        except duplicate_rules.DuplicateRuleError:
+            # Older callers may pass a rule for a different schedule. Imports
+            # must stay usable, so fall back to the safe all-columns-exact rule
+            # instead of failing the whole preview.
+            duplicate_rule = duplicate_rules.EXACT_ALL_REFERENCE
     # Report blank cells in required profile fields by original spreadsheet
     # row number. Optional fields remain nullable and can be omitted.
-    row_issues = []
-    valid_rows = []
+    row_numbers = list(row_numbers) if row_numbers is not None else [
+        number for number in range(2, len(rows) + 2)
+    ]
+    row_sheets = list(row_sheets) if row_sheets is not None else [None] * len(rows)
+    if len(row_numbers) != len(rows) or len(row_sheets) != len(rows):
+        raise DCRateServiceError(
+            "The worksheet row metadata does not match the supplied rows."
+        )
+    row_issues: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
     required_targets = required_by_profile[schedule_type]
-    for row_number, row in enumerate(rows, start=2):
+    rate_fields = (
+        "property_type", "classification", "floor", "rate_value",
+        "structure_rate", "per_marla_value", "rate_unit", "effective_from",
+        "effective_to", "published_year", "source_reference", "source_date",
+        "verification_status", "verified_by",
+    )
+    for index, row in enumerate(rows):
+        row_number = row_numbers[index]
+        sheet_name = row_sheets[index]
+
+        def mapped(field: str):
+            column = mapping.get(field)
+            if column is None:
+                return None
+            if column == -1:
+                return "per_square_foot"
+            return row[column] if column < len(row) else None
+
         empty = [
             field for field in required_targets
             if field in mapping
-            and (mapping[field] == -1 or mapping[field] >= len(row) or _text(row[mapping[field]]) is None)
+            and (
+                mapping[field] == -1
+                or mapping[field] >= len(row)
+                or _text(row[mapping[field]]) is None
+            )
         ]
         if schedule_type in {"rural_dc", "fbr"}:
             def has_value(field: str) -> bool:
-                index = mapping.get(field)
-                return index is not None and index >= 0 and index < len(row) and _text(row[index]) is not None
+                column = mapping.get(field)
+                return (
+                    column is not None
+                    and column >= 0
+                    and column < len(row)
+                    and _text(row[column]) is not None
+                )
 
             # A Khasra-based record may legitimately omit square and Kila.
             # Rural rows otherwise need both; FBR rows need a square number.
             if has_value("khasra_no"):
                 empty = [field for field in empty if field not in {"square_no", "kila_no"}]
             elif schedule_type == "rural_dc" and (not has_value("square_no") or not has_value("kila_no")):
-                empty.extend(field for field in ("square_no", "kila_no") if not has_value(field) and field not in empty)
+                empty.extend(
+                    field for field in ("square_no", "kila_no")
+                    if not has_value(field) and field not in empty
+                )
             elif schedule_type == "fbr" and not has_value("square_no"):
                 empty.append("square_no")
+        source_values = [
+            "" if value is None else str(value) for value in row
+        ]
         if empty:
             row_issues.append({
                 "row": row_number,
+                "sheet": sheet_name,
                 "kind": "invalid",
                 "message": "Required value(s) are blank: " + ", ".join(sorted(empty)),
-                "source_values": ["" if value is None else str(value) for value in row],
+                "source_values": source_values,
                 "fix": "Fill the missing required value or select the correct spreadsheet column mapping.",
             })
-        else:
-            valid_rows.append(row)
-    output = BytesIO()
-    workbook = Workbook()
-    sheet = workbook.active
-    fields = list(mapping) + ["schedule_type", "land_type"]
-    sheet.append(fields)
-    for row in valid_rows:
-        sheet.append([
-            *[
-                "per_square_foot" if index == -1 else row[index] if index < len(row) else None
-                for index in mapping.values()
-            ],
-            normalized_schedule,
-            land_type,
-        ])
-    workbook.save(output)
-    workbook.close()
-    preview = preview_dc_rate_workbook(output.getvalue())
-    preview["issues"] = sorted([*row_issues, *preview["issues"]], key=lambda issue: issue["row"])
+            continue
+        location_values = {
+            field: mapped(field) for field in LOCATION_FIELDS if field in mapping
+        }
+        # The schedule profile, not a source column, defines rural/urban.
+        location_values["land_type"] = land_type
+        location_values["name"] = (
+            mapped("location_name")
+            or mapped("mauza")
+            or mapped("locality")
+        )
+        rate_values = {
+            field: mapped(field) for field in rate_fields if field in mapping
+        }
+        rate_values["schedule_type"] = normalized_schedule
+        rate_values["land_type"] = land_type
+        items.append({
+            "row": row_number,
+            "sheet": sheet_name,
+            "location_values": location_values,
+            "rate_values": rate_values,
+            "source_values": source_values,
+        })
+
+    preview = _preview_import_items(
+        items,
+        duplicate_policy=duplicate_policy,
+        duplicate_rule=duplicate_rule,
+        storage_mode=storage_mode,
+        initial_issues=row_issues,
+        initial_invalid_rows=len(row_issues),
+    )
     preview["rows_read"] = len(rows)
+    preview["source_rows"] = len(rows)
+    preview["sheet_names"] = sorted({
+        name for name in row_sheets if name
+    })
     return preview
 
 
-def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
-    """Validate an XLSX sheet and report invalid/duplicate rows without writes."""
+def preview_dc_rate_workbook(
+    file_bytes: bytes,
+    *,
+    duplicate_policy: str = "check_now",
+    duplicate_rule: str | None = None,
+    storage_mode: str = "ranges",
+) -> dict[str, Any]:
+    """Validate an XLSX sheet and report invalid/exact-duplicate rows without writes.
+
+    This entry point recognises the standard schedule headers directly. For
+    user-defined column mappings use :func:`preview_mapped_schedule`, which
+    shares the same validation, duplicate policy, and range storage pipeline.
+    """
     try:
         workbook = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
     except Exception as exc:
@@ -2070,6 +3009,10 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
             if not raw_header:
                 continue
             target = RATE_HEADERS.get(raw_header)
+            if target is None and any(
+                token in raw_header for token in ("mauza", "mouza", "village")
+            ):
+                target = "mauza"
             if target:
                 if target in columns:
                     duplicate_headers.append(target)
@@ -2087,231 +3030,183 @@ def preview_dc_rate_workbook(file_bytes: bytes) -> dict[str, Any]:
                 "Missing required columns: " + ", ".join(sorted(missing))
             )
 
-        candidates: list[dict[str, Any]] = []
-        issues: list[dict[str, Any]] = []
-        seen: dict[tuple[Any, ...], list[tuple[date, date | None, int]]] = {}
-        rows_read = 0
+        items: list[dict[str, Any]] = []
         for excel_row, values in enumerate(iterator, start=2):
             if not any(value is not None and str(value).strip() for value in values):
                 continue
-            rows_read += 1
             raw = {
                 field: values[index] if index < len(values) else None
                 for field, index in columns.items()
             }
-            try:
-                location = _location_data({
-                    "name": raw.get("location_name"),
-                    "serial_no": raw.get("serial_no"),
-                    "province": raw.get("province"),
-                    "district": raw.get("district"),
-                    "tehsil": raw.get("tehsil"),
-                    "land_type": raw.get("land_type"),
-                    "committee_town": raw.get("committee_town"),
-                    "revenue_circle": raw.get("revenue_circle"),
-                    "property_area": raw.get("property_area"),
-                    "qanoongoi": raw.get("qanoongoi"),
-                    "patwar_circle": raw.get("patwar_circle"),
-                    "mauza": raw.get("mauza"),
-                    "hadbast_number": raw.get("hadbast_number"),
-                    "square_no": raw.get("square_no"),
-                    "kila_no": raw.get("kila_no"),
-                    "khasra_no": raw.get("khasra_no"),
-                    "locality": raw.get("locality"),
-                })
-                rate = _rate_data(raw)
-                identity = _rate_identity(rate, _location_key(location))
-                scope = identity[:6]
-                conflict_row = next(
-                    (
-                        prior_row
-                        for prior_start, prior_end, prior_row in seen.get(scope, [])
-                        if _periods_overlap(
-                            prior_start,
-                            prior_end,
-                            rate["effective_from"],
-                            rate["effective_to"],
-                        )
+            items.append({
+                "row": excel_row,
+                "sheet": None,
+                "location_values": {
+                    **{field: raw.get(field) for field in LOCATION_FIELDS},
+                    "name": (
+                        raw.get("location_name")
+                        or raw.get("mauza")
+                        or raw.get("locality")
                     ),
-                    None,
-                )
-                if conflict_row is not None:
-                    issues.append({
-                        "row": excel_row,
-                        "kind": "duplicate in workbook",
-                        "message": f"Conflicting effective period with row {conflict_row} in this workbook.",
-                        "source_values": ["" if value is None else str(value) for value in values],
-                    })
-                    continue
-                seen.setdefault(scope, []).append(
-                    (rate["effective_from"], rate["effective_to"], excel_row)
-                )
-                candidates.append({
-                    "row": excel_row,
-                    "location": location,
-                    "source_values": ["" if value is None else str(value) for value in values],
-                    **rate,
-                })
-            except DCRateServiceError as exc:
-                issues.append({
-                    "row": excel_row,
-                    "kind": "invalid",
-                    "message": str(exc),
-                    "source_values": ["" if value is None else str(value) for value in values],
-                })
+                },
+                "rate_values": raw,
+                "source_values": [
+                    "" if value is None else str(value) for value in values
+                ],
+            })
 
-        with SessionLocal() as session:
-            existing_keys: list[tuple[tuple[Any, ...], int]] = []
-            locations = session.scalars(select(PropertyLocation)).all()
-            location_by_id = {location.id: location for location in locations}
-            rates = session.scalars(select(DCValuationRate)).all()
-            for rate in rates:
-                location = location_by_id.get(rate.location_id)
-                if location is not None:
-                    location_values = {
-                        field: getattr(location, field) for field in LOCATION_FIELDS
-                    }
-                    existing_keys.append(
-                        (
-                            _rate_identity(
-                                {
-                                    "schedule_type": rate.schedule_type,
-                                    "property_type": rate.property_type,
-                                    "classification": rate.classification,
-                                    "floor": rate.floor,
-                                    "rate_unit": rate.rate_unit,
-                                    "effective_from": rate.effective_from,
-                                    "effective_to": rate.effective_to,
-                                },
-                                _location_key(location_values),
-                            ),
-                            rate.id,
-                        )
-                    )
-
-        new_candidates = []
-        for candidate in candidates:
-            identity = _rate_identity(candidate, _location_key(candidate["location"]))
-            conflict_id = next(
-                (
-                    rate_id
-                    for existing_key, rate_id in existing_keys
-                    if existing_key[:6] == identity[:6]
-                    and _periods_overlap(
-                        existing_key[6],
-                        existing_key[7],
-                        identity[6],
-                        identity[7],
-                    )
-                ),
-                None,
-            )
-            if conflict_id is not None:
-                issues.append({
-                    "row": candidate["row"],
-                    "kind": "duplicate in database",
-                    "message": (
-                        f"Conflicts with existing record #{conflict_id} for the "
-                        "same location, property class, unit, and effective period."
-                    ),
-                    "source_values": candidate.get("source_values", []),
-                })
-                continue
-            new_candidates.append(candidate)
-        for issue in issues:
-            issue.setdefault("fix", _import_fix_suggestion(issue["message"], issue["kind"]))
-        return {
-            "valid_records": new_candidates,
-            "issues": sorted(issues, key=lambda issue: issue["row"]),
-            "rows_read": rows_read,
-        }
+        preview = _preview_import_items(
+            items,
+            duplicate_policy=duplicate_policy,
+            duplicate_rule=duplicate_rule,
+            storage_mode=storage_mode,
+        )
+        preview["rows_read"] = len(items)
+        preview["source_rows"] = len(items)
+        return preview
     finally:
         workbook.close()
 
 
-def import_dc_rate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Batch-insert previewed rows while checking conflicts again at commit.
+def import_dc_rate_records(
+    records: list[dict[str, Any]],
+    *,
+    duplicate_policy: str = "check_now",
+    duplicate_rule: str | None = None,
+    storage_mode: str = "ranges",
+) -> dict[str, Any]:
+    """Batch-insert previewed rows using the chosen storage and duplicate policy.
 
-    The preview has already reported invalid input and existing conflicts. This
-    final check protects against records added between preview and import, but
-    builds location/rate indexes once instead of querying and flushing per row.
+    ``storage_mode='ranges'`` stores one compact Square/Kila/Khasra range per
+    previewed record, while ``individual`` expands it into one row per value.
+    ``duplicate_policy='import_all'`` inserts exact duplicates too so they can be
+    removed later with the duplicate tools.
     """
+    if duplicate_policy not in {"check_now", "import_all"}:
+        raise DCRateServiceError("Choose whether to check duplicates now or later.")
+    if storage_mode not in REFERENCE_STORAGE_MODES:
+        raise DCRateServiceError("Cadastral storage must be 'ranges' or 'individual'.")
     issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    duplicates_removed = 0
+    duplicates_kept = 0
+    expanded_total = 0
     with SessionLocal.begin() as session:
+        profile = duplicate_rules.get_profile(
+            session, duplicate_rule or duplicate_rules.EXACT_ALL_REFERENCE
+        )
         # Cache all known locations by their normalized identity so thousands
         # of rows do not repeatedly scan/query the table.
         location_by_key = {
             _location_key({field: getattr(location, field) for field in LOCATION_FIELDS}): location
             for location in session.scalars(select(PropertyLocation)).all()
         }
-        prepared: list[tuple[dict[str, Any], dict[str, Any], tuple[str, ...], PropertyLocation]] = []
+        prepared: list[
+            tuple[dict[str, Any], dict[str, Any], dict[str, Any], PropertyLocation]
+        ] = []
         new_locations: list[PropertyLocation] = []
         for candidate in records:
-            row = candidate["row"]
-            location_values = _location_data(candidate["location"])
+            base_location = _location_data(
+                candidate["location"], reference_mode=storage_mode
+            )
             rate_values = _rate_data(candidate)
-            location_key = _location_key(location_values)
-            location = location_by_key.get(location_key)
-            if location is None:
-                location = PropertyLocation(**location_values)
-                location_by_key[location_key] = location
-                new_locations.append(location)
-            prepared.append((candidate, rate_values, location_key, location))
+            if storage_mode == "ranges":
+                expanded_locations = [base_location]
+            else:
+                expanded_locations = _expand_location_values(
+                    base_location, source_row=candidate.get("row")
+                )
+            expanded_total += len(expanded_locations)
+            if expanded_total > MAX_EXPANDED_ROWS_PER_IMPORT:
+                raise DCRateServiceError(
+                    f"This import expands to more than "
+                    f"{MAX_EXPANDED_ROWS_PER_IMPORT:,} cadastral records. "
+                    "Split the schedule into smaller files or keep ranges."
+                )
+            for location_values in expanded_locations:
+                location_key = _location_key(location_values)
+                location = location_by_key.get(location_key)
+                if location is None:
+                    location = PropertyLocation(**location_values)
+                    location_by_key[location_key] = location
+                    new_locations.append(location)
+                prepared.append((candidate, rate_values, location_values, location))
 
         if new_locations:
             session.add_all(new_locations)
             # One flush assigns IDs for all newly created locations.
             session.flush()
 
-        # Index effective periods for each rate identity. This catches both
-        # concurrent inserts made after preview and duplicate rows in the
-        # submitted batch without a SQL query for every candidate.
-        location_by_id = {location.id: location for location in location_by_key.values()}
-        rate_periods: dict[tuple[Any, ...], list[tuple[date, date | None, int | None]]] = {}
-        for rate in session.scalars(select(DCValuationRate)).all():
-            location = location_by_id.get(rate.location_id)
-            if location is None:
-                continue
-            location_values = {field: getattr(location, field) for field in LOCATION_FIELDS}
-            rate_identity = _rate_identity({
-                "schedule_type": rate.schedule_type,
-                "property_type": rate.property_type,
-                "classification": rate.classification,
-                "floor": rate.floor,
-                "rate_unit": rate.rate_unit,
-                "effective_from": rate.effective_from,
-                "effective_to": rate.effective_to,
-            }, _location_key(location_values))
-            rate_periods.setdefault(rate_identity[:6], []).append(
-                (rate.effective_from, rate.effective_to, rate.id)
-            )
+        # Index existing rates once so commit detects changes made after preview.
+        rate_index = duplicate_rules.DuplicateIndex(profile)
+        if duplicate_policy == "check_now":
+            for rate in session.scalars(
+                select(DCValuationRate)
+                .options(joinedload(DCValuationRate.location))
+                .order_by(DCValuationRate.id)
+            ).unique().all():
+                rate_index.add(_record_dict(rate))
 
         new_rates: list[DCValuationRate] = []
-        for candidate, rate_values, location_key, location in prepared:
-            rate_identity = _rate_identity(rate_values, location_key)
-            conflicts = [
-                existing_id
-                for start, end, existing_id in rate_periods.get(rate_identity[:6], [])
-                if _periods_overlap(start, end, rate_identity[6], rate_identity[7])
-            ]
-            if conflicts:
-                existing_id = conflicts[0]
-                conflict_description = (
-                    f"existing record #{existing_id}" if existing_id is not None
-                    else "another row in this import"
-                )
-                issues.append({
-                    "row": candidate["row"],
-                    "kind": "duplicate at import time",
-                    "message": f"Conflicts with {conflict_description}; skipped.",
-                })
-                continue
+        for candidate, rate_values, location_values, location in prepared:
+            flat = _flat_rate_record(rate_values, location_values)
+            if duplicate_policy == "check_now":
+                duplicate = rate_index.find(flat)
+                if duplicate is not None:
+                    duplicates_removed += 1
+                    if duplicate.get("id") is not None:
+                        duplicate_description = f"existing record #{duplicate['id']}"
+                    else:
+                        duplicate_description = (
+                            f"row {duplicate.get('row')} in this import"
+                        )
+                    issues.append({
+                        "row": candidate.get("row"),
+                        "sheet": candidate.get("sheet"),
+                        "kind": "exact duplicate at import time",
+                        "message": (
+                            f"All compared columns exactly match {duplicate_description}. "
+                            "This duplicate was not inserted; the first row is kept."
+                        ),
+                        "allowed_by_rule": False,
+                    })
+                    continue
+            else:
+                # Duplicates are intentionally imported; report them so the
+                # user can find them later with the cleanup tools.
+                if rate_index.find(flat) is not None:
+                    duplicates_kept += 1
+                    warnings.append({
+                        "row": candidate.get("row"),
+                        "sheet": candidate.get("sheet"),
+                        "kind": "exact duplicate imported for later cleanup",
+                        "message": (
+                            "An exact duplicate of this row is already stored. "
+                            "It was imported because duplicates are set to be "
+                            "cleaned later."
+                        ),
+                        "allowed_by_rule": True,
+                    })
             record = DCValuationRate(location_id=location.id, **rate_values)
             new_rates.append(record)
-            rate_periods.setdefault(rate_identity[:6], []).append(
-                (rate_identity[6], rate_identity[7], None)
-            )
+            rate_index.add({
+                **flat,
+                "row": candidate.get("row"),
+                "id": None,
+            })
         if new_rates:
             session.add_all(new_rates)
             session.flush()
-    return {"imported_count": len(new_rates), "issues": issues}
+    return {
+        "imported_count": len(new_rates),
+        "issues": issues,
+        "warnings": warnings,
+        "allowed_duplicate_count": duplicates_kept,
+        "duplicates_removed": duplicates_removed,
+        "duplicates_kept": duplicates_kept,
+        "duplicate_policy": duplicate_policy,
+        "storage_mode": storage_mode,
+        "expanded_count": expanded_total,
+        "source_records": len(records),
+        "duplicate_rule": duplicate_rules.profile_to_dict(profile),
+    }

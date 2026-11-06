@@ -10,13 +10,22 @@ from typing import Awaitable, Callable
 import flet as ft
 
 from core.models import DC_RATE_UNITS
+from services.dc_rate_duplicate_service import (
+    EXACT_ALL_REFERENCE,
+    MATCH_FIELD_GROUPS,
+    MATCH_FIELD_LABELS,
+)
 from services.dc_rate_service import (
     DCRateServiceError,
     MAUZA_CONTEXT_FIELDS,
     create_dc_rate,
+    create_duplicate_rule_profile,
     create_location,
+    delete_duplicate_rule_profile,
+    export_import_issues,
     export_schedule_records,
     get_dc_rate,
+    group_schedule_sheets,
     import_dc_rate_records,
     assign_cadastral_references_to_khewat,
     list_khewats_for_mauza,
@@ -30,6 +39,7 @@ from services.dc_rate_service import (
     list_mauza_contexts,
     list_cadastral_values,
     list_dc_rates,
+    list_duplicate_rule_profiles,
     list_locations,
     list_mauza_cadastral_values,
     list_rhz_years,
@@ -40,6 +50,7 @@ from services.dc_rate_service import (
     normalize_rhz_year,
     preview_dc_rate_workbook,
     preview_mapped_schedule,
+    read_schedule_sheets,
     read_schedule_spreadsheet,
     remove_duplicate_dc_rates_with_report,
     suggested_column_mapping,
@@ -50,6 +61,11 @@ from services.dc_rate_service import (
     summarize_mauza_references,
     update_khewat_record,
     update_dc_rate,
+    update_duplicate_rule_profile,
+)
+from services.settings_service import (
+    get_cadastral_storage_mode,
+    set_cadastral_storage_mode,
 )
 
 
@@ -63,6 +79,59 @@ UNIT_LABELS = {
     "per_kila": "Per kila",
     "per_plot": "Per plot",
 }
+
+DUPLICATE_SCOPE_LABELS = {
+    "rural_dc": "Rural DC",
+    "urban_dc": "Urban DC",
+    "fbr": "FBR",
+    "any": "Any schedule",
+}
+DUPLICATE_DATE_LABELS = {
+    "overlap": "Overlapping dates",
+    "exact": "Exact dates",
+    "ignore": "Ignore dates",
+}
+DUPLICATE_ACTION_LABELS = {
+    "skip": "Skip duplicates",
+    "import": "Import anyway",
+}
+
+
+def _duplicate_rule_label(profile: dict) -> str:
+    return (
+        f"{profile['name']} | {DUPLICATE_SCOPE_LABELS.get(profile['schedule_scope'], profile['schedule_scope'])} | "
+        f"{DUPLICATE_DATE_LABELS.get(profile['date_mode'], profile['date_mode'])} | "
+        f"{DUPLICATE_ACTION_LABELS.get(profile['import_action'], profile['import_action'])}"
+    )
+
+
+def _duplicate_rule_options(
+    profiles: list[dict], schedule_scope: str | None = None
+) -> list[ft.dropdown.Option]:
+    allowed = [
+        profile
+        for profile in profiles
+        if schedule_scope is None
+        or profile["schedule_scope"] in (schedule_scope, "any")
+    ]
+    return [ft.dropdown.Option(profile["reference"], _duplicate_rule_label(profile)) for profile in allowed]
+
+
+def _duplicate_rule_by_reference(profiles: list[dict], reference: str | None) -> dict | None:
+    return next((profile for profile in profiles if profile["reference"] == reference), None)
+
+
+def _duplicate_rule_help(profile: dict | None) -> str:
+    if profile is None:
+        return "Select a duplicate rule before scanning or previewing."
+    fields = profile.get("match_fields", [])
+    field_labels = [MATCH_FIELD_LABELS.get(field, field) for field in fields]
+    return (
+        f"{profile.get('description') or 'No description.'}\n"
+        f"Match {len(fields)} field(s): {', '.join(field_labels)}.\n"
+        f"{DUPLICATE_DATE_LABELS.get(profile['date_mode'], profile['date_mode'])}; "
+        f"{DUPLICATE_ACTION_LABELS.get(profile['import_action'], profile['import_action'])}."
+    )
 
 
 def _format_date(value: date | None, *, empty: str = "Not supplied") -> str:
@@ -155,6 +224,44 @@ def build_dc_rates_page(
     )
     status_text = ft.Text("", size=12, color="#475569")
     result_count = ft.Text("", size=12, color="#64748B")
+    busy_message = ft.Text("Working…", size=13, color="#0F172A")
+    busy_detail = ft.Text("", size=11, color="#64748B")
+    busy_overlay = ft.Container(
+        visible=False,
+        left=0,
+        top=0,
+        right=0,
+        bottom=0,
+        bgcolor="#660F172A",
+        alignment=ft.Alignment(0, 0),
+        content=ft.Container(
+            width=340,
+            padding=20,
+            bgcolor="#FFFFFF",
+            border_radius=10,
+            border=ft.Border.all(1, "#E2E8F0"),
+            content=ft.Column([
+                ft.Row([
+                    ft.ProgressRing(width=30, height=30, stroke_width=3),
+                    ft.Column([
+                        busy_message,
+                        busy_detail,
+                    ], spacing=2, expand=True),
+                ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.ProgressBar(width=300),
+            ], spacing=12, tight=True),
+        ),
+    )
+
+    def show_busy(message: str, detail: str = "The page stays responsive; please wait."):
+        busy_message.value = message
+        busy_detail.value = detail
+        busy_overlay.visible = True
+        page.update()
+
+    def hide_busy():
+        busy_overlay.visible = False
+        page.update()
     rate_summary = ft.Container(
         padding=10,
         bgcolor="#F8FAFC",
@@ -309,7 +416,9 @@ def build_dc_rates_page(
         if update_page:
             page.update()
 
-    def schedule_rates_refresh(_=None, *, append=False, suggestion_field=None):
+    def schedule_rates_refresh(
+        _=None, *, append=False, suggestion_field=None, refresh_cadastral=False,
+    ):
         """Debounce rapid edits, query on a worker, and render only the latest result."""
         nonlocal request_generation
         request_generation += 1
@@ -369,16 +478,45 @@ def build_dc_rates_page(
                     "kila_no": kila_filter,
                     "khasra_no": khasra_filter,
                 }
+                cadastral_fields = list(cadastral_controls) if refresh_cadastral else []
                 if suggestion_field in cadastral_controls:
-                    control = cadastral_controls[suggestion_field]
-                    values = await asyncio.to_thread(
-                        list_cadastral_values,
-                        suggestion_field,
-                        search=control.value or "",
+                    cadastral_fields.append(suggestion_field)
+                    if suggestion_field == "square_no":
+                        cadastral_fields.extend(("kila_no", "khasra_no"))
+                    elif suggestion_field == "kila_no":
+                        cadastral_fields.append("khasra_no")
+                cadastral_fields = list(dict.fromkeys(cadastral_fields))
+                if cadastral_fields:
+                    selected_location_id = (
+                        int(selected_location) if selected_location != "all" else None
                     )
+                    cadastral_values = await asyncio.gather(*(
+                        asyncio.to_thread(
+                            list_cadastral_values,
+                            field_name,
+                            search=cadastral_controls[field_name].value or "",
+                            qanoongoi=qanoongoi_filter.value or "",
+                            mauza=mauza_filter.value or "",
+                            square_no=(
+                                square_filter.value or ""
+                                if field_name in {"kila_no", "khasra_no"} else ""
+                            ),
+                            kila_no=(
+                                kila_filter.value or "" if field_name == "khasra_no" else ""
+                            ),
+                            schedule_type=schedule_type,
+                            land_type=land_type,
+                            location_id=selected_location_id,
+                        )
+                        for field_name in cadastral_fields
+                    ))
                     if generation != request_generation:
                         return
-                    control.suggestions = [ft.AutoCompleteSuggestion(key=value, value=value) for value in values]
+                    for field_name, values in zip(cadastral_fields, cadastral_values):
+                        cadastral_controls[field_name].suggestions = [
+                            ft.AutoCompleteSuggestion(key=value, value=value)
+                            for value in values
+                        ]
                 # Keep a recent save/import confirmation visible after its
                 # automatic background refresh has completed.
                 if completion_message and not completion_message.startswith("Loading"):
@@ -818,8 +956,9 @@ def build_dc_rates_page(
         page.show_dialog(dialog)
 
     async def import_excel(_=None):
-        # Import moves from file parsing -> column mapping -> validated preview
-        # -> service commit, so spreadsheet columns are never guessed silently.
+        # Import moves from file parsing -> worksheet selection -> column
+        # mapping -> validated preview -> service commit, so every worksheet is
+        # accounted for and spreadsheet columns are never guessed silently.
         try:
             files = await file_picker.pick_files(
                 dialog_title="Import DC or FBR schedule",
@@ -834,15 +973,9 @@ def build_dc_rates_page(
             if payload is None and selected.path:
                 payload = Path(selected.path).read_bytes()
             if payload is None:
-                raise DCRateServiceError("Could not read the selected workbook.")
-            if payload is None:
                 raise DCRateServiceError("Could not read the selected spreadsheet.")
-            headers, rows = read_schedule_spreadsheet(payload, selected.name)
-            guesses = suggested_column_mapping(headers)
-            source_options = [ft.dropdown.Option("", "Skip this field")] + [
-                ft.dropdown.Option(str(i), header or f"Column {i + 1}")
-                for i, header in enumerate(headers)
-            ]
+            sheets = read_schedule_sheets(payload, selected.name)
+            groups = group_schedule_sheets(sheets)
             profile_fields = {
                 "rural_dc": [
                     ("serial_no", "Serial no. (optional)"), ("district", "District (optional)"),
@@ -872,191 +1005,481 @@ def build_dc_rates_page(
                     ("per_marla_value", "Per marla valuation (optional; defaults to square-foot value × 272)"),
                 ],
             }
-            selects = {}
-            mapping_controls = ft.ResponsiveRow(run_spacing=4)
 
-            def rebuild_mapping(_=None):
-                """Display only fields supported by the selected schedule profile."""
-                profile = schedule.value or "rural_dc"
-                selects.clear()
-                controls = []
-                for target, label in profile_fields[profile]:
-                    control = ft.Dropdown(
-                        label=label,
-                        value=str(guesses[target]) if target in guesses else "",
-                        options=source_options,
+            def open_group_picker(groups):
+                """Let the user review every worksheet layout before importing."""
+                if len(groups) == 1:
+                    open_mapping(groups, 0)
+                    return
+                checks = []
+                error = ft.Text("", color="#B91C1C", size=12)
+                for index, group in enumerate(groups, start=1):
+                    check = ft.Checkbox(
+                        value=True,
+                        label=(
+                            f"Layout {index}: {', '.join(group['sheets'])} "
+                            f"({len(group['rows']):,} row(s))"
+                        ),
                     )
-                    selects[target] = control
-                    controls.append(ft.Container(control, col={"xs": 12, "md": 6}))
-                mapping_controls.controls = controls
-                page.update()
-
-            schedule = ft.RadioGroup(
-                value="rural_dc",
-                content=ft.Row([
-                    ft.Radio(value="rural_dc", label="Rural DC"),
-                    ft.Radio(value="urban_dc", label="Urban DC"),
-                    ft.Radio(value="fbr", label="FBR schedule"),
-                ], wrap=True, spacing=12),
-                on_change=rebuild_mapping,
-            )
-
-            def schedule_name() -> str:
-                return {"rural_dc": "Rural DC", "urban_dc": "Urban DC", "fbr": "FBR"}.get(
-                    schedule.value or "", "selected schedule"
-                )
-
-            def show_review(preview):
-                candidates, issues = preview["valid_records"], preview["issues"]
-                import_year = ft.TextField(
-                    label="Published year for this import (optional)",
-                    hint_text="Example: 2026. Leave blank to use each row's date/year.",
-                    width=300,
-                )
-                issue_controls = [ft.Text(
-                    f"Row {issue['row']} — {issue['kind']}: {issue['message']}", selectable=True,
-                    color="#B91C1C" if issue["kind"].startswith("invalid") else "#B45309")
-                    for issue in issues[:100]]
-                if not issue_controls:
-                    issue_controls.append(ft.Text("No invalid or duplicate rows found."))
-                # Replace the compact issue labels with a scrollable review:
-                # valid records can still be imported, while every skipped row
-                # shows its source values, reason, and a concrete correction.
-                issue_controls.clear()
-                for issue in issues:
-                    invalid = issue["kind"].startswith("invalid")
-                    issue_controls.append(ft.Container(
-                        padding=8,
-                        bgcolor="#FEF2F2" if invalid else "#FFFBEB",
-                        border=ft.Border.all(1, "#FECACA" if invalid else "#FDE68A"),
-                        border_radius=6,
-                        content=ft.Column([
-                            ft.Text(f"Row {issue['row']} · {issue['kind']}: {issue['message']}",
-                                    selectable=True, color="#B91C1C" if invalid else "#B45309",
-                                    weight=ft.FontWeight.BOLD),
-                            ft.Text("Source values: " + " | ".join(issue.get("source_values", [])),
-                                    selectable=True, size=11, color="#7F1D1D" if invalid else "#78350F"),
-                            ft.Text("Suggested fix: " + issue.get("fix", "Review and correct this source row."),
-                                    selectable=True, size=12, color="#991B1B" if invalid else "#92400E"),
-                        ], spacing=3),
-                    ))
-                if not issue_controls:
-                    issue_controls.append(ft.Text("No invalid or duplicate rows found.", color="#166534"))
-                valid_preview = ft.ListView(controls=[ft.Text(
-                    f"Row {record['row']}: {record['location'].get('name')} · "
-                    f"{record['classification'] or record['property_type']} · "
-                    f"{record['rate_value']} {record['rate_unit']}",
-                    size=12, color="#334155",
-                ) for record in candidates[:50]], height=130, spacing=3)
-                if not candidates:
-                    valid_preview.controls.append(ft.Text("No valid rows are ready to import.", color="#64748B"))
-                elif len(candidates) > 50:
-                    valid_preview.controls.append(ft.Text(f"…and {len(candidates) - 50} more valid rows.", size=11, color="#64748B"))
-                issue_preview = ft.ListView(controls=issue_controls, height=230, spacing=5)
-                content = ft.Column(controls=[
-                    ft.Text(f"File: {selected.name}\nSchedule: {schedule_name()}\n"
-                            f"Rows read: {preview['rows_read']} · Ready to import: {len(candidates)} · "
-                            f"Rows needing review: {len(issues)}. Existing rates will not be overwritten. "
-                            "Valid rows can be imported while issue rows remain skipped.",
-                            selectable=True),
-                    import_year,
-                    ft.Text("Valid row preview", weight=ft.FontWeight.BOLD), valid_preview,
-                    ft.Text("Rows needing attention", weight=ft.FontWeight.BOLD), issue_preview],
-                    width=680, tight=True, scroll=ft.ScrollMode.AUTO)
-
-                def commit_import(_):
-                    nonlocal import_in_progress
-                    if import_in_progress:
-                        status_text.value = "A schedule import is already running. Please wait for it to finish."
+                    checks.append((group, check))
+                def continue_import(_):
+                    selected_groups = [group for group, check in checks if check.value]
+                    if not selected_groups:
+                        error.value = "Select at least one worksheet layout to import."
                         page.update()
                         return
-                    year_text = (import_year.value or "").strip()
-                    if year_text:
-                        try:
-                            year_value = int(year_text)
-                            if not 1900 <= year_value <= 2200:
-                                raise ValueError
-                        except ValueError:
-                            status_text.value = "Published year must be a four-digit year from 1900 to 2200."
-                            page.update()
-                            return
-                        import_records = [
-                            {**record, "published_year": year_value,
-                             "effective_from": date(year_value, 1, 1)}
-                            for record in candidates
-                        ]
-                    else:
-                        import_records = candidates
-                    import_in_progress = True
                     close_dialog()
-                    status_text.value = (
-                        f"Import running in the background: {len(candidates):,} valid "
-                        f"{schedule_name()} rate(s). The page remains responsive."
-                    )
-                    page.update()
-
-                    async def run_import_in_background():
-                        nonlocal import_in_progress
-                        try:
-                            # Database writes happen on a worker thread so a
-                            # large schedule does not block Flet's UI event loop.
-                            outcome = await asyncio.to_thread(import_dc_rate_records, import_records)
-                            refreshed_locations = await asyncio.to_thread(list_locations)
-                            refresh_locations(refreshed_locations)
-                            schedule_filter.value = "all"
-                            location_filter.value = "all"
-                            unit_filter.value = "all"
-                            published_year_filter.value = ""
-                            search_field.value = ""
-                            qanoongoi_filter.value = ""
-                            mauza_filter.value = ""
-                            square_filter.value = ""
-                            kila_filter.value = ""
-                            khasra_filter.value = ""
-                            schedule_rates_refresh()
-                            status_text.value = (
-                                f"Imported {outcome['imported_count']:,} {schedule_name()} "
-                                f"rate(s) from {selected.name}."
+                    open_mapping(selected_groups, 0)
+                page.show_dialog(ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text(f"Choose worksheets - {selected.name}"),
+                    content=ft.Column([
+                        ft.Text(
+                            f"This file contains {len(groups)} column layout(s). "
+                            "Every worksheet is listed; selected layouts are imported "
+                            "one after another with their own column mapping.",
+                            size=12,
+                            color="#475569",
+                        ),
+                        *[
+                            ft.Container(
+                                padding=6,
+                                bgcolor="#F8FAFC",
+                                border=ft.Border.all(1, "#E2E8F0"),
+                                border_radius=6,
+                                content=ft.Column([
+                                    check,
+                                    ft.Text(
+                                        "Columns: " + ", ".join(
+                                            header or "(blank)" for header in group["headers"]
+                                        ),
+                                        size=11,
+                                        color="#64748B",
+                                    ),
+                                ], spacing=2),
                             )
-                            skipped = len(issues) + len(outcome["issues"])
-                            if skipped:
-                                status_text.value += f" {skipped:,} invalid or conflicting row(s) were skipped."
-                        except Exception as exc:
-                            status_text.value = f"Schedule import failed: {exc}"
-                        finally:
-                            import_in_progress = False
-                            page.update()
-
-                    try:
-                        page.run_task(run_import_in_background)
-                    except Exception as exc:
-                        import_in_progress = False
-                        status_text.value = f"Could not start the background import: {exc}"
-                        page.update()
-                page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text("Review schedule import"),
-                    content=content, actions=[ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
-                    ft.Button(f"Import {len(candidates)} valid rate(s)", on_click=commit_import, disabled=not candidates)]))
+                            for group, check in checks
+                        ],
+                        error,
+                    ], width=680, tight=True, scroll=ft.ScrollMode.AUTO),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
+                        ft.Button("Continue", on_click=continue_import),
+                    ],
+                ))
                 page.update()
 
-            def preview_mapping(_):
-                try:
-                    mapping = {key: int(control.value) for key, control in selects.items()
-                               if control.value not in (None, "")}
-                    preview = preview_mapped_schedule(headers, rows, mapping, schedule.value)
-                    close_dialog()
-                    show_review(preview)
-                except Exception as exc:
-                    mapping_error.value = str(exc)
+            def open_mapping(queue, index):
+                """Map and import one worksheet layout, then continue the queue."""
+                group = queue[index]
+                headers = group["headers"]
+                rows = group["rows"]
+                row_numbers = group.get("row_numbers")
+                row_sheets = group.get("row_sheets")
+                guesses = suggested_column_mapping(headers)
+                source_options = [ft.dropdown.Option("", "Skip this field")] + [
+                    ft.dropdown.Option(str(i), header or f"Column {i + 1}")
+                    for i, header in enumerate(headers)
+                ]
+                profiles = list_duplicate_rule_profiles()
+                selects = {}
+                mapping_controls = ft.ResponsiveRow(run_spacing=4)
+                mapping_error = ft.Text("", color="#B91C1C", size=12)
+
+                storage_mode = ft.RadioGroup(
+                    value=get_cadastral_storage_mode(),
+                    content=ft.Row([
+                        ft.Radio(value="ranges", label="Keep as ranges (recommended)"),
+                        ft.Radio(value="individual", label="Store each individual value"),
+                    ], wrap=True, spacing=12),
+                )
+                duplicate_policy = ft.RadioGroup(
+                    value="check_now",
+                    content=ft.Row([
+                        ft.Radio(value="check_now", label="Check / remove duplicates now"),
+                        ft.Radio(value="import_all", label="Import everything and clean later"),
+                    ], wrap=True, spacing=12),
+                )
+                duplicate_rule_dropdown = ft.Dropdown(
+                    label="Duplicate rule",
+                    value=EXACT_ALL_REFERENCE,
+                    options=_duplicate_rule_options(profiles),
+                    width=680,
+                )
+                duplicate_help = ft.Text(
+                    "The default rule removes a row only when every compared column "
+                    "is 100% identical; the first row is kept. Choose another rule or "
+                    "import everything to clean duplicates later.",
+                    size=11,
+                    color="#64748B",
+                )
+
+                def selected_profile() -> dict | None:
+                    return _duplicate_rule_by_reference(
+                        profiles, duplicate_rule_dropdown.value
+                    )
+
+                def refresh_rule_help(_=None):
+                    duplicate_help.value = _duplicate_rule_help(selected_profile())
                     page.update()
 
-            mapping_error = ft.Text("", color="#B91C1C", size=12)
-            page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text(f"Map columns — {selected.name}"),
-                content=ft.Column(controls=[ft.Text("Schedule type"), schedule, mapping_controls, mapping_error], width=680,
-                                  tight=True, scroll=ft.ScrollMode.AUTO),
-                actions=[ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
-                         ft.Button("Preview rows", on_click=preview_mapping)]))
-            rebuild_mapping()
-            page.update()
+                duplicate_rule_dropdown.on_select = refresh_rule_help
+
+                def rebuild_rule_options(_=None):
+                    scope = schedule.value or "rural_dc"
+                    allowed = [
+                        profile for profile in profiles
+                        if profile["schedule_scope"] in (scope, "any")
+                    ]
+                    references = [profile["reference"] for profile in allowed]
+                    duplicate_rule_dropdown.options = [
+                        ft.dropdown.Option(profile["reference"], _duplicate_rule_label(profile))
+                        for profile in allowed
+                    ]
+                    if duplicate_rule_dropdown.value not in references:
+                        duplicate_rule_dropdown.value = (
+                            EXACT_ALL_REFERENCE
+                            if EXACT_ALL_REFERENCE in references
+                            else (references[0] if references else None)
+                        )
+                    refresh_rule_help()
+
+                def rebuild_mapping(_=None):
+                    """Display only fields supported by the selected schedule profile."""
+                    profile = schedule.value or "rural_dc"
+                    selects.clear()
+                    controls = []
+                    for target, label in profile_fields[profile]:
+                        control = ft.Dropdown(
+                            label=label,
+                            value=str(guesses[target]) if target in guesses else "",
+                            options=source_options,
+                        )
+                        selects[target] = control
+                        controls.append(ft.Container(control, col={"xs": 12, "md": 6}))
+                    mapping_controls.controls = controls
+                    rebuild_rule_options()
+                    page.update()
+
+                schedule = ft.RadioGroup(
+                    value="rural_dc",
+                    content=ft.Row([
+                        ft.Radio(value="rural_dc", label="Rural DC"),
+                        ft.Radio(value="urban_dc", label="Urban DC"),
+                        ft.Radio(value="fbr", label="FBR schedule"),
+                    ], wrap=True, spacing=12),
+                    on_change=rebuild_mapping,
+                )
+
+                def schedule_name() -> str:
+                    return {"rural_dc": "Rural DC", "urban_dc": "Urban DC", "fbr": "FBR"}.get(
+                        schedule.value or "", "selected schedule"
+                    )
+
+                def show_review(preview):
+                    candidates, issues = preview["valid_records"], preview["issues"]
+                    warnings = preview.get("warnings", [])
+                    applied_rule = preview.get("duplicate_rule") or {}
+                    chosen_policy = duplicate_policy.value or "check_now"
+                    chosen_storage = storage_mode.value or "ranges"
+                    import_year = ft.TextField(
+                        label="Published year for this import (optional)",
+                        hint_text="Example: 2026. Leave blank to use each row's date/year.",
+                        width=300,
+                    )
+                    review_status = ft.Text("", size=12, color="#334155")
+
+                    def issue_label(issue: dict) -> str:
+                        sheet = issue.get("sheet")
+                        prefix = f"{sheet} " if sheet else ""
+                        return f"{prefix}row {issue['row']}"
+
+                    issue_controls = []
+                    for issue in issues:
+                        invalid = issue["kind"].startswith("invalid")
+                        issue_controls.append(ft.Container(
+                            padding=8,
+                            bgcolor="#FEF2F2" if invalid else "#FFFBEB",
+                            border=ft.Border.all(1, "#FECACA" if invalid else "#FDE68A"),
+                            border_radius=6,
+                            content=ft.Column([
+                                ft.Text(f"{issue_label(issue)} · {issue['kind']}: {issue['message']}",
+                                        selectable=True, color="#B91C1C" if invalid else "#B45309",
+                                        weight=ft.FontWeight.BOLD),
+                                ft.Text("Source values: " + " | ".join(issue.get("source_values", [])),
+                                        selectable=True, size=11, color="#7F1D1D" if invalid else "#78350F"),
+                                ft.Text("Suggested fix: " + issue.get("fix", "Review and correct this source row."),
+                                        selectable=True, size=12, color="#991B1B" if invalid else "#92400E"),
+                            ], spacing=3),
+                        ))
+                    if not issue_controls:
+                        issue_controls.append(ft.Text("No invalid or duplicate rows found.", color="#166534"))
+                    warning_controls = []
+                    for warning in warnings:
+                        warning_controls.append(ft.Container(
+                            padding=8,
+                            bgcolor="#EFF6FF",
+                            border=ft.Border.all(1, "#BFDBFE"),
+                            border_radius=6,
+                            content=ft.Column([
+                                ft.Text(
+                                    f"{issue_label(warning)} - {warning['kind']}: {warning['message']}",
+                                    selectable=True,
+                                    color="#1D4ED8",
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    "Source values: " + " | ".join(warning.get("source_values", [])),
+                                    selectable=True,
+                                    size=11,
+                                    color="#1E3A8A",
+                                ),
+                            ], spacing=3),
+                        ))
+                    if not warning_controls:
+                        warning_controls.append(ft.Text("No additional duplicate notes.", color="#166534"))
+                    warning_preview = ft.ListView(controls=warning_controls, height=130, spacing=5)
+                    valid_preview = ft.ListView(controls=[ft.Text(
+                        f"{record.get('sheet') + ' ' if record.get('sheet') else ''}"
+                        f"row {record['row']}: {record['location'].get('name')} · "
+                        f"{record['classification'] or record['property_type']} · "
+                        f"{record['rate_value']} {record['rate_unit']}",
+                        size=12, color="#334155",
+                    ) for record in candidates[:50]], height=130, spacing=3)
+                    if not candidates:
+                        valid_preview.controls.append(ft.Text("No valid rows are ready to import.", color="#64748B"))
+                    elif len(candidates) > 50:
+                        valid_preview.controls.append(ft.Text(f"…and {len(candidates) - 50} more valid rows.", size=11, color="#64748B"))
+                    issue_preview = ft.ListView(controls=issue_controls, height=230, spacing=5)
+
+                    async def export_issues(_=None):
+                        try:
+                            payload_bytes = export_import_issues(issues)
+                            destination = await file_picker.save_file(
+                                dialog_title="Save skipped-row report",
+                                file_name=(
+                                    f"import_issues_{selected.name.rsplit('.', 1)[0]}_"
+                                    f"{date.today().isoformat()}.csv"
+                                ),
+                                allowed_extensions=["csv"],
+                                src_bytes=payload_bytes,
+                            )
+                            review_status.value = (
+                                f"Saved {len(issues):,} issue row(s) to {destination}."
+                                if destination else "Issue report export cancelled."
+                            )
+                        except Exception as exc:
+                            review_status.value = f"Could not export issue report: {exc}"
+                        page.update()
+
+                    storage_label = (
+                        "Ranges (one compact record per source row)"
+                        if chosen_storage == "ranges"
+                        else "Individual values (one record per value combination)"
+                    )
+                    policy_label = (
+                        "Check and remove exact duplicates now"
+                        if chosen_policy == "check_now"
+                        else "Import everything; clean duplicates later"
+                    )
+                    content = ft.Column(controls=[
+                        ft.Text(
+                            f"File: {selected.name}\n"
+                            f"Worksheet(s): {', '.join(group['sheets'])}\n"
+                            f"Schedule: {schedule_name()}\n"
+                            f"Duplicate rule: {applied_rule.get('name', 'all columns exactly identical')}\n"
+                            f"Duplicate policy: {policy_label}\n"
+                            f"Storage: {storage_label}\n"
+                            f"Source rows read: {preview['rows_read']:,} | "
+                            f"Records after storage: {preview.get('expanded_rows', len(candidates)):,} | "
+                            f"Ready to import: {len(candidates):,} | "
+                            f"Exact duplicates removed: {preview.get('duplicates_removed', 0):,} | "
+                            f"Duplicates kept for later: {preview.get('duplicates_kept', 0):,} | "
+                            f"Invalid rows: {preview.get('invalid_rows', 0):,}.\n"
+                            "Every source row is accounted for in the counters above. "
+                            "Existing rates will not be overwritten.",
+                            selectable=True,
+                        ),
+                        import_year,
+                        ft.Row([
+                            ft.OutlinedButton(
+                                "Export skipped-row report (CSV)",
+                                on_click=export_issues,
+                                disabled=not issues,
+                            ),
+                            review_status,
+                        ], wrap=True, spacing=10),
+                        ft.Text("Valid row preview", weight=ft.FontWeight.BOLD), valid_preview,
+                        ft.Text("Rows needing attention", weight=ft.FontWeight.BOLD), issue_preview,
+                        ft.Text("Additional duplicate notes", weight=ft.FontWeight.BOLD),
+                        warning_preview,
+                    ], width=680, tight=True, scroll=ft.ScrollMode.AUTO)
+
+                    def commit_import(_):
+                        nonlocal import_in_progress
+                        if import_in_progress:
+                            status_text.value = "A schedule import is already running. Please wait for it to finish."
+                            page.update()
+                            return
+                        year_text = (import_year.value or "").strip()
+                        if year_text:
+                            try:
+                                year_value = int(year_text)
+                                if not 1900 <= year_value <= 2200:
+                                    raise ValueError
+                            except ValueError:
+                                status_text.value = "Published year must be a four-digit year from 1900 to 2200."
+                                page.update()
+                                return
+                            import_records = [
+                                {**record, "published_year": year_value,
+                                 "effective_from": date(year_value, 1, 1)}
+                                for record in candidates
+                            ]
+                        else:
+                            import_records = candidates
+                        import_in_progress = True
+                        close_dialog()
+                        show_busy(
+                            f"Importing {len(import_records):,} {schedule_name()} rate(s) "
+                            f"from {selected.name}…"
+                        )
+                        status_text.value = (
+                            f"Import running in the background: {len(import_records):,} valid "
+                            f"{schedule_name()} rate(s). The page remains responsive."
+                        )
+                        page.update()
+
+                        async def run_import_in_background():
+                            nonlocal import_in_progress
+                            next_opened = False
+                            try:
+                                try:
+                                    set_cadastral_storage_mode(chosen_storage)
+                                except Exception:
+                                    # The preference must never block an import.
+                                    pass
+                                # Database writes happen on a worker thread so a
+                                # large schedule does not block Flet's UI event loop.
+                                outcome = await asyncio.to_thread(
+                                    import_dc_rate_records,
+                                    import_records,
+                                    duplicate_policy=chosen_policy,
+                                    duplicate_rule=duplicate_rule_dropdown.value,
+                                    storage_mode=chosen_storage,
+                                )
+                                refreshed_locations = await asyncio.to_thread(list_locations)
+                                refresh_locations(refreshed_locations)
+                                schedule_filter.value = "all"
+                                location_filter.value = "all"
+                                unit_filter.value = "all"
+                                published_year_filter.value = ""
+                                search_field.value = ""
+                                qanoongoi_filter.value = ""
+                                mauza_filter.value = ""
+                                square_filter.value = ""
+                                kila_filter.value = ""
+                                khasra_filter.value = ""
+                                schedule_rates_refresh()
+                                storage_note = (
+                                    "stored as ranges"
+                                    if chosen_storage == "ranges"
+                                    else "stored as individual values"
+                                )
+                                status_text.value = (
+                                    f"Imported {outcome['imported_count']:,} {schedule_name()} "
+                                    f"rate(s) from {selected.name} ({storage_note}). "
+                                    f"{outcome.get('expanded_count', outcome['imported_count']):,} "
+                                    f"record(s) came from "
+                                    f"{outcome.get('source_records', len(import_records)):,} "
+                                    f"submitted row(s)."
+                                )
+                                skipped = len(issues) + len(outcome["issues"])
+                                if skipped:
+                                    status_text.value += (
+                                        f" {skipped:,} invalid or exact-duplicate row(s) were not imported."
+                                    )
+                                if outcome.get("duplicates_kept"):
+                                    status_text.value += (
+                                        f" {outcome['duplicates_kept']:,} duplicate row(s) were kept "
+                                        "for later cleanup."
+                                    )
+                                if index + 1 < len(queue):
+                                    next_opened = True
+                                    open_mapping(queue, index + 1)
+                            except Exception as exc:
+                                status_text.value = f"Schedule import failed: {exc}"
+                            finally:
+                                import_in_progress = False
+                                hide_busy()
+                                if not next_opened:
+                                    page.update()
+
+                        try:
+                            page.run_task(run_import_in_background)
+                        except Exception as exc:
+                            import_in_progress = False
+                            hide_busy()
+                            status_text.value = f"Could not start the background import: {exc}"
+                            page.update()
+                    page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text("Review schedule import"),
+                        content=content, actions=[ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
+                        ft.Button(f"Import {len(candidates)} valid rate(s)", on_click=commit_import, disabled=not candidates)]))
+                    page.update()
+
+                def preview_mapping(_):
+                    try:
+                        mapping = {key: int(control.value) for key, control in selects.items()
+                                   if control.value not in (None, "")}
+                        preview = preview_mapped_schedule(
+                            headers,
+                            rows,
+                            mapping,
+                            schedule.value,
+                            duplicate_policy=duplicate_policy.value or "check_now",
+                            duplicate_rule=duplicate_rule_dropdown.value,
+                            storage_mode=storage_mode.value or "ranges",
+                            row_numbers=row_numbers,
+                            row_sheets=row_sheets,
+                        )
+                        close_dialog()
+                        show_review(preview)
+                    except Exception as exc:
+                        mapping_error.value = str(exc)
+                        page.update()
+
+                page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text(f"Map columns - {selected.name}"),
+                    content=ft.Column(controls=[
+                        ft.Text(
+                            f"Worksheet(s) in this layout: {', '.join(group['sheets'])} "
+                            f"({len(rows):,} row(s))",
+                            size=12,
+                            color="#475569",
+                        ),
+                        ft.Text("Schedule type"),
+                        schedule,
+                        mapping_controls,
+                        ft.Text("Cadastral storage", weight=ft.FontWeight.BOLD),
+                        ft.Text(
+                            "Ranges keep Square/Kila/Khasra compact. Search still finds "
+                            "individual values and overlapping ranges. You can change "
+                            "this preference at any time.",
+                            size=11,
+                            color="#64748B",
+                        ),
+                        storage_mode,
+                        ft.Text("Duplicate detection", weight=ft.FontWeight.BOLD),
+                        duplicate_policy,
+                        duplicate_rule_dropdown,
+                        duplicate_help,
+                        mapping_error,
+                    ], width=680, tight=True, scroll=ft.ScrollMode.AUTO),
+                    actions=[ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
+                             ft.Button("Preview rows", on_click=preview_mapping)]))
+                rebuild_mapping()
+                page.update()
+
+            open_group_picker(groups)
         except Exception as exc:
             status_text.value = f"Could not open schedule spreadsheet: {exc}"
             page.update()
@@ -1081,6 +1504,210 @@ def build_dc_rates_page(
             khasra_no=khasra_filter.value or "",
         )
 
+    def open_duplicate_rules_dialog(_=None):
+        profiles = list_duplicate_rule_profiles()
+        rules_list = ft.ListView(height=360, spacing=6)
+        manager_status = ft.Text("", size=12, color="#334155")
+
+        def refresh_rules(message: str = ""):
+            nonlocal profiles
+            profiles = list_duplicate_rule_profiles()
+            rules_list.controls.clear()
+            for profile in profiles:
+                origin = "Built-in" if profile.get("is_builtin") else "Custom"
+                actions = []
+                if profile.get("is_builtin"):
+                    actions.append(ft.TextButton(
+                        "Copy",
+                        on_click=lambda _, item=profile: open_rule_editor(item, as_copy=True),
+                    ))
+                else:
+                    actions.append(ft.TextButton(
+                        "Edit",
+                        on_click=lambda _, item=profile: open_rule_editor(item),
+                    ))
+                    actions.append(ft.TextButton(
+                        "Delete",
+                        on_click=lambda _, item=profile: confirm_rule_delete(item),
+                    ))
+                rules_list.controls.append(ft.Container(
+                    padding=8,
+                    bgcolor="#F8FAFC",
+                    border=ft.Border.all(1, "#CBD5E1"),
+                    border_radius=6,
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(profile["name"], weight=ft.FontWeight.BOLD),
+                            ft.Text(
+                                f"{origin} | {DUPLICATE_SCOPE_LABELS.get(profile['schedule_scope'], profile['schedule_scope'])} | "
+                                f"{DUPLICATE_DATE_LABELS.get(profile['date_mode'], profile['date_mode'])} | "
+                                f"{DUPLICATE_ACTION_LABELS.get(profile['import_action'], profile['import_action'])} | "
+                                f"{len(profile.get('match_fields', []))} match field(s)",
+                                size=11,
+                                color="#475569",
+                            ),
+                            ft.Text(profile.get("description") or "No description.", size=11, color="#64748B"),
+                        ], spacing=2, expand=True),
+                        ft.Row(actions, spacing=2),
+                    ], vertical_alignment=ft.CrossAxisAlignment.START),
+                ))
+            if not rules_list.controls:
+                rules_list.controls.append(ft.Text("No duplicate rules are available.", color="#64748B"))
+            manager_status.value = message
+            page.update()
+
+        def confirm_rule_delete(profile: dict):
+            def delete_rule(_):
+                try:
+                    delete_duplicate_rule_profile(profile["custom_id"])
+                except Exception as exc:
+                    manager_status.value = f"Could not delete duplicate rule: {exc}"
+                    page.update()
+                    return
+                page.pop_dialog()
+                refresh_rules(f"Deleted custom duplicate rule '{profile['name']}'.")
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Delete duplicate rule"),
+                content=ft.Text(
+                    f"Delete custom duplicate rule '{profile['name']}'? Existing rate records "
+                    "are not affected."
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.Button("Delete rule", on_click=delete_rule),
+                ],
+            ))
+            page.update()
+
+        def open_rule_editor(profile: dict | None = None, *, as_copy: bool = False):
+            source = profile or {}
+            is_update = bool(profile and not profile.get("is_builtin") and not as_copy)
+            selected_fields = set(source.get("match_fields", []))
+            default_name = source.get("name", "")
+            if as_copy and default_name:
+                default_name = f"{default_name} (copy)"
+
+            name_field = ft.TextField(label="Rule name", value=default_name, width=640)
+            scope_field = ft.Dropdown(
+                label="Schedule scope",
+                value=source.get("schedule_scope", "any"),
+                options=[
+                    ft.dropdown.Option(key, label)
+                    for key, label in DUPLICATE_SCOPE_LABELS.items()
+                ],
+                width=300,
+            )
+            date_field = ft.Dropdown(
+                label="Effective-date matching",
+                value=source.get("date_mode", "overlap"),
+                options=[
+                    ft.dropdown.Option(key, label)
+                    for key, label in DUPLICATE_DATE_LABELS.items()
+                ],
+                width=300,
+            )
+            action_field = ft.Dropdown(
+                label="When a duplicate is found",
+                value=source.get("import_action", "skip"),
+                options=[
+                    ft.dropdown.Option(key, label)
+                    for key, label in DUPLICATE_ACTION_LABELS.items()
+                ],
+                width=300,
+            )
+            description_field = ft.TextField(
+                label="Description (optional)",
+                value=source.get("description", ""),
+                multiline=True,
+                min_lines=1,
+                max_lines=3,
+                width=640,
+            )
+            field_controls: dict[str, ft.Checkbox] = {}
+            groups = []
+            for group_name, fields in MATCH_FIELD_GROUPS:
+                checks = []
+                for field, label in fields:
+                    control = ft.Checkbox(label=label, value=field in selected_fields)
+                    field_controls[field] = control
+                    checks.append(control)
+                groups.append(ft.Column([
+                    ft.Text(group_name, weight=ft.FontWeight.BOLD, size=12),
+                    ft.ResponsiveRow(
+                        [ft.Container(control, col={"xs": 12, "md": 6}) for control in checks],
+                        run_spacing=0,
+                    ),
+                ], spacing=2))
+            editor_error = ft.Text("", color="#B91C1C", size=12)
+
+            def save_rule(_):
+                try:
+                    match_fields = [
+                        field for field, control in field_controls.items() if control.value
+                    ]
+                    values = {
+                        "name": name_field.value,
+                        "schedule_scope": scope_field.value,
+                        "match_fields": match_fields,
+                        "date_mode": date_field.value,
+                        "import_action": action_field.value,
+                        "description": description_field.value,
+                    }
+                    if is_update:
+                        saved = update_duplicate_rule_profile(
+                            profile["custom_id"], **values
+                        )
+                    else:
+                        saved = create_duplicate_rule_profile(**values)
+                except Exception as exc:
+                    editor_error.value = str(exc)
+                    page.update()
+                    return
+                page.pop_dialog()
+                refresh_rules(f"Saved duplicate rule '{saved['name']}'.")
+
+            title = "Edit duplicate rule" if is_update else "New duplicate rule"
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text(title),
+                content=ft.Column([
+                    name_field,
+                    ft.Row([scope_field, date_field, action_field], wrap=True, spacing=8),
+                    description_field,
+                    ft.Text("Fields compared by this rule", weight=ft.FontWeight.BOLD),
+                    *groups,
+                    editor_error,
+                ], width=680, height=480, spacing=8, scroll=ft.ScrollMode.AUTO),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.Button("Save rule", on_click=save_rule),
+                ],
+            ))
+            page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Duplicate detection rules"),
+            content=ft.Column([
+                ft.Text(
+                    "Built-in rules cover common rural, urban, and FBR schedules. Copy one to "
+                    "customize it, or create a rule from scratch. Import and removal dialogs "
+                    "require an explicit rule selection.",
+                    size=12,
+                ),
+                rules_list,
+                manager_status,
+            ], width=780, height=470, spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[
+                ft.TextButton("Close", on_click=lambda _: close_dialog()),
+                ft.Button("New rule", on_click=lambda _: open_rule_editor()),
+            ],
+        ))
+        refresh_rules()
+        page.update()
+
     def open_duplicate_cleanup_dialog(_=None):
         """Preview duplicates, then export their values before removing extras."""
         report_format = ft.Dropdown(
@@ -1093,25 +1720,43 @@ def build_dc_rates_page(
             ],
             width=280,
         )
-        scan_summary = ft.Text("Scan existing schedule records before removing anything.", size=12)
-        duplicate_list = ft.ListView(height=250, spacing=4)
+        profiles = list_duplicate_rule_profiles()
+        duplicate_rule = ft.Dropdown(
+            label="Duplicate rule (required)",
+            value=None,
+            options=_duplicate_rule_options(profiles),
+            width=640,
+        )
+        duplicate_help = ft.Text(
+            "Select a duplicate rule before scanning.", size=11, color="#64748B"
+        )
+        scan_summary = ft.Text("Select a duplicate rule, then scan existing records.", size=12)
+        scan_progress = ft.ProgressBar(visible=False)
+        duplicate_list = ft.ListView(height=220, spacing=4)
         remove_button = ft.Button("Export and remove duplicates", disabled=True)
         scan_button = ft.OutlinedButton("Scan for duplicates")
         scanned_count = 0
 
+        def cleanup_profile():
+            return _duplicate_rule_by_reference(profiles, duplicate_rule.value)
+
         def show_duplicates(records):
             nonlocal scanned_count
             scanned_count = len(records)
+            profile = cleanup_profile()
+            rule_name = profile["name"] if profile else "selected rule"
             duplicate_list.controls.clear()
             if not records:
                 duplicate_list.controls.append(ft.Text("No duplicate schedule rows were found."))
-                scan_summary.value = "No duplicates found. Your records were not changed."
+                scan_summary.value = (
+                    f"No duplicates found under '{rule_name}'. Your records were not changed."
+                )
                 remove_button.disabled = True
                 remove_button.text = "Export and remove duplicates"
             else:
                 scan_summary.value = (
-                    f"Found {scanned_count:,} extra row(s). The lowest record ID in each "
-                    "duplicate group will be kept. Removed rows are exported first."
+                    f"Found {scanned_count:,} extra row(s) under '{rule_name}'. The lowest "
+                    "record ID in each duplicate group will be kept. Removed rows are exported first."
                 )
                 for record in records[:100]:
                     duplicate_list.controls.append(ft.Text(
@@ -1132,27 +1777,45 @@ def build_dc_rates_page(
                 remove_button.text = f"Export and remove {scanned_count:,} duplicate row(s)"
             page.update()
 
+        def duplicate_rule_changed(_):
+            nonlocal scanned_count
+            scanned_count = 0
+            duplicate_help.value = _duplicate_rule_help(cleanup_profile())
+            duplicate_list.controls.clear()
+            scan_summary.value = "Rule changed. Scan again before removing anything."
+            remove_button.disabled = True
+            remove_button.text = "Export and remove duplicates"
+            page.update()
+
         async def run_scan():
             scan_button.disabled = True
+            scan_progress.visible = True
             scan_summary.value = "Scanning schedule records in the background..."
             page.update()
             try:
-                records = await asyncio.to_thread(find_duplicate_dc_rates)
+                records = await asyncio.to_thread(
+                    find_duplicate_dc_rates, duplicate_rule.value
+                )
                 show_duplicates(records)
             except Exception as exc:
                 scan_summary.value = f"Could not scan for duplicates: {exc}"
                 remove_button.disabled = True
             finally:
                 scan_button.disabled = False
+                scan_progress.visible = False
                 page.update()
 
         def scan(_):
+            if not duplicate_rule.value:
+                scan_summary.value = "Select a duplicate rule before scanning."
+                page.update()
+                return
             if hasattr(page, "run_task"):
                 page.run_task(run_scan)
             else:
                 scan_button.disabled = True
                 try:
-                    show_duplicates(find_duplicate_dc_rates())
+                    show_duplicates(find_duplicate_dc_rates(duplicate_rule.value))
                 except Exception as exc:
                     scan_summary.value = f"Could not scan for duplicates: {exc}"
                 finally:
@@ -1161,11 +1824,15 @@ def build_dc_rates_page(
 
         async def run_removal():
             remove_button.disabled = True
+            scan_button.disabled = True
+            scan_progress.visible = True
             scan_summary.value = "Writing the report and removing duplicate rows..."
             page.update()
             try:
                 removed_count, report_path = await asyncio.to_thread(
-                    remove_duplicate_dc_rates_with_report, report_format.value
+                    remove_duplicate_dc_rates_with_report,
+                    report_format.value,
+                    duplicate_rule.value,
                 )
                 if removed_count and report_path:
                     close_dialog()
@@ -1181,6 +1848,10 @@ def build_dc_rates_page(
                 scan_summary.value = f"Duplicate removal failed; records were not removed: {exc}"
                 remove_button.disabled = False
                 page.update()
+            finally:
+                scan_button.disabled = False
+                scan_progress.visible = False
+                page.update()
 
         def remove_duplicates(_):
             if scanned_count == 0:
@@ -1191,6 +1862,8 @@ def build_dc_rates_page(
                 scan_summary.value = "Background task support is required for safe duplicate removal."
                 page.update()
 
+        duplicate_rule.on_change = duplicate_rule_changed
+        duplicate_rule.on_select = duplicate_rule_changed
         scan_button.on_click = scan
         remove_button.on_click = remove_duplicates
         page.show_dialog(ft.AlertDialog(
@@ -1198,14 +1871,17 @@ def build_dc_rates_page(
             title=ft.Text("Find and remove duplicate schedule rows"),
             content=ft.Column([
                 ft.Text(
-                    "Rural DC rows are grouped by Mauza, cadastral numbers, location, classification, and unit. "
-                    "Urban DC and FBR rows must match all schedule and location values. The first record is kept.",
+                    "Choose the fields and date behavior that define a duplicate. The lowest "
+                    "record ID in each duplicate group is kept. Removed rows are exported first.",
                     size=12,
                 ),
+                duplicate_rule,
+                duplicate_help,
                 report_format,
                 scan_summary,
+                scan_progress,
                 duplicate_list,
-            ], width=720, height=420, scroll=ft.ScrollMode.AUTO, spacing=8),
+            ], width=720, height=460, scroll=ft.ScrollMode.AUTO, spacing=8),
             actions=[
                 ft.TextButton("Close", on_click=lambda _: close_dialog()),
                 scan_button,
@@ -1215,23 +1891,82 @@ def build_dc_rates_page(
         page.update()
 
     def make_export_handler(file_format: str):
-        """Export the currently filtered records in the selected spreadsheet format."""
+        """Ask how ranges should be exported, then export filtered records."""
         async def export_schedule(_=None):
-            try:
-                records = records_matching_current_filters()
-                payload = export_schedule_records(records, file_format)
-                destination = await file_picker.save_file(
-                    dialog_title=f"Export valuation schedules as {file_format.upper()}",
-                    file_name=f"valuation_schedules_{date.today().isoformat()}.{file_format}",
-                    allowed_extensions=[file_format],
-                    src_bytes=payload,
+            reference_mode = ft.RadioGroup(
+                value="ranges",
+                content=ft.Column([
+                    ft.Radio(value="ranges", label="Keep ranges (compact)"),
+                    ft.Radio(value="individual", label="Expand ranges into individual values"),
+                    ft.Radio(value="stored", label="Use values exactly as stored"),
+                ], spacing=2, tight=True),
+            )
+            export_error = ft.Text("", size=12, color="#B91C1C")
+
+            def confirm_export(_):
+                chosen_mode = reference_mode.value or "ranges"
+                close_dialog()
+                show_busy(
+                    f"Preparing {file_format.upper()} export…",
+                    "Filtering records and serializing the spreadsheet.",
                 )
-                if destination:
-                    status_text.value = f"Exported {len(records)} record(s) to {destination}."
-                else:
-                    status_text.value = "Export cancelled."
-            except Exception as exc:
-                status_text.value = f"Could not export schedule records: {exc}"
+                async def run_export():
+                    try:
+                        records = await asyncio.to_thread(records_matching_current_filters)
+                        payload = await asyncio.to_thread(
+                            export_schedule_records,
+                            records,
+                            file_format,
+                            reference_mode=chosen_mode,
+                        )
+                        destination = await file_picker.save_file(
+                            dialog_title=f"Export valuation schedules as {file_format.upper()}",
+                            file_name=f"valuation_schedules_{date.today().isoformat()}.{file_format}",
+                            allowed_extensions=[file_format],
+                            src_bytes=payload,
+                        )
+                        if destination:
+                            mode_label = {
+                                "ranges": "as compact ranges",
+                                "individual": "with individual values",
+                                "stored": "as stored",
+                            }.get(chosen_mode, "")
+                            status_text.value = (
+                                f"Exported {len(records):,} record(s) {mode_label} to {destination}."
+                            )
+                        else:
+                            status_text.value = "Export cancelled."
+                    except Exception as exc:
+                        status_text.value = f"Could not export schedule records: {exc}"
+                    finally:
+                        hide_busy()
+                        page.update()
+                try:
+                    page.run_task(run_export)
+                except Exception as exc:
+                    hide_busy()
+                    status_text.value = f"Could not start the export: {exc}"
+                    page.update()
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text(f"Export {file_format.upper()} - choose cadastral format"),
+                content=ft.Column([
+                    ft.Text(
+                        "Choose whether Square/Kila/Khasra values should stay as ranges "
+                        "or be expanded into individual exported rows. Stored data is "
+                        "never changed by exporting.",
+                        size=12,
+                        color="#475569",
+                    ),
+                    reference_mode,
+                    export_error,
+                ], width=460, tight=True),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: close_dialog()),
+                    ft.Button("Export", on_click=confirm_export),
+                ],
+            ))
             page.update()
         return export_schedule
 
@@ -1958,17 +2693,38 @@ def build_dc_rates_page(
         page.update()
 
     def qanoongoi_changed(event):
-        """Reset a Mauza that belonged to the previous Qanoongoi selection."""
+        """Reset child location values and cadastral choices for the new Qanoongoi."""
         mauza_filter.value = ""
-        schedule_rates_refresh(event)
+        square_filter.value = ""
+        kila_filter.value = ""
+        khasra_filter.value = ""
+        schedule_rates_refresh(event, refresh_cadastral=True)
+
+    def mauza_changed(event):
+        """Reset cadastral choices that belonged to the previous Mauza."""
+        square_filter.value = ""
+        kila_filter.value = ""
+        khasra_filter.value = ""
+        schedule_rates_refresh(event, refresh_cadastral=True)
+
+    def square_changed(event):
+        """Clear child cadastral fields and narrow Killa choices to the Square."""
+        kila_filter.value = ""
+        khasra_filter.value = ""
+        schedule_rates_refresh(event, suggestion_field="square_no")
+
+    def kila_changed(event):
+        """Clear Khasra choices that belonged to the previous Kila."""
+        khasra_filter.value = ""
+        schedule_rates_refresh(event, suggestion_field="kila_no")
 
     search_field.on_change = schedule_rates_refresh
     qanoongoi_filter.on_change = qanoongoi_changed
     qanoongoi_filter.on_select = qanoongoi_changed
-    mauza_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="mauza")
-    mauza_filter.on_select = schedule_rates_refresh
-    square_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="square_no")
-    kila_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="kila_no")
+    mauza_filter.on_change = mauza_changed
+    mauza_filter.on_select = mauza_changed
+    square_filter.on_change = square_changed
+    kila_filter.on_change = kila_changed
     khasra_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="khasra_no")
     schedule_filter.on_select = schedule_rates_refresh
     location_filter.on_select = schedule_rates_refresh
@@ -2110,13 +2866,13 @@ def build_dc_rates_page(
         try:
             rows = summarize_location_hierarchy()
         except Exception as exc:
-            status_text.value = f"Could not load area summary: {exc}"
+            status_text.value = f"Could not load Tehsil details: {exc}"
             page.update()
             return
         if not rows:
             page.show_dialog(ft.AlertDialog(
                 modal=True,
-                title=ft.Text("Area summary"),
+                title=ft.Text("Tehsil details"),
                 content=ft.Text("No location records are available to summarize."),
                 actions=[ft.TextButton("Close", on_click=lambda _: close_dialog())],
             ))
@@ -2129,21 +2885,44 @@ def build_dc_rates_page(
             (row["district"], row["tehsil"], row["qanoongoi"])
             for row in rows if row["qanoongoi"]
         })
-        table = ft.DataTable(
+        district_totals: dict[str, dict[str, set[str]]] = {}
+        for row in rows:
+            totals = district_totals.setdefault(
+                row["district"], {"tehsils": set(), "qanoongoi": set()}
+            )
+            if row["tehsil"]:
+                totals["tehsils"].add(row["tehsil"])
+            if row["qanoongoi"]:
+                totals["qanoongoi"].add((row["tehsil"], row["qanoongoi"]))
+        district_table = ft.DataTable(
             columns=[
                 ft.DataColumn(label=ft.Text("District")),
                 ft.DataColumn(label=ft.Text("Tehsils in district")),
+                ft.DataColumn(label=ft.Text("Qanoongoi in district")),
+            ],
+            rows=[
+                ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(district or "Not recorded")),
+                    ft.DataCell(ft.Text(str(len(totals["tehsils"])))),
+                    ft.DataCell(ft.Text(str(len(totals["qanoongoi"])))),
+                ])
+                for district, totals in sorted(district_totals.items())
+            ],
+            column_spacing=18,
+            horizontal_margin=8,
+            data="district_summary",
+        )
+        table = ft.DataTable(
+            columns=[
+                ft.DataColumn(label=ft.Text("District")),
                 ft.DataColumn(label=ft.Text("Tehsil")),
-                ft.DataColumn(label=ft.Text("Qanoongoi in tehsil")),
                 ft.DataColumn(label=ft.Text("Qanoongoi")),
                 ft.DataColumn(label=ft.Text("Mauzas in Qanoongoi")),
             ],
             rows=[
                 ft.DataRow(cells=[
                     ft.DataCell(ft.Text(row["district"] or "Not recorded")),
-                    ft.DataCell(ft.Text(str(row["tehsil_count"]))),
                     ft.DataCell(ft.Text(row["tehsil"] or "Not recorded")),
-                    ft.DataCell(ft.Text(str(row["qanoongoi_count"]))),
                     ft.DataCell(ft.Text(row["qanoongoi"] or "Not recorded")),
                     ft.DataCell(ft.Text(str(row["mauza_count"]))),
                 ])
@@ -2151,10 +2930,11 @@ def build_dc_rates_page(
             ],
             column_spacing=18,
             horizontal_margin=8,
+            data="tehsil_details",
         )
         page.show_dialog(ft.AlertDialog(
             modal=True,
-            title=ft.Text("District / Tehsil / Qanoongoi summary"),
+            title=ft.Text("Tehsil details"),
             content=ft.Column(
                 controls=[
                     ft.Text(
@@ -2163,20 +2943,42 @@ def build_dc_rates_page(
                         size=12,
                         color="#475569",
                     ),
-                    ft.Column(
-                        controls=[ft.Row([table], scroll=ft.ScrollMode.AUTO)],
-                        height=390,
-                        scroll=ft.ScrollMode.AUTO,
-                    ),
+                    ft.Text("Districts", weight=ft.FontWeight.BOLD, size=13),
+                    ft.Row([district_table], scroll=ft.ScrollMode.AUTO),
+                    ft.Text("Tehsil / Qanoongoi details", weight=ft.FontWeight.BOLD, size=13),
+                    ft.Row([table], scroll=ft.ScrollMode.AUTO),
                 ],
                 width=940,
-                height=500,
+                height=520,
                 spacing=8,
+                scroll=ft.ScrollMode.AUTO,
             ),
             actions=[ft.TextButton("Close", on_click=lambda _: close_dialog())],
         ))
         page.update()
 
+    def storage_preference_changed(_=None):
+        mode = storage_preference.value or "ranges"
+        try:
+            set_cadastral_storage_mode(mode)
+            status_text.value = (
+                "New cadastral records will be stored as compact ranges."
+                if mode == "ranges"
+                else "New cadastral records will be stored as individual values."
+            )
+        except Exception as exc:
+            status_text.value = f"Could not save the cadastral storage preference: {exc}"
+        page.update()
+
+    storage_preference = ft.Dropdown(
+        value=get_cadastral_storage_mode(),
+        options=[
+            ft.dropdown.Option("ranges", "Keep Square/Kila/Khasra as ranges"),
+            ft.dropdown.Option("individual", "Store each individual value"),
+        ],
+        width=320,
+        on_select=storage_preference_changed,
+    )
     import_export_button = ft.TextButton("Show import / export")
     filter_button = ft.TextButton("Show filters")
 
@@ -2196,6 +2998,7 @@ def build_dc_rates_page(
             ft.OutlinedButton("Add FBR rate", on_click=lambda _: open_rate_dialog(schedule_type="fbr")),
             ft.OutlinedButton("Add location", on_click=open_location_dialog),
             ft.OutlinedButton("Find / remove duplicates", on_click=open_duplicate_cleanup_dialog),
+            ft.OutlinedButton("Duplicate rules", on_click=open_duplicate_rules_dialog),
             ft.OutlinedButton("Select squares / Kilas", on_click=open_cadastral_selection_dialog),
             ft.OutlinedButton("View Khewats", on_click=open_khewat_search_dialog),
             ft.OutlinedButton("Tehsil Details", on_click=open_hierarchy_summary_dialog),
@@ -2224,6 +3027,15 @@ def build_dc_rates_page(
                         )
                         for file_format in ("csv", "xlsx", "ods")
                     ],
+                ],
+                wrap=True,
+                spacing=6,
+                run_spacing=6,
+            ),
+            ft.Row(
+                controls=[
+                    ft.Text("New cadastral records:", size=12, color="#475569"),
+                    storage_preference,
                 ],
                 wrap=True,
                 spacing=6,
@@ -2305,6 +3117,7 @@ def build_dc_rates_page(
         spacing=8,
         expand=True,
     )
+    page_root = ft.Stack(controls=[root, busy_overlay], expand=True)
     if defer_initial_load:
         async def load_initial_data():
             """Populate the first bounded view without blocking page navigation."""
@@ -2348,4 +3161,4 @@ def build_dc_rates_page(
             # Keep their construction side-effect free and render on demand.
             rate_list.controls.clear()
             rate_list.controls.append(ft.Text("Use Refresh to load valuation schedules.", color="#64748B"))
-    return root
+    return page_root
