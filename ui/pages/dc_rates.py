@@ -64,9 +64,13 @@ from services.dc_rate_service import (
     update_duplicate_rule_profile,
 )
 from services.settings_service import (
+    format_card_heading,
     get_cadastral_storage_mode,
+    get_card_appearance,
+    get_default_file_location,
     set_cadastral_storage_mode,
 )
+from ui.file_location import ask_location_choice, write_export_to_folder
 
 
 UNIT_LABELS = {
@@ -177,6 +181,60 @@ def build_dc_rates_page(
     visible_rate_limit = 40
     visible_location_limit = 500
     location_picker_truncated = False
+    card_appearance = get_card_appearance()
+
+    async def export_with_location(
+        *,
+        action: str,
+        dialog_title: str,
+        file_name: str,
+        allowed_extensions: list[str],
+        payload: bytes,
+    ) -> str | None:
+        """Write to the saved default folder or let the user choose a path."""
+        default_location = get_default_file_location()
+        choice = await ask_location_choice(
+            page, action=action, default_location=default_location
+        )
+        if choice is None:
+            return None
+        if choice == "default":
+            return await asyncio.to_thread(
+                write_export_to_folder,
+                default_location,
+                file_name,
+                payload,
+            )
+        return await file_picker.save_file(
+            dialog_title=dialog_title,
+            file_name=file_name,
+            allowed_extensions=allowed_extensions,
+            src_bytes=payload,
+        )
+
+    async def pick_import_file(
+        *,
+        action: str,
+        dialog_title: str,
+        allowed_extensions: list[str],
+        with_data: bool = True,
+    ) -> list:
+        """Open the import picker, optionally starting in the default folder."""
+        default_location = get_default_file_location()
+        choice = await ask_location_choice(
+            page, action=action, default_location=default_location
+        )
+        if choice is None:
+            return []
+        return await file_picker.pick_files(
+            dialog_title=dialog_title,
+            initial_directory=(
+                default_location if choice == "default" else None
+            ),
+            allowed_extensions=allowed_extensions,
+            allow_multiple=False,
+            with_data=with_data,
+        )
 
     qanoongoi_filter = ft.AutoComplete(
         width=200, suggestions_max_height=240, data="qanoongoi"
@@ -462,6 +520,7 @@ def build_dc_rates_page(
                         list_mauza_names,
                         search=mauza_filter.value or "",
                         qanoongoi=qanoongoi_filter.value or "",
+                        limit=500,
                     ),
                 )
                 if generation != request_generation:
@@ -589,6 +648,9 @@ def build_dc_rates_page(
                 record.get("mauza"),
             ) if value
         ) or "Location details not supplied"
+        heading_text = format_card_heading(
+            card_appearance["heading_template"], record
+        )
 
         def open_details(_):
             show_rate_details(record["id"])
@@ -599,17 +661,18 @@ def build_dc_rates_page(
         rate_list.controls.append(
             ft.Container(
                 padding=14,
-                bgcolor="#FFFFFF",
-                border=ft.Border.all(1, "#E2E8F0"),
+                bgcolor=card_appearance["background_color"],
+                border=ft.Border.all(1, card_appearance["border_color"]),
                 border_radius=10,
                 content=ft.Column(
                     controls=[
                         ft.Row(
                             controls=[
                                 ft.Text(
-                                    f"{record.get('schedule_type', 'dc').upper()} schedule · {record['location_name']}",
+                                    heading_text,
                                     weight=ft.FontWeight.BOLD,
                                     size=16,
+                                    color=card_appearance["heading_color"],
                                     selectable=True,
                                 ),
                             ],
@@ -622,18 +685,26 @@ def build_dc_rates_page(
                             f"{record.get('classification') or record['property_type']}"
                             f" · Rate: {rate_text}"
                             f" · Floor: {record.get('floor') or 'All / not specified'}",
+                            color=card_appearance["body_color"],
                             selectable=True,
                         ),
-                        ft.Text(location_summary, size=12, color="#475569", selectable=True),
+                        ft.Text(
+                            location_summary,
+                            size=12,
+                            color=card_appearance["body_color"],
+                            selectable=True,
+                        ),
                         ft.Text(
                             f"{_cadastral_label(record)} | Unit: "
                             f"{UNIT_LABELS.get(record['rate_unit'], record['rate_unit']).removeprefix('Per ').title()}",
-                            size=12, color="#475569", selectable=True,
+                            size=12,
+                            color=card_appearance["body_color"],
+                            selectable=True,
                         ),
                         ft.Text(
                             f"Published year: {published_year} · Source: {record.get('source_reference') or 'Not supplied'}",
                             size=12,
-                            color="#64748B",
+                            color=card_appearance["body_color"],
                             selectable=True,
                         ),
                         ft.Row(
@@ -960,11 +1031,10 @@ def build_dc_rates_page(
         # mapping -> validated preview -> service commit, so every worksheet is
         # accounted for and spreadsheet columns are never guessed silently.
         try:
-            files = await file_picker.pick_files(
+            files = await pick_import_file(
+                action="schedule import",
                 dialog_title="Import DC or FBR schedule",
                 allowed_extensions=["csv", "xlsx", "ods"],
-                allow_multiple=False,
-                with_data=True,
             )
             if not files:
                 return
@@ -1076,9 +1146,21 @@ def build_dc_rates_page(
                 rows = group["rows"]
                 row_numbers = group.get("row_numbers")
                 row_sheets = group.get("row_sheets")
-                guesses = suggested_column_mapping(headers)
+                guesses = suggested_column_mapping(headers, rows)
+                header_counts: dict[str, int] = {}
+                for header in headers:
+                    key = (header or "").strip().casefold()
+                    header_counts[key] = header_counts.get(key, 0) + 1
                 source_options = [ft.dropdown.Option("", "Skip this field")] + [
-                    ft.dropdown.Option(str(i), header or f"Column {i + 1}")
+                    ft.dropdown.Option(
+                        str(i),
+                        (header or f"Column {i + 1}")
+                        + (
+                            f" (column {i + 1})"
+                            if header_counts[(header or "").strip().casefold()] > 1
+                            else ""
+                        ),
+                    )
                     for i, header in enumerate(headers)
                 ]
                 profiles = list_duplicate_rule_profiles()
@@ -1255,14 +1337,15 @@ def build_dc_rates_page(
                     async def export_issues(_=None):
                         try:
                             payload_bytes = export_import_issues(issues)
-                            destination = await file_picker.save_file(
+                            destination = await export_with_location(
+                                action="skipped-row report export",
                                 dialog_title="Save skipped-row report",
                                 file_name=(
                                     f"import_issues_{selected.name.rsplit('.', 1)[0]}_"
                                     f"{date.today().isoformat()}.csv"
                                 ),
                                 allowed_extensions=["csv"],
-                                src_bytes=payload_bytes,
+                                payload=payload_bytes,
                             )
                             review_status.value = (
                                 f"Saved {len(issues):,} issue row(s) to {destination}."
@@ -1919,11 +2002,12 @@ def build_dc_rates_page(
                             file_format,
                             reference_mode=chosen_mode,
                         )
-                        destination = await file_picker.save_file(
+                        destination = await export_with_location(
+                            action=f"valuation schedule {file_format.upper()} export",
                             dialog_title=f"Export valuation schedules as {file_format.upper()}",
                             file_name=f"valuation_schedules_{date.today().isoformat()}.{file_format}",
                             allowed_extensions=[file_format],
-                            src_bytes=payload,
+                            payload=payload,
                         )
                         if destination:
                             mode_label = {
@@ -2164,10 +2248,12 @@ def build_dc_rates_page(
             try:
                 render_khewat_summary()
                 payload = export_khewat_summary(khewat_summary_rows, file_format)
-                destination = await file_picker.save_file(
+                destination = await export_with_location(
+                    action="Khewat summary export",
                     dialog_title="Export Khewat summary",
                     file_name=f"khewat_summary_{date.today().isoformat()}.{file_format}",
-                    allowed_extensions=[file_format], src_bytes=payload,
+                    allowed_extensions=[file_format],
+                    payload=payload,
                 )
                 assignment_status.value = (
                     f"Exported Khewat summary to {destination}." if destination
@@ -2185,10 +2271,12 @@ def build_dc_rates_page(
         async def save_khewat_template(_=None):
             try:
                 payload = export_khewat_import_template("xlsx")
-                destination = await file_picker.save_file(
+                destination = await export_with_location(
+                    action="Khewat import template export",
                     dialog_title="Save Khewat import template",
                     file_name="khewat_import_template.xlsx",
-                    allowed_extensions=["xlsx"], src_bytes=payload,
+                    allowed_extensions=["xlsx"],
+                    payload=payload,
                 )
                 assignment_status.value = (
                     f"Saved Khewat import template to {destination}." if destination
@@ -2200,9 +2288,11 @@ def build_dc_rates_page(
 
         async def import_khewat_file(_=None):
             try:
-                selected_files = await file_picker.pick_files(
-                    dialog_title="Import Khewats", allow_multiple=False,
+                selected_files = await pick_import_file(
+                    action="Khewat import",
+                    dialog_title="Import Khewats",
                     allowed_extensions=["csv", "xlsx", "ods"],
+                    with_data=False,
                 )
                 if not selected_files:
                     return
@@ -3129,6 +3219,7 @@ def build_dc_rates_page(
                         list_mauza_names,
                         search=mauza_filter.value or "",
                         qanoongoi=qanoongoi_filter.value or "",
+                        limit=500,
                     ),
                     asyncio.to_thread(
                         summarize_dc_rates,

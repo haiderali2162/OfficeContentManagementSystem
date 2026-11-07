@@ -35,6 +35,7 @@ def build_navigation() -> list[NavigationItem]:
     from ui.pages.dashboard import build_dashboard
     from ui.pages.placeholder import build_placeholder
     from ui.pages.clients import build_clients_page
+    from ui.pages.settings import build_settings_page
     from ui.pages.valuation import build_valuation_page
 
     def placeholder(title: str, description: str):
@@ -124,9 +125,6 @@ def build_navigation() -> list[NavigationItem]:
             title="Settings",
             description="Application preferences",
             icon=get_icon("SETTINGS"),
-            page_builder=placeholder(
-                "Settings",
-                "Application settings are planned.",
-            ),
+            page_builder=build_settings_page,
         ),
     ]

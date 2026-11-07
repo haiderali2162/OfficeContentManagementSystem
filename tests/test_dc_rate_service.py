@@ -671,6 +671,52 @@ def test_village_schedule_headers_map_to_mauza(column_header):
     assert mapping["location_name"] == 2
 
 
+def test_duplicate_mauza_headers_choose_the_village_column_for_search(rate_database):
+    """A repeated district column must not hide the real Mauza values.
+
+    Published schedules sometimes contain two columns labelled "Mauza": the
+    first repeats the district and the second holds the villages. Selecting the
+    first column silently loses the villages, so they cannot be searched later.
+    """
+    headers = [
+        "Serial No", "District", "Tehsil", "Mauza", "Qanoongoi", "Mauza",
+        "Classification", "Location", "Square No", "Killa No", "DC Rate", "Unit",
+    ]
+    rows = [
+        ["1", "District A", "Tehsil A", "District A", "Qanoongoi A", "Village One",
+         "Residential", "Off road", "16", "8", "181600", "per_marla"],
+        ["2", "District A", "Tehsil A", "District A", "Qanoongoi A", "Village Two",
+         "Residential", "Off road", "17", "9", "181600", "per_marla"],
+    ]
+    mapping = dc_rate_service.suggested_column_mapping(headers, rows)
+    assert mapping["mauza"] == 5
+    assert mapping["location_name"] == 5
+
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers,
+        rows,
+        mapping,
+        "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+    )
+    assert [
+        record["location"]["mauza"] for record in preview["valid_records"]
+    ] == ["Village One", "Village Two"]
+    dc_rate_service.import_dc_rate_records(
+        preview["valid_records"], duplicate_rule="default:rural_dc_overlap"
+    )
+
+    assert dc_rate_service.list_mauza_names() == ["Village One", "Village Two"]
+    assert dc_rate_service.list_mauza_names(search="one") == ["Village One"]
+    assert len(dc_rate_service.list_dc_rates(mauza="Village Two")) == 1
+
+
+def test_duplicate_mauza_mapping_without_rows_keeps_legacy_first_column():
+    headers = ["District", "Tehsil", "Mauza", "Qanoongoi", "Mauza", "DC Rate"]
+    mapping = dc_rate_service.suggested_column_mapping(headers)
+    assert mapping["mauza"] == 2
+
+
 def test_reference_range_normalization_validates_direction_and_size():
     assert dc_rate_service._normalize_reference("1-5,6;7-9") == "1, 2, 3, 4, 5, 6, 7, 8, 9"
     assert dc_rate_service._normalize_reference("25-21") == "21, 22, 23, 24, 25"

@@ -1,3 +1,4 @@
 it should ask for the export location if the default one is not set in the settings. allow user to set a default export/import location and always ask him before import/export whether to user default one or not.
 still the mauza like chachoke, madar or not searchable in the imported file in the app but these are still there in the excel file, why this is happening and we are unble to fix this still now.
 also allow app to use different databases and allow user to set it up even after the app run. allow this setting in the settings page and keep the settings however it is best for any os like win/mac/linux. provide these db options like postgres, ms sql server, sql workbench, any other sql options, sqlite setting options etc. make the app competible with any db and allow to set this in the setting professionally.
+also about the card, allow user to show whatever information from the schedule on the card, even some formulas calculated values also.

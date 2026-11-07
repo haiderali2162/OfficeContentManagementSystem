@@ -2525,24 +2525,71 @@ def read_schedule_spreadsheet(
     return first["headers"], first["rows"]
 
 
-def suggested_column_mapping(headers: list[str]) -> dict[str, int]:
-    """Suggest mappings from familiar schedule headers; user confirms them."""
+def _column_variety(index: int, rows: list[list[Any]], sample_size: int = 250) -> int:
+    """Count distinct non-empty values for a candidate source column."""
+    values = set()
+    for row in rows[:sample_size]:
+        if index >= len(row):
+            continue
+        value = _text(row[index])
+        if value:
+            values.add(value.casefold())
+    return len(values)
+
+
+def _choose_mauza_column(
+    candidates: list[int], rows: list[list[Any]] | None
+) -> int:
+    """Pick the real village column when a sheet repeats the Mauza header.
+
+    Some published schedules contain two columns labelled "Mauza": the first
+    repeats the district/tehsil and the second holds the actual villages. A
+    constant administrative column has almost no variety, so prefer the
+    candidate with the most distinct sample values. Ties keep the right-most
+    column because schedules generally put the specific village after the
+    broader administrative label.
+    """
+    if not candidates:
+        raise DCRateServiceError("No Mauza column was found in this worksheet.")
+    if len(candidates) == 1 or not rows:
+        return candidates[0]
+    return max(
+        candidates,
+        key=lambda index: (_column_variety(index, rows), index),
+    )
+
+
+def suggested_column_mapping(
+    headers: list[str], rows: list[list[Any]] | None = None
+) -> dict[str, int]:
+    """Suggest mappings from familiar schedule headers; user confirms them.
+
+    ``rows`` is optional and only used to disambiguate repeated headers. When
+    several columns look like Mauza, the most varied sample column is chosen so
+    a repeated district/tehsil column does not hide the real villages.
+    """
     mapping = {}
+    mauza_candidates: list[int] = []
     for index, header in enumerate(headers):
-        target = RATE_HEADERS.get(_header_key(header))
-        if _header_key(header) == "location":
+        key = _header_key(header)
+        target = RATE_HEADERS.get(key)
+        if key == "location":
             target = "locality"
+        if target == "mauza":
+            mauza_candidates.append(index)
+            continue
         if target and target not in mapping:
             mapping[target] = index
     # Some official files label the village column with wording that is not an
     # exact alias, such as "Name of Village" or "Mauza / Village". Match those
     # tokens explicitly so a whole village is not silently left unmapped.
-    if "mauza" not in mapping:
+    if not mauza_candidates:
         for index, header in enumerate(headers):
             key = _header_key(header)
             if any(token in key for token in ("mauza", "mouza", "village")):
-                mapping["mauza"] = index
-                break
+                mauza_candidates.append(index)
+    if mauza_candidates:
+        mapping["mauza"] = _choose_mauza_column(mauza_candidates, rows)
     # The current official schedule exports usually expose Mauza and Location,
     # but not a separate display-name column for the database location record.
     if "location_name" not in mapping:

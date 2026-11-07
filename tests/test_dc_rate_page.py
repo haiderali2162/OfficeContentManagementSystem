@@ -20,6 +20,18 @@ def _isolate_cadastral_settings(monkeypatch):
     monkeypatch.setattr(
         dc_rates, "set_cadastral_storage_mode", lambda mode: saved_modes.append(mode)
     )
+    monkeypatch.setattr(
+        dc_rates,
+        "get_card_appearance",
+        lambda: {
+            "heading_template": "{schedule} schedule · {location}",
+            "background_color": "#FFFFFF",
+            "border_color": "#E2E8F0",
+            "heading_color": "#0F172A",
+            "body_color": "#475569",
+        },
+    )
+    monkeypatch.setattr(dc_rates, "get_default_file_location", lambda: "")
     return saved_modes
 
 
@@ -243,6 +255,9 @@ def test_qanoongoi_choices_are_unique_and_cascade_to_mauza_suggestions(monkeypat
     mauza_filters = [kwargs for kind, kwargs in calls if kind == "mauza"][-1]
     assert rate_filters["qanoongoi"] == "Qanoongoi A"
     assert mauza_filters["qanoongoi"] == "Qanoongoi A"
+    # The filter must not hide Mauzas merely because the district has more
+    # than the previous 50-name default.
+    assert mauza_filters["limit"] >= 500
 
 
 def test_area_summary_dialog_shows_hierarchy_counts(monkeypatch):
@@ -798,6 +813,60 @@ def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypa
     assert "Unit" not in labels
 
 
+def test_import_mapping_uses_row_values_to_disambiguate_duplicate_mauza_headers(monkeypatch):
+    class FakePicker:
+        async def pick_files(self, **_kwargs):
+            return [SimpleNamespace(bytes=b"test", path=None, name="schedule.csv")]
+
+    headers = [
+        "District", "Tehsil", "Mauza", "Qanoongoi", "Mauza",
+        "Classification", "Location", "Square No", "Killa No", "DC Rate", "Unit",
+    ]
+    rows = [
+        ["District A", "Tehsil A", "District A", "Qanoongoi A", "Village One",
+         "Residential", "Off road", "16", "8", "181600", "per_marla"],
+        ["District A", "Tehsil A", "District A", "Qanoongoi A", "Village Two",
+         "Residential", "Off road", "17", "9", "181600", "per_marla"],
+    ]
+
+    monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    _mock_duplicate_profiles(monkeypatch)
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
+    monkeypatch.setattr(dc_rates, "read_schedule_sheets", lambda *_: [
+        _sheet(headers, rows)
+    ])
+    suggestion_calls = []
+    original_suggestion = dc_rates.suggested_column_mapping
+
+    def spy_suggestion(source_headers, source_rows=None):
+        suggestion_calls.append((source_headers, source_rows))
+        return original_suggestion(source_headers, source_rows)
+
+    monkeypatch.setattr(dc_rates, "suggested_column_mapping", spy_suggestion)
+
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    import_button = next(control for control in _walk(root)
+                         if isinstance(control, ft.OutlinedButton)
+                         and control.content == "Import CSV / Excel / ODS")
+    asyncio.run(import_button.on_click())
+    dialog = page.dialogs[-1]
+
+    assert suggestion_calls[-1] == (headers, rows)
+    mauza_dropdown = next(
+        control for control in _walk(dialog.content)
+        if isinstance(control, ft.Dropdown) and control.label == "Mauza"
+    )
+    assert mauza_dropdown.value == "4"
+    option_labels = [option.text for option in mauza_dropdown.options]
+    assert "Mauza (column 3)" in option_labels
+    assert "Mauza (column 5)" in option_labels
+
+
 def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypatch):
     class FakePicker:
         async def pick_files(self, **_kwargs):
@@ -982,3 +1051,177 @@ def test_duplicate_rules_dialog_lists_rules_and_opens_editor(monkeypatch):
         if isinstance(control, ft.Dropdown)
     }
     assert {"Schedule scope", "Effective-date matching", "When a duplicate is found"} <= labels
+
+
+def _first_rate_card(root):
+    rate_list = next(control for control in _walk(root) if isinstance(control, ft.ListView))
+    return next(control for control in rate_list.controls if isinstance(control, ft.Container))
+
+
+def test_rate_card_uses_default_appearance(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    record = {**_rate_record(), "schedule_type": "dc", "published_year": 2025}
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
+
+    root = dc_rates.build_dc_rates_page(FakePage())
+    card = _first_rate_card(root)
+    heading = card.content.controls[0].controls[0]
+
+    assert heading.value == "DC schedule · Test Mauza"
+    assert heading.color == "#0F172A"
+    assert card.bgcolor == "#FFFFFF"
+    assert card.border is not None
+    assert card.content.controls[1].color == "#475569"
+
+
+def test_rate_card_uses_saved_heading_and_colours(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    record = {**_rate_record(), "schedule_type": "fbr", "published_year": 2025}
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
+    monkeypatch.setattr(
+        dc_rates,
+        "get_card_appearance",
+        lambda: {
+            "heading_template": "{schedule} - {location} ({year})",
+            "background_color": "#FFF8E7",
+            "border_color": "#C2410C",
+            "heading_color": "#7C2D12",
+            "body_color": "#1E293B",
+        },
+    )
+
+    root = dc_rates.build_dc_rates_page(FakePage())
+    card = _first_rate_card(root)
+    heading = card.content.controls[0].controls[0]
+
+    assert heading.value == "FBR - Test Mauza (2025)"
+    assert heading.color == "#7C2D12"
+    assert card.bgcolor == "#FFF8E7"
+    assert card.content.controls[1].color == "#1E293B"
+
+
+def _stub_empty_rate_page(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
+        "count": 0, "lowest": None, "highest": None,
+    })
+
+
+def _export_button(root, label="Export CSV"):
+    return next(
+        control for control in _walk(root)
+        if isinstance(control, ft.OutlinedButton) and control.content == label
+    )
+
+
+def test_schedule_export_writes_to_the_default_folder(monkeypatch, tmp_path):
+    _stub_empty_rate_page(monkeypatch)
+    monkeypatch.setattr(dc_rates, "get_default_file_location", lambda: str(tmp_path))
+    prompts = []
+
+    async def choose_default(*_args, **kwargs):
+        prompts.append(kwargs)
+        return "default"
+
+    monkeypatch.setattr(dc_rates, "ask_location_choice", choose_default)
+    monkeypatch.setattr(
+        dc_rates,
+        "export_schedule_records",
+        lambda records, file_format, reference_mode=None: b"exported",
+    )
+    picker_calls = []
+
+    class FakePicker:
+        async def save_file(self, **kwargs):
+            picker_calls.append(kwargs)
+            return "picked.csv"
+
+    monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+
+    asyncio.run(_export_button(root).on_click())
+    page.dialogs[-1].actions[-1].on_click(None)
+    asyncio.run(page.background_task)
+
+    target = tmp_path / f"valuation_schedules_{date.today().isoformat()}.csv"
+    assert target.read_bytes() == b"exported"
+    assert picker_calls == []
+    assert prompts[-1]["action"] == "valuation schedule CSV export"
+    assert prompts[-1]["default_location"] == str(tmp_path)
+    assert any(
+        isinstance(control, ft.Text)
+        and f"Exported 0 record(s)" in (control.value or "")
+        and str(target) in (control.value or "")
+        for control in _walk(root)
+    )
+
+
+def test_schedule_export_can_choose_another_location(monkeypatch):
+    _stub_empty_rate_page(monkeypatch)
+    monkeypatch.setattr(dc_rates, "get_default_file_location", lambda: "D:\\default")
+    prompts = []
+
+    async def choose_other(page, *, action, default_location):
+        prompts.append((action, default_location))
+        return "choose"
+
+    monkeypatch.setattr(dc_rates, "ask_location_choice", choose_other)
+    monkeypatch.setattr(
+        dc_rates,
+        "export_schedule_records",
+        lambda records, file_format, reference_mode=None: b"exported",
+    )
+    picker_calls = []
+
+    class FakePicker:
+        async def save_file(self, **kwargs):
+            picker_calls.append(kwargs)
+            return "picked.csv"
+
+    monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+
+    asyncio.run(_export_button(root).on_click())
+    page.dialogs[-1].actions[-1].on_click(None)
+    asyncio.run(page.background_task)
+
+    assert prompts[-1] == ("valuation schedule CSV export", "D:\\default")
+    assert picker_calls[-1]["file_name"] == (
+        f"valuation_schedules_{date.today().isoformat()}.csv"
+    )
+    assert picker_calls[-1]["src_bytes"] == b"exported"
+
+
+def test_schedule_import_starts_in_the_default_folder(monkeypatch):
+    _stub_empty_rate_page(monkeypatch)
+    _mock_duplicate_profiles(monkeypatch)
+    monkeypatch.setattr(dc_rates, "get_default_file_location", lambda: "D:\\default")
+
+    async def choose_default(*_args, **_kwargs):
+        return "default"
+
+    monkeypatch.setattr(dc_rates, "ask_location_choice", choose_default)
+    picker_calls = []
+
+    class FakePicker:
+        async def pick_files(self, **kwargs):
+            picker_calls.append(kwargs)
+            return []
+
+    monkeypatch.setattr(ft, "FilePicker", FakePicker)
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+    import_button = next(
+        control for control in _walk(root)
+        if isinstance(control, ft.OutlinedButton)
+        and control.content == "Import CSV / Excel / ODS"
+    )
+
+    asyncio.run(import_button.on_click())
+
+    assert picker_calls[-1]["initial_directory"] == "D:\\default"
+    assert picker_calls[-1]["allowed_extensions"] == ["csv", "xlsx", "ods"]
+    assert picker_calls[-1]["with_data"] is True
