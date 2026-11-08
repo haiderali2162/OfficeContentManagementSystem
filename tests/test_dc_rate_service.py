@@ -717,6 +717,89 @@ def test_duplicate_mauza_mapping_without_rows_keeps_legacy_first_column():
     assert mapping["mauza"] == 2
 
 
+def test_year_suffixed_rate_header_maps_to_rate_value(rate_database):
+    """A fiscal year in the rate header must not unmap the rate column."""
+    headers = [
+        "Tehsil", "Qanoongoi", "Mauza", "Classification", "Location",
+        "Square No", "Killa No", "DC Rate (2026-2027)", "Unit",
+    ]
+    rows = [
+        ["Tehsil A", "Qanoongoi A", "Mauza A", "Agricultural", "Farm",
+         "16", "8", "1000", "per_marla"],
+    ]
+    mapping = dc_rate_service.suggested_column_mapping(headers, rows)
+    assert mapping["rate_value"] == 7
+
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, rows, mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+    )
+    assert preview["issues"] == []
+    assert len(preview["valid_records"]) == 1
+    dc_rate_service.import_dc_rate_records(
+        preview["valid_records"], duplicate_rule="default:rural_dc_overlap"
+    )
+    saved = dc_rate_service.list_dc_rates()[0]
+    assert saved["rate_value"] == Decimal("1000")
+    assert saved["rate_unit"] == "per_marla"
+
+
+def test_urban_and_fbr_schedules_capture_optional_mauza_for_search(rate_database):
+    """Urban DC and FBR rows keep their Mauza column when one exists."""
+    urban_headers = [
+        "District", "Tehsil", "Mauza", "Town", "Revenue Circle",
+        "Property Area", "Classification", "Location", "Square No",
+        "Killa No", "Khasra No", "DC Rate", "Unit", "Structure Rate",
+    ]
+    urban_row = [
+        "District B", "Tehsil B", "Test Village Urban", "Town B", "Circle B",
+        "Block B", "Residential", "Main Road", "12", "3", "K-4",
+        "7000", "per_marla", "9000",
+    ]
+    urban_mapping = dc_rate_service.suggested_column_mapping(urban_headers, [urban_row])
+    assert urban_mapping["mauza"] == 2
+    urban_preview = dc_rate_service.preview_mapped_schedule(
+        urban_headers, [urban_row], urban_mapping, "urban_dc",
+        duplicate_rule="default:urban_dc_overlap",
+    )
+    assert urban_preview["issues"] == []
+    dc_rate_service.import_dc_rate_records(
+        urban_preview["valid_records"], duplicate_rule="default:urban_dc_overlap"
+    )
+    assert dc_rate_service.list_mauza_names(search="Test Village Urban") == [
+        "Test Village Urban"
+    ]
+    assert len(dc_rate_service.list_dc_rates(
+        mauza="Test Village Urban", schedule_type="dc",
+    )) == 1
+
+    fbr_headers = [
+        "District", "Tehsil", "Mauza", "Serial No", "Revenue Circle",
+        "Property Area", "Classification", "Location", "Location (Square No.)",
+        "Value of property per Square Ft (in Rs.)", "Per marla Valuation",
+    ]
+    fbr_row = [
+        "District C", "Tehsil C", "Test Village FBR", "9", "Circle C",
+        "Sector C", "Commercial", "Market Road", "22", "123.50", "",
+    ]
+    fbr_mapping = dc_rate_service.suggested_column_mapping(fbr_headers, [fbr_row])
+    assert fbr_mapping["mauza"] == 2
+    fbr_preview = dc_rate_service.preview_mapped_schedule(
+        fbr_headers, [fbr_row], fbr_mapping, "fbr",
+        duplicate_rule="default:fbr_overlap",
+    )
+    assert fbr_preview["issues"] == []
+    dc_rate_service.import_dc_rate_records(
+        fbr_preview["valid_records"], duplicate_rule="default:fbr_overlap"
+    )
+    assert dc_rate_service.list_mauza_names(search="Test Village FBR") == [
+        "Test Village FBR"
+    ]
+    fbr_saved = dc_rate_service.list_dc_rates(schedule_type="fbr")[0]
+    assert fbr_saved["mauza"] == "Test Village FBR"
+    assert fbr_saved["rate_unit"] == "per_square_foot"
+
+
 def test_reference_range_normalization_validates_direction_and_size():
     assert dc_rate_service._normalize_reference("1-5,6;7-9") == "1, 2, 3, 4, 5, 6, 7, 8, 9"
     assert dc_rate_service._normalize_reference("25-21") == "21, 22, 23, 24, 25"
@@ -962,6 +1045,96 @@ def test_qanoongoi_filters_and_location_hierarchy_summary(rate_database):
     )
     assert unassigned["mauza_count"] == 1
     assert unassigned["qanoongoi_count"] == 1
+
+
+def test_list_location_picker_bounds_and_pins_locations(rate_database):
+    alpha_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Alpha", mauza="Alpha", qanoongoi="Qanoongoi One",
+    ))
+    beta_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Beta", mauza="Beta", qanoongoi="qanoongoi one",
+    ))
+    gamma_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Gamma", mauza="Gamma",
+    ))
+
+    bounded = dc_rate_service.list_location_picker(limit=2)
+    assert [item["id"] for item in bounded["locations"]] == [alpha_id, beta_id]
+    assert bounded["has_more"] is True
+    # Qanoongoi suggestions are case-insensitively unique, sorted, and non-empty.
+    assert bounded["qanoongoi"] == ["Qanoongoi One"]
+
+    pinned = dc_rate_service.list_location_picker(
+        limit=2, include_ids=[gamma_id, alpha_id]
+    )
+    pinned_ids = [item["id"] for item in pinned["locations"]]
+    # The first page keeps its order; pinned records outside it are appended.
+    assert pinned_ids[:2] == [alpha_id, beta_id]
+    assert pinned_ids[2] == gamma_id
+
+
+def test_location_subquery_filter_matches_mauza_qanoongoi_and_land_type(rate_database):
+    rural_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Ring Road", mauza="Ring Road", qanoongoi="Qanoongoi North",
+        land_type="rural",
+    ))
+    dc_rate_service.create_dc_rate(
+        location_id=rural_id, **_rate_values(rate_value="900")
+    )
+    urban_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Ring Road Urban", mauza="Ring Road", qanoongoi="Qanoongoi South",
+        land_type="urban", square_no="5",
+    ))
+    dc_rate_service.create_dc_rate(
+        location_id=urban_id, **_rate_values(rate_value="2500", rate_unit="per_square_foot")
+    )
+
+    assert [item["location_id"] for item in dc_rate_service.list_dc_rates(
+        mauza="ring"
+    )] == [urban_id, rural_id]
+    assert [item["location_id"] for item in dc_rate_service.list_dc_rates(
+        mauza="ring", qanoongoi="south"
+    )] == [urban_id]
+    assert [item["location_id"] for item in dc_rate_service.list_dc_rates(
+        mauza="ring", land_type="rural"
+    )] == [rural_id]
+    assert [item["location_id"] for item in dc_rate_service.list_dc_rates(
+        mauza="ring", land_type="urban", square_no="5"
+    )] == [urban_id]
+    summary = dc_rate_service.summarize_dc_rates(mauza="ring", qanoongoi="north")
+    assert summary["count"] == 1
+    assert summary["lowest"] == Decimal("900")
+    type_summary = dc_rate_service.summarize_dc_rates(mauza="ring", land_type="urban")
+    assert type_summary["highest_unit"] == "per_square_foot"
+    # Free-text search keeps the joined candidate path and stays consistent.
+    assert [item["location_id"] for item in dc_rate_service.list_dc_rates(
+        mauza="ring", search="north"
+    )] == [rural_id]
+
+
+def test_large_mauza_search_pages_and_summaries_stay_consistent(rate_database):
+    """Enough locations to force real pagination while filtering by Mauza."""
+    created_ids = []
+    for index in range(1, 8):
+        location_id, _ = dc_rate_service.create_location(**_location_values(
+            name=f"Village {index}", mauza="Spread Village",
+            square_no=str(index),
+        ))
+        created_ids.append(location_id)
+    for offset, location_id in enumerate(created_ids, start=1):
+        dc_rate_service.create_dc_rate(
+            location_id=location_id, **_rate_values(rate_value=str(offset * 100))
+        )
+
+    page_one = dc_rate_service.list_dc_rates(mauza="spread", limit=3)
+    page_two = dc_rate_service.list_dc_rates(mauza="spread", limit=3, offset=3)
+    assert len(page_one) == 3 and len(page_two) == 3
+    assert page_one != page_two
+    summary = dc_rate_service.summarize_dc_rates(mauza="spread")
+    assert summary["count"] == 7
+    assert summary["lowest"] == Decimal("100")
+    assert summary["highest"] == Decimal("700")
+    assert (summary["lowest_square"], summary["highest_square"]) == ("1", "7")
 
 
 def test_mauza_cadastral_selection_summary_and_khewat_assignment(rate_database):

@@ -8,10 +8,11 @@ from io import BytesIO, StringIO
 import csv
 import itertools
 import os
+import sqlite3
 import sys
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import func, or_, select
@@ -959,6 +960,61 @@ def list_locations() -> list[dict[str, Any]]:
             )
         ).all()
         return [_location_dict(location) for location in locations]
+
+
+def list_location_picker(
+    *, limit: int = 500, include_ids: Sequence[int] | None = None,
+) -> dict[str, Any]:
+    """Bounded location data for the rate-page dropdowns.
+
+    The location table can hold hundreds of thousands of rows, so pages load
+    only the first `limit` records in display order and report whether more
+    remain (`has_more`). Records named in `include_ids` are always attached so
+    a just-created or currently selected location is never truncated away.
+    """
+    limit = max(0, int(limit))
+    wanted_ids = {int(value) for value in (include_ids or []) if value is not None}
+    with SessionLocal() as session:
+        fetched = session.scalars(
+            select(PropertyLocation)
+            .order_by(
+                PropertyLocation.district,
+                PropertyLocation.tehsil,
+                PropertyLocation.name,
+                PropertyLocation.id,
+            )
+            .limit(limit + 1)
+        ).all()
+        has_more = len(fetched) > limit
+        locations = fetched[:limit]
+        missing_ids = sorted(wanted_ids - {location.id for location in locations})
+        if missing_ids:
+            locations = [*locations, *session.scalars(
+                select(PropertyLocation)
+                .where(PropertyLocation.id.in_(missing_ids))
+                .order_by(
+                    PropertyLocation.district,
+                    PropertyLocation.tehsil,
+                    PropertyLocation.name,
+                    PropertyLocation.id,
+                )
+            ).all()]
+        distinct_values = session.scalars(
+            select(func.distinct(PropertyLocation.qanoongoi)).where(
+                PropertyLocation.qanoongoi.is_not(None),
+                PropertyLocation.qanoongoi != "",
+            )
+        ).all()
+    qanoongoi: dict[str, str] = {}
+    for raw_value in distinct_values:
+        value = " ".join(str(raw_value or "").split())
+        if value:
+            qanoongoi.setdefault(value.casefold(), value)
+    return {
+        "locations": [_location_dict(location) for location in locations],
+        "qanoongoi": sorted(qanoongoi.values(), key=str.casefold),
+        "has_more": has_more,
+    }
 
 
 def _apply_location_land_type(statement, land_type: str | None):
@@ -2006,24 +2062,62 @@ def list_cadastral_values(
     return sorted(tokens, key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else token.casefold()))[:max(1, limit)]
 
 
+# Matched location id sets up to this size are passed as literal SQL ids so the
+# repeated statements (summary aggregate, cadastral extremes, first/last rate)
+# reuse the SQLite variable cache instead of re-running a large location scan.
+# The bound respects the backend's bind-parameter limit: SQLite >= 3.32 allows
+# 32,766 parameters, older builds default to 999. Bigger match sets fall back to
+# an embedded location subquery.
+_SQLITE_BIND_PARAMETER_LIMIT = (
+    32766 if sqlite3.sqlite_version_info >= (3, 32, 0) else 999
+)
+_LOCATION_ID_LITERAL_LIMIT = min(10000, _SQLITE_BIND_PARAMETER_LIMIT - 20)
+
+
 def summarize_dc_rates(
     *, mauza: str = "", qanoongoi: str = "", rate_unit: str | None = None,
     schedule_type: str | None = None, land_type: str | None = None,
 ) -> dict[str, Any]:
     """Aggregate rate extremes for the selected location filters."""
-    statement = (
-        select(DCValuationRate.id)
-        .join(PropertyLocation, DCValuationRate.location_id == PropertyLocation.id)
-    )
+    statement: Any = None
     if mauza.strip():
-        statement = statement.where(PropertyLocation.mauza.ilike(f"%{mauza.strip()}%"))
-    statement = _apply_qanoongoi_filter(statement, qanoongoi)
+        # Locations-first plan: match the Mauza (and other location-side
+        # filters) inside a location-id subquery so SQLite probes rates
+        # through their location index instead of scanning the rate table
+        # joined against every location.
+        location_match = select(PropertyLocation.id).where(
+            PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
+        )
+        location_match = _apply_qanoongoi_filter(location_match, qanoongoi)
+        if land_type in {"rural", "urban"}:
+            location_match = location_match.where(
+                PropertyLocation.land_type == land_type
+            )
+        with SessionLocal() as session:
+            matched_ids = session.scalars(location_match).all()
+        if len(matched_ids) <= _LOCATION_ID_LITERAL_LIMIT:
+            # A small Mauza match set is resolved once here; the aggregate,
+            # cadastral, and extreme-value statements below then reuse plain id
+            # lists instead of re-running the location scan each time.
+            statement = select(DCValuationRate.id).where(
+                DCValuationRate.location_id.in_(matched_ids)
+            )
+        else:
+            statement = select(DCValuationRate.id).where(
+                DCValuationRate.location_id.in_(location_match)
+            )
+    else:
+        statement = (
+            select(DCValuationRate.id)
+            .join(PropertyLocation, DCValuationRate.location_id == PropertyLocation.id)
+        )
+        statement = _apply_qanoongoi_filter(statement, qanoongoi)
+        if land_type in {"rural", "urban"}:
+            statement = statement.where(PropertyLocation.land_type == land_type)
     if rate_unit:
         statement = statement.where(DCValuationRate.rate_unit == rate_unit)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
-    if land_type in {"rural", "urban"}:
-        statement = statement.where(PropertyLocation.land_type == land_type)
     aggregate = select(
         func.count(DCValuationRate.id),
         func.min(DCValuationRate.rate_value),
@@ -2224,8 +2318,26 @@ def list_dc_rates(
 ) -> list[dict[str, Any]]:
     statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
     search = search.strip()
-    if (mauza.strip() or qanoongoi.strip() or square_no.strip() or kila_no.strip()
-            or khasra_no.strip() or land_type in {"rural", "urban"} or search):
+    mauza_term = mauza.strip()
+    cadastral_terms = (square_no.strip(), kila_no.strip(), khasra_no.strip())
+    # With a Mauza filter and no free-text/cadastral search, match location
+    # fields inside a location-id subquery: SQLite then probes rates through
+    # their location index instead of joining every location into the scan.
+    use_location_subquery = bool(
+        mauza_term and not search and not any(cadastral_terms)
+    )
+    if use_location_subquery:
+        location_match = select(PropertyLocation.id).where(
+            PropertyLocation.mauza.ilike(f"%{mauza_term}%")
+        )
+        location_match = _apply_qanoongoi_filter(location_match, qanoongoi)
+        if land_type in {"rural", "urban"}:
+            location_match = location_match.where(
+                PropertyLocation.land_type == land_type
+            )
+        statement = statement.where(DCValuationRate.location_id.in_(location_match))
+    elif (mauza_term or qanoongoi.strip() or any(cadastral_terms)
+            or land_type in {"rural", "urban"} or search):
         statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
@@ -2235,7 +2347,7 @@ def list_dc_rates(
         )
     elif location_id is not None:
         statement = statement.where(DCValuationRate.location_id == location_id)
-    if land_type in {"rural", "urban"}:
+    if land_type in {"rural", "urban"} and not use_location_subquery:
         statement = statement.where(PropertyLocation.land_type == land_type)
     if rate_unit:
         statement = statement.where(DCValuationRate.rate_unit == rate_unit)
@@ -2250,11 +2362,12 @@ def list_dc_rates(
         )
     if published_year is not None:
         statement = statement.where(DCValuationRate.published_year == published_year)
-    if mauza.strip():
-        statement = statement.where(
-            PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
-        )
-    statement = _apply_qanoongoi_filter(statement, qanoongoi)
+    if not use_location_subquery:
+        if mauza_term:
+            statement = statement.where(
+                PropertyLocation.mauza.ilike(f"%{mauza_term}%")
+            )
+        statement = _apply_qanoongoi_filter(statement, qanoongoi)
     # Cadastral fields are stored as token lists or compact ranges; query a
     # broad superset in SQLite, then validate whole tokens/ranges below so
     # (for example) 2 does not match 12 and overlapping ranges still match.
@@ -2370,6 +2483,36 @@ def list_dc_rates(
 def _header_key(value: Any) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().casefold())
     return normalized.strip("_")
+
+
+_FISCAL_YEAR_TOKEN = re.compile(r"^(?:19|20)\d{2}$")
+_FISCAL_RANGE_TOKEN = re.compile(r"^(?:19|20)\d{2}[-_](?:\d{2}|(?:19|20)\d{2})$")
+_FISCAL_SHORT_SUFFIX = re.compile(r"^(?P<end>\d{2})$")
+
+
+def _rate_header_key(value: Any) -> str:
+    """Header alias key with a trailing fiscal-year label removed.
+
+    Published schedules name the rate column with its year, for example
+    "DC Rate (2026-2027)" or "DC Rate 2026-27". The year words are not part of
+    the column identity; without this the rate column is silently unmapped and
+    the import reports a missing required column.
+    """
+    tokens = [token for token in _header_key(value).split("_") if token]
+    while tokens:
+        token = tokens[-1]
+        if _FISCAL_YEAR_TOKEN.fullmatch(token) or _FISCAL_RANGE_TOKEN.fullmatch(token):
+            tokens.pop()
+            continue
+        short = _FISCAL_SHORT_SUFFIX.match(token)
+        if short and len(tokens) >= 2 and _FISCAL_YEAR_TOKEN.fullmatch(tokens[-2]):
+            start = int(tokens[-2])
+            if start % 100 + 1 == int(short.group("end")):
+                tokens.pop()
+                tokens.pop()
+                continue
+        break
+    return "_".join(tokens)
 
 
 def _sheet_from_rows(
@@ -2571,7 +2714,7 @@ def suggested_column_mapping(
     mapping = {}
     mauza_candidates: list[int] = []
     for index, header in enumerate(headers):
-        key = _header_key(header)
+        key = _rate_header_key(header)
         target = RATE_HEADERS.get(key)
         if key == "location":
             target = "locality"
@@ -3055,7 +3198,7 @@ def preview_dc_rate_workbook(
             raw_header = _header_key(value)
             if not raw_header:
                 continue
-            target = RATE_HEADERS.get(raw_header)
+            target = RATE_HEADERS.get(_rate_header_key(value))
             if target is None and any(
                 token in raw_header for token in ("mauza", "mouza", "village")
             ):

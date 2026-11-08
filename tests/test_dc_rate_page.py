@@ -107,7 +107,7 @@ def _rate_record():
 
 
 def test_add_button_event_is_not_used_as_rate_id(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(
         dc_rates,
@@ -148,7 +148,7 @@ def test_add_button_event_is_not_used_as_rate_id(monkeypatch):
 def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
     saved = [_rate_record()]
     last_filters = {}
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [{"id": 3, "name": "Test Mauza"}])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [{"id": 3, "name": "Test Mauza"}], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 2, "lowest": "1", "highest": "2",
         "lowest_unit": "per_marla", "lowest_schedule": "dc",
@@ -195,7 +195,7 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
 
 def test_large_location_set_keeps_quick_filter_bounded(monkeypatch):
     locations = [{"id": row, "name": f"Mauza {row}"} for row in range(1, 601)]
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: locations)
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **kwargs: {"locations": locations, "qanoongoi": dc_rates._unique_location_values(locations, "qanoongoi"), "has_more": len(locations) > kwargs.get("limit", 500)})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     root = dc_rates.build_dc_rates_page(FakePage())
 
@@ -214,7 +214,7 @@ def test_qanoongoi_choices_are_unique_and_cascade_to_mauza_suggestions(monkeypat
         {"id": 4, "name": "Location D", "qanoongoi": ""},
     ]
     calls = []
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: locations)
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **kwargs: {"locations": locations, "qanoongoi": dc_rates._unique_location_values(locations, "qanoongoi"), "has_more": len(locations) > kwargs.get("limit", 500)})
     monkeypatch.setattr(
         dc_rates, "list_dc_rates",
         lambda **kwargs: calls.append(("rates", kwargs)) or [],
@@ -261,7 +261,7 @@ def test_qanoongoi_choices_are_unique_and_cascade_to_mauza_suggestions(monkeypat
 
 
 def test_area_summary_dialog_shows_hierarchy_counts(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_location_hierarchy", lambda: [
         {
@@ -307,7 +307,7 @@ def test_area_summary_dialog_shows_hierarchy_counts(monkeypatch):
 
 def test_edit_button_passes_the_rate_id_explicitly(monkeypatch):
     record = _rate_record()
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [{"id": 3, "name": "Test Mauza"}])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [{"id": 3, "name": "Test Mauza"}], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
     monkeypatch.setattr(dc_rates, "get_dc_rate", lambda rate_id: record if rate_id == 7 else None)
     page = FakePage()
@@ -328,7 +328,7 @@ def test_rate_card_shows_rate_and_location_text(monkeypatch):
     record = _rate_record()
     record["rate_value"] = "12345.00"
     record.update({"square_no": "7-8", "kila_no": "4", "khasra_no": "21/3"})
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
     monkeypatch.setattr(dc_rates, "get_dc_rate", lambda _rate_id: record)
     page = FakePage()
@@ -349,7 +349,7 @@ def test_rate_card_shows_rate_and_location_text(monkeypatch):
 
 
 def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -382,7 +382,7 @@ def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch)
 
 
 def test_filter_and_import_export_sections_toggle_independently(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -419,7 +419,7 @@ def test_cadastral_selection_dialog_summarizes_and_saves_slash_khewat(monkeypatc
         "qanoongoi": None, "patwar_circle": None, "mauza_name": "Test Mauza",
         "hadbast_number": "123",
     }
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -548,7 +548,7 @@ def test_main_khewat_search_filters_and_opens_saved_record(monkeypatch):
         **context, "id": 42, "khewat_number": "30/1", "rhz_year": "2019-20",
         "khewat_size": "12-4-0", "squares": ["12"], "kilas": ["4"],
     }
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -593,7 +593,7 @@ def test_main_khewat_search_filters_and_opens_saved_record(monkeypatch):
 
 def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch):
     cadastral_calls = []
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [_rate_record()])
     def list_mauza_names(**_kwargs):
         return ["Test Mauza", "Other Mauza"]
@@ -642,7 +642,7 @@ def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch)
 
 def test_square_change_clears_kila_and_narrows_its_suggestions(monkeypatch):
     cadastral_calls = []
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -688,7 +688,7 @@ def test_duplicate_cleanup_dialog_previews_candidates_before_removal(monkeypatch
     record = {**_rate_record(), "duplicate_of": 6, "id": 7}
     _mock_duplicate_profiles(monkeypatch)
     scanned_rules = []
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(
         dc_rates,
@@ -726,7 +726,7 @@ def test_duplicate_cleanup_dialog_previews_candidates_before_removal(monkeypatch
 
 
 def test_location_form_switches_rural_and_urban_fields(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
@@ -773,7 +773,7 @@ def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypa
 
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
     _mock_duplicate_profiles(monkeypatch)
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -801,7 +801,8 @@ def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypa
     labels = {control.label for control in _walk(dialog.content) if isinstance(control, ft.Dropdown)}
     assert "Town" in labels
     assert "Structure rate" in labels
-    assert "Mauza" not in labels
+    # Urban schedules may carry a Mauza column, so it is offered as optional.
+    assert "Mauza (optional)" in labels
 
     radio.value = "fbr"
     radio.on_change(None)
@@ -811,6 +812,7 @@ def test_import_mapping_dialog_switches_between_schedule_field_profiles(monkeypa
     assert "Kila no. (optional)" in labels
     assert "Khasra no. (optional)" in labels
     assert "Unit" not in labels
+    assert "Mauza (optional)" in labels
 
 
 def test_import_mapping_uses_row_values_to_disambiguate_duplicate_mauza_headers(monkeypatch):
@@ -831,7 +833,7 @@ def test_import_mapping_uses_row_values_to_disambiguate_duplicate_mauza_headers(
 
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
     _mock_duplicate_profiles(monkeypatch)
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -874,7 +876,7 @@ def test_large_import_is_scheduled_in_background_and_reports_completion(monkeypa
 
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
     _mock_duplicate_profiles(monkeypatch)
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -964,7 +966,7 @@ def test_import_mapping_shows_automatic_exact_duplicate_rule(monkeypatch):
 
     monkeypatch.setattr(ft, "FilePicker", FakePicker)
     _mock_duplicate_profiles(monkeypatch)
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
@@ -1025,7 +1027,7 @@ def test_import_mapping_shows_automatic_exact_duplicate_rule(monkeypatch):
 
 def test_duplicate_rules_dialog_lists_rules_and_opens_editor(monkeypatch):
     _mock_duplicate_profiles(monkeypatch)
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page)
@@ -1059,7 +1061,7 @@ def _first_rate_card(root):
 
 
 def test_rate_card_uses_default_appearance(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     record = {**_rate_record(), "schedule_type": "dc", "published_year": 2025}
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
 
@@ -1075,7 +1077,7 @@ def test_rate_card_uses_default_appearance(monkeypatch):
 
 
 def test_rate_card_uses_saved_heading_and_colours(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     record = {**_rate_record(), "schedule_type": "fbr", "published_year": 2025}
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
     monkeypatch.setattr(
@@ -1101,7 +1103,7 @@ def test_rate_card_uses_saved_heading_and_colours(monkeypatch):
 
 
 def _stub_empty_rate_page(monkeypatch):
-    monkeypatch.setattr(dc_rates, "list_locations", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,

@@ -40,7 +40,7 @@ from services.dc_rate_service import (
     list_cadastral_values,
     list_dc_rates,
     list_duplicate_rule_profiles,
-    list_locations,
+    list_location_picker,
     list_mauza_cadastral_values,
     list_rhz_years,
     list_mauza_names,
@@ -347,16 +347,48 @@ def build_dc_rates_page(
     def close_dialog():
         page.pop_dialog()
 
-    def refresh_locations(locations=None):
+    def refresh_locations(
+        locations=None, *, include_ids=None, qanoongoi_values=None, has_more=None,
+    ):
         """Reload location choices used by the filter and rate editor."""
         nonlocal location_picker_truncated
-        locations = list_locations() if locations is None else locations
+        if locations is None:
+            # The location table can hold hundreds of thousands of rows, so
+            # dropdown loads stay bounded; any supplied ids are pinned so a
+            # just-created or selected location is never truncated away.
+            pinned_ids = [int(value) for value in (include_ids or [])]
+            if not pinned_ids and (location_filter.value or "") not in ("", "all"):
+                try:
+                    pinned_ids = [int(location_filter.value)]
+                except (TypeError, ValueError):
+                    pinned_ids = []
+            picker = list_location_picker(
+                limit=visible_location_limit, include_ids=pinned_ids,
+            )
+            locations = picker["locations"]
+            qanoongoi_values = picker["qanoongoi"]
+            has_more = picker["has_more"]
+        else:
+            pinned_ids = [int(value) for value in (include_ids or [])]
+        if qanoongoi_values is None:
+            qanoongoi_values = _unique_location_values(locations, "qanoongoi")
         qanoongoi_filter.suggestions = [
             ft.AutoCompleteSuggestion(key=value, value=value)
-            for value in _unique_location_values(locations, "qanoongoi")
+            for value in qanoongoi_values
         ]
         visible_locations = locations[:visible_location_limit]
-        location_picker_truncated = len(locations) > visible_location_limit
+        shown_ids = {str(location["id"]) for location in visible_locations}
+        # Pinned records that fall outside the first page still need their
+        # option rendered for the dropdown value to stay selectable.
+        pinned_locations = [
+            location for location in locations
+            if int(location["id"]) in pinned_ids
+            and str(location["id"]) not in shown_ids
+        ]
+        location_picker_truncated = (
+            bool(has_more) if has_more is not None
+            else len(locations) > visible_location_limit
+        )
         location_filter.options = [
             ft.dropdown.Option("all", "All locations"),
             *[
@@ -376,7 +408,7 @@ def build_dc_rates_page(
                         if part
                     ),
                 )
-                for location in visible_locations
+                for location in [*visible_locations, *pinned_locations]
             ],
         ]
         if location_filter.value != "all" and not any(
@@ -784,7 +816,7 @@ def build_dc_rates_page(
                 )
                 location_id, created = create_location(**location_values)
                 close_dialog()
-                refresh_locations()
+                refresh_locations(include_ids=[location_id])
                 location_filter.value = str(location_id)
                 schedule_rates_refresh()
                 status_text.value = (
@@ -826,12 +858,22 @@ def build_dc_rates_page(
         """Open the add form from a Flet event or edit a specific rate ID."""
         # The selected location stores the administrative dimensions; this
         # form stores one effective, source-traceable DC or FBR schedule row.
-        locations = refresh_locations()
         existing = get_dc_rate(rate_id) if rate_id is not None else None
         if rate_id is not None and existing is None:
             status_text.value = "This rate record no longer exists."
             page.update()
             return
+        pinned_location_id = (
+            int(existing["location_id"])
+            if existing and existing["location_id"] else None
+        )
+        # The dropdown reuses the bounded location list; a rate being edited
+        # always keeps its own location pinned even beyond the first page.
+        locations = refresh_locations(
+            include_ids=(
+                [pinned_location_id] if pinned_location_id is not None else None
+            ),
+        )
 
         location_field = ft.Dropdown(
             label="Property location",
@@ -1058,7 +1100,8 @@ def build_dc_rates_page(
                 ],
                 "urban_dc": [
                     ("district", "District (optional)"), ("tehsil", "Tehsil"),
-                    ("qanoongoi", "Qanoongoi (optional)"), ("committee_town", "Town"),
+                    ("qanoongoi", "Qanoongoi (optional)"), ("mauza", "Mauza (optional)"),
+                    ("committee_town", "Town"),
                     ("revenue_circle", "Revenue circle"), ("property_area", "Property area"),
                     ("classification", "Classification"), ("locality", "Location"),
                     ("square_no", "Square no. (optional)"), ("kila_no", "Kila no. (optional)"),
@@ -1067,6 +1110,7 @@ def build_dc_rates_page(
                 ],
                 "fbr": [
                     ("district", "District (optional)"), ("tehsil", "Tehsil (optional)"),
+                    ("mauza", "Mauza (optional)"),
                     ("serial_no", "Serial no. (optional)"), ("revenue_circle", "Revenue circle"),
                     ("property_area", "Property area"), ("classification", "Classification"),
                     ("locality", "Location"), ("square_no", "Location (Square No.)"),
@@ -1451,8 +1495,12 @@ def build_dc_rates_page(
                                     duplicate_rule=duplicate_rule_dropdown.value,
                                     storage_mode=chosen_storage,
                                 )
-                                refreshed_locations = await asyncio.to_thread(list_locations)
-                                refresh_locations(refreshed_locations)
+                                picker = await asyncio.to_thread(list_location_picker)
+                                refresh_locations(
+                                    picker["locations"],
+                                    qanoongoi_values=picker["qanoongoi"],
+                                    has_more=picker["has_more"],
+                                )
                                 schedule_filter.value = "all"
                                 location_filter.value = "all"
                                 unit_filter.value = "all"
@@ -3212,8 +3260,8 @@ def build_dc_rates_page(
         async def load_initial_data():
             """Populate the first bounded view without blocking page navigation."""
             try:
-                locations, records, mauza_names, summary, squares, kilas, khasras = await asyncio.gather(
-                    asyncio.to_thread(list_locations),
+                location_picker_data, records, mauza_names, summary, squares, kilas, khasras = await asyncio.gather(
+                    asyncio.to_thread(list_location_picker, limit=visible_location_limit),
                     asyncio.to_thread(list_dc_rates, limit=visible_rate_limit + 1),
                     asyncio.to_thread(
                         list_mauza_names,
@@ -3229,7 +3277,11 @@ def build_dc_rates_page(
                     asyncio.to_thread(list_cadastral_values, "kila_no"),
                     asyncio.to_thread(list_cadastral_values, "khasra_no"),
                 )
-                refresh_locations(locations)
+                refresh_locations(
+                    location_picker_data["locations"],
+                    qanoongoi_values=location_picker_data["qanoongoi"],
+                    has_more=location_picker_data["has_more"],
+                )
                 mauza_filter.suggestions = [
                     ft.AutoCompleteSuggestion(key=name, value=name) for name in mauza_names
                 ]
