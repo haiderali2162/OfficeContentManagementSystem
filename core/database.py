@@ -2,13 +2,16 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+import threading
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, Engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.engine import URL, make_url
 
-# our declared db path
+# our declared db path and the connection options file
 from core.config import DATABASE_PATH
+from core import database_config
 
 
 # Base class for all database models.
@@ -16,41 +19,160 @@ class Base(DeclarativeBase):
     pass
 
 
-# Create the database engine.
-# SQLite stores our data in a local file.
-engine = create_engine(
-    f"sqlite:///{DATABASE_PATH.as_posix()}",
-    connect_args={"check_same_thread": False},
-)
+# --------------------------------------------------------------------------
+# Engine configuration
+#
+# The engine is created from the connection options file (data/database.json),
+# falling back to the built-in SQLite path when the file is absent or
+# unusable. ``reconfigure_database`` below can swap the engine at runtime, so
+# ``SessionLocal`` is NOT a plain sessionmaker: it is a proxy object that
+# always dispatches to the *current* factory. Every module that imported
+# ``SessionLocal`` keeps the same object and follows a live database switch.
+# --------------------------------------------------------------------------
+
+#: Serialises engine rebuilds while one is in progress.
+_engine_lock = threading.Lock()
 
 
-@event.listens_for(engine, "connect")
-def enable_sqlite_foreign_keys(connection, _record) -> None:
-    # SQLite leaves FK checks off unless enabled for every connection;
-    # this makes Client relationships' ON DELETE CASCADE guarantees real.
-    cursor = connection.cursor()
+class SessionFactoryProxy:
+    """Callable stand-in for the current :class:`sessionmaker`.
+
+    Service modules run ``from core.database import SessionLocal`` once at
+    import time, so re-binding ``core.database.SessionLocal`` alone would
+    leave them holding a stale factory bound to the previous engine. The
+    proxy avoids that without touching any other module: calls (and
+    ``.begin()`` and attribute access) resolve against the live factory,
+    which points at whatever database the settings page last connected to.
+    """
+
+    def __call__(self, *args, **kwargs):
+        """Return a new Session bound to the currently configured engine."""
+        return _current_sessionmaker()(*args, **kwargs)
+
+    def begin(self, *args, **kwargs):
+        """Forward a ``begin()`` context-manager call to the live factory."""
+        return _current_sessionmaker().begin(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # Forward any other sessionmaker attribute (for example ``.kw``, used
+        # by tests to read the bound engine).
+        return getattr(_current_sessionmaker(), name)
+
+
+# ``configure_engine`` populates the live factory during module import, so a
+# proxy call before that point is a programming error, never a user error.
+SessionLocal = SessionFactoryProxy()
+
+
+def _current_sessionmaker():
+    """Return the live session factory bound to the current engine."""
+    factory = globals().get("_active_sessionmaker")
+    if factory is None:  # pragma: no cover - import always configures first
+        raise RuntimeError("The database engine has not been configured yet.")
+    return factory
+
+
+def _install_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+    """Enable foreign-key enforcement on every new SQLite connection.
+
+    SQLite leaves foreign-key checks off unless enabled per connection; this
+    makes Client relationships' ON DELETE CASCADE guarantees real. The listener
+    is only registered for SQLite engines (see :func:`_build_engine`), so
+    server dialects — which enforce referential integrity themselves — never
+    receive SQLite ``PRAGMA`` statements.
+    """
+    cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
 
-# Each operation can obtain its own database session.
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
-    expire_on_commit=False,
-)
+def _build_engine(url: str | URL) -> Engine:
+    """Create an engine for ``url`` with dialect-appropriate connection hooks.
+
+    SQLite-specific behavior (``check_same_thread=False`` so Flet's UI thread
+    and worker threads may share pool connections, plus the foreign-key
+    pragma listener) is applied only when the URL really targets SQLite:
+    drivers such as psycopg2, pymysql, and pyodbc reject unknown connection
+    arguments, so hard-coding them would break every server backend.
+    """
+    url_object = make_url(url)
+    is_sqlite = url_object.get_backend_name() == "sqlite"
+    engine = create_engine(
+        url,
+        connect_args={"check_same_thread": False} if is_sqlite else {},
+    )
+    if is_sqlite:
+        event.listen(engine, "connect", _install_sqlite_pragmas)
+    return engine
+
+
+def configure_engine(url: str | URL) -> Engine:
+    """Build and install the engine/sessionmaker pair for ``url``.
+
+    Returns the new engine. Runtime switches should use
+    :func:`reconfigure_database`, which also disposes the old engine.
+    """
+    new_engine = _build_engine(url)
+    new_factory = sessionmaker(
+        bind=new_engine,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    with _engine_lock:
+        globals()["engine"] = new_engine
+        globals()["_active_sessionmaker"] = new_factory
+    return new_engine
+
+
+def reconfigure_database(url: str | URL) -> Engine:
+    """Point the whole application at ``url`` without restarting.
+
+    The new engine is installed first, then the previous engine is disposed,
+    so in-flight operations finish on the old engine and every operation
+    started afterwards uses the new database. No data is copied between
+    databases; the previous database file/server remains untouched.
+    """
+    old_engine = globals().get("engine")
+    new_engine = configure_engine(url)
+    if old_engine is not None and old_engine is not new_engine:
+        old_engine.dispose()
+    return new_engine
+
+
+# Startup connection: the saved options file when present, otherwise the
+# original SQLite file. An unusable options file falls back to the SQLite
+# default instead of blocking the startup path (the same defensive posture
+# the settings service takes for app preferences).
+try:
+    _startup_url = database_config.build_url(database_config.load_options())
+except Exception:  # noqa: BLE001 - startup must not crash on bad options
+    _startup_url = f"sqlite:///{DATABASE_PATH.as_posix()}"
+
+engine = configure_engine(_startup_url)
 
 
 def initialize_database() -> None:
-    """Create missing tables, then apply safe legacy-schema migrations."""
+    """Create missing tables, then apply safe legacy-schema migrations.
+
+    Legacy migrations (khewat rebuild, valuation/client column backfills) were
+    written against SQLite and use SQLite-only statements such as
+    ``PRAGMA table_info`` and SQLite ``ALTER TABLE`` forms. When the app runs
+    on PostgreSQL, MySQL, SQL Server, or a custom backend, a fresh database
+    gets the full current schema from ``create_all`` directly, so the SQLite
+    migrations are deliberately skipped — running them would either fail on
+    dialect-specific SQL or perform no useful work.
+    """
     # Import every model so create_all can register new module tables. It only
     # creates missing tables; it does not drop or rewrite existing user data.
     import core.models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
-    migrate_client_columns()
-    migrate_valuation_columns()
-    migrate_khewat_schema()
+    # Only apply the historical SQLite migrations on the SQLite dialect; they
+    # use PRAGMA and SQLite ALTER TABLE forms (see their bodies below).
+    if engine.dialect.name == "sqlite":
+        migrate_client_columns()
+        migrate_valuation_columns()
+        migrate_khewat_schema()
 
 
 def _backup_sqlite_database(database_engine) -> Path | None:

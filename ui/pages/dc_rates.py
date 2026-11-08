@@ -9,7 +9,7 @@ from typing import Awaitable, Callable
 
 import flet as ft
 
-from core.models import DC_RATE_UNITS
+from core.models import DC_RATE_UNIT_LABELS as UNIT_LABELS, DC_RATE_UNITS
 from services.dc_rate_duplicate_service import (
     EXACT_ALL_REFERENCE,
     MATCH_FIELD_GROUPS,
@@ -64,25 +64,19 @@ from services.dc_rate_service import (
     update_duplicate_rule_profile,
 )
 from services.settings_service import (
+    format_card_body_lines,
     format_card_heading,
     get_cadastral_storage_mode,
     get_card_appearance,
+    get_card_fields,
     get_default_file_location,
     set_cadastral_storage_mode,
 )
 from ui.file_location import ask_location_choice, write_export_to_folder
 
 
-UNIT_LABELS = {
-    "per_square_foot": "Per square foot",
-    "per_square_yard": "Per square yard",
-    "per_square_meter": "Per square meter",
-    "per_marla": "Per marla",
-    "per_kanal": "Per kanal",
-    "per_acre": "Per acre",
-    "per_kila": "Per kila",
-    "per_plot": "Per plot",
-}
+# (canonical unit labels moved to core.models.DC_RATE_UNIT_LABELS and are
+# imported as UNIT_LABELS in the header above)
 
 DUPLICATE_SCOPE_LABELS = {
     "rural_dc": "Rural DC",
@@ -182,6 +176,9 @@ def build_dc_rates_page(
     visible_location_limit = 500
     location_picker_truncated = False
     card_appearance = get_card_appearance()
+    # Card content (chosen body fields + formula lines) is loaded once per
+    # page build so every card renders the same saved configuration.
+    card_fields_config = get_card_fields()
 
     async def export_with_location(
         *,
@@ -665,7 +662,16 @@ def build_dc_rates_page(
         page.show_dialog(dialog)
 
     def add_rate_card(record: dict):
-        """Render one queried schedule record as a readable, responsive card."""
+        """Render one queried schedule record as a readable, responsive card.
+
+        The body comes from the saved card content when the user has chosen
+        fields or formula lines in Settings (see the CARD_FIELDS_KEY docs in
+        ``services.settings_service``): selected fields render as one wrapped
+        ``Label: value`` line followed by one line per formula. With no custom
+        content configured, the built-in layout below keeps its established
+        look (classification/rate/floor, location summary, cadastral +
+        unit, published year + source).
+        """
         rate_text = (
             f"{record['rate_value']} {UNIT_LABELS.get(record['rate_unit'], record['rate_unit'])}"
         )
@@ -683,6 +689,9 @@ def build_dc_rates_page(
         heading_text = format_card_heading(
             card_appearance["heading_template"], record
         )
+        # Custom lines come from the saved card-content configuration; an
+        # empty configuration (the default) keeps the built-in layout.
+        custom_lines = format_card_body_lines(record, card_fields_config)
 
         def open_details(_):
             show_rate_details(record["id"])
@@ -690,6 +699,45 @@ def build_dc_rates_page(
         def open_edit(_):
             open_rate_dialog(rate_id=record["id"])
 
+        if custom_lines:
+            body_texts = [
+                ft.Text(
+                    line,
+                    size=12 if index else None,
+                    color=card_appearance["body_color"],
+                    selectable=True,
+                )
+                for index, line in enumerate(custom_lines)
+            ]
+        else:
+            body_texts = [
+                ft.Text(
+                    f"{record.get('classification') or record['property_type']}"
+                    f" · Rate: {rate_text}"
+                    f" · Floor: {record.get('floor') or 'All / not specified'}",
+                    color=card_appearance["body_color"],
+                    selectable=True,
+                ),
+                ft.Text(
+                    location_summary,
+                    size=12,
+                    color=card_appearance["body_color"],
+                    selectable=True,
+                ),
+                ft.Text(
+                    f"{_cadastral_label(record)} | Unit: "
+                    f"{UNIT_LABELS.get(record['rate_unit'], record['rate_unit']).removeprefix('Per ').title()}",
+                    size=12,
+                    color=card_appearance["body_color"],
+                    selectable=True,
+                ),
+                ft.Text(
+                    f"Published year: {published_year} · Source: {record.get('source_reference') or 'Not supplied'}",
+                    size=12,
+                    color=card_appearance["body_color"],
+                    selectable=True,
+                ),
+            ]
         rate_list.controls.append(
             ft.Container(
                 padding=14,
@@ -713,32 +761,7 @@ def build_dc_rates_page(
                             spacing=10,
                             run_spacing=4,
                         ),
-                        ft.Text(
-                            f"{record.get('classification') or record['property_type']}"
-                            f" · Rate: {rate_text}"
-                            f" · Floor: {record.get('floor') or 'All / not specified'}",
-                            color=card_appearance["body_color"],
-                            selectable=True,
-                        ),
-                        ft.Text(
-                            location_summary,
-                            size=12,
-                            color=card_appearance["body_color"],
-                            selectable=True,
-                        ),
-                        ft.Text(
-                            f"{_cadastral_label(record)} | Unit: "
-                            f"{UNIT_LABELS.get(record['rate_unit'], record['rate_unit']).removeprefix('Per ').title()}",
-                            size=12,
-                            color=card_appearance["body_color"],
-                            selectable=True,
-                        ),
-                        ft.Text(
-                            f"Published year: {published_year} · Source: {record.get('source_reference') or 'Not supplied'}",
-                            size=12,
-                            color=card_appearance["body_color"],
-                            selectable=True,
-                        ),
+                        *body_texts,
                         ft.Row(
                             controls=[
                                 ft.TextButton("Details", on_click=open_details),

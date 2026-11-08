@@ -2013,7 +2013,34 @@ def list_cadastral_values(
     square_no: str = "", kila_no: str = "", schedule_type: str | None = None,
     land_type: str | None = None, location_id: int | None = None, limit: int = 50,
 ) -> list[str]:
-    """Return cadastral tokens from schedules matching the selected parent context."""
+    """Return cadastral tokens from schedules matching the selected parent context.
+
+    Suggestions feed the square/kila/khasra auto-complete boxes. Values stored
+    as token lists or compact ranges (``1-5,6``) are expanded, so the caller
+    receives single usable tokens like ``3`` even though the record itself
+    stores ``1-5,6``.
+
+    With a Mauza filter the query takes the same *locations-first* plan as the
+    summary above: matched location ids are resolved once through the Mauza
+    covering index and the fabricated ``IN`` condition keeps the rate join
+    probes on ``ix_dc_valuation_rates_location_id`` instead of scanning the
+    whole rate table per keystroke.
+
+    Args:
+        field_name: ``square_no``, ``kila_no``, or ``khasra_no`` — the column
+            whose tokens are suggested.
+        search: optional substring the suggestions must start with.
+        qanoongoi / mauza / land_type: location-side parent filters.
+        square_no / kila_no: optional sibling cadastral filters; rows must
+            satisfy *whole-token* matches of these values (rows whose sibling
+            range straddles the request are intentionally excluded here and
+            handled by the rate listing).
+        schedule_type: restrict to one schedule when given.
+        location_id: restrict suggestions to one saved location.
+        limit: maximum number of suggestions returned (at least 1).
+    Raises:
+        DCRateServiceError: for an unsupported field_name.
+    """
     fields = {
         "square_no": PropertyLocation.square_no,
         "kila_no": PropertyLocation.kila_no,
@@ -2022,6 +2049,9 @@ def list_cadastral_values(
     field = fields.get(field_name)
     if field is None:
         raise DCRateServiceError("Choose Square no., Kila no., or Khasra no. for suggestions.")
+    # Sibling cadastral filters (e.g. a Kila chosen before asking for squares)
+    # must hold for every returned stored value. Their whole-token validation
+    # happens in Python below; the query stays a broad superset.
     active_contexts = [
         (filter_name, fields[filter_name], term)
         for filter_name, term in (("square_no", square_no), ("kila_no", kila_no))
@@ -2034,11 +2064,29 @@ def list_cadastral_values(
         .distinct()
     )
     if mauza.strip():
-        statement = statement.where(PropertyLocation.mauza.ilike(f"%{mauza.strip()}%"))
+        # Locations-first plan: resolve matching location ids once, then let
+        # the rate join probe only those locations (comment detail in
+        # _mauza_location_match).
+        matched_ids = _resolve_mauza_location_ids(
+            mauza, qanoongoi=qanoongoi, land_type=land_type,
+        )
+        statement = statement.where(
+            DCValuationRate.location_id.in_(
+                _match_locations_expression(
+                    matched_ids,
+                    _mauza_location_match(
+                        mauza, qanoongoi=qanoongoi, land_type=land_type,
+                    ),
+                )
+            )
+        )
     statement = _apply_qanoongoi_filter(statement, qanoongoi)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
-    if land_type in {"rural", "urban"}:
+    if land_type in {"rural", "urban"} and not mauza.strip():
+        # With a Mauza filter the land type is already applied inside the
+        # matched-location query; a second (joined) condition would be
+        # duplicated work and, without ids hoisted, the same scan.
         statement = statement.where(PropertyLocation.land_type == land_type)
     if location_id is not None:
         statement = statement.where(DCValuationRate.location_id == location_id)
@@ -2048,6 +2096,8 @@ def list_cadastral_values(
     requested_tokens = [set(_reference_values(term)) for _, _, term in active_contexts]
     with SessionLocal() as session:
         stored_rows = session.execute(statement).all()
+    # Expand stored lists/ranges into single tokens and drop candidates whose
+    # sibling cadastral values do not contain the requested tokens exactly.
     tokens = set()
     for stored_row in stored_rows:
         context_values = stored_row[1:]
@@ -2059,7 +2109,73 @@ def list_cadastral_values(
         for token in _reference_values(stored_row[0]):
             if not query or token.casefold().startswith(query.casefold()):
                 tokens.add(token)
+    # Numeric tokens sort numerically, everything else case-insensitively.
     return sorted(tokens, key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else token.casefold()))[:max(1, limit)]
+
+
+def _mauza_location_match(
+    mauza: str, *, qanoongoi: str = "", land_type: str | None = None,
+):
+    """Build ``SELECT id FROM property_locations`` matching the Mauza filter.
+
+    This is the *locations-first* plan that the Mauza-filtered queries below
+    share. All location-side filters (Mauza substring, Qanoongoi, rural/urban
+    type) are applied inside this location-only query so the remaining
+    rate-side statements can reach matched locations through the covering
+    ``ix_property_locations_mauza`` index instead of scanning the whole
+    ``dc_valuation_rates`` table in a join across every location.
+
+    Args:
+        mauza: Mauza substring filter; the caller must ensure it is non-blank.
+        qanoongoi: optional Qanoongoi substring filter (case-insensitive).
+        land_type: optional ``"rural"``/``"urban"`` location type filter.
+    Returns:
+        A SQLAlchemy select of ``PropertyLocation.id`` rows.
+    """
+    statement = select(PropertyLocation.id).where(
+        PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
+    )
+    statement = _apply_qanoongoi_filter(statement, qanoongoi)
+    if land_type in {"rural", "urban"}:
+        statement = statement.where(PropertyLocation.land_type == land_type)
+    return statement
+
+
+def _match_locations_expression(
+    ids: list[int], location_match,
+):
+    """Wrap matched location ids for a rate-side ``IN`` condition.
+
+    Small match sets become literal id lists: the repeated statements around a
+    Mauza-filtered page (summary aggregate, cadastral extremes, first/last
+    rate) then reuse SQLite's variable cache instead of re-running the
+    location scan once per statement. Very large match sets keep the embedded
+    subquery so the SQL stays within the backend's bind-parameter limit; the
+    subquery form re-runs the location scan per statement but stays correct
+    and bounded by the mauza covering index.
+    """
+    if len(ids) <= _LOCATION_ID_LITERAL_LIMIT:
+        return ids
+    return location_match
+
+
+def _resolve_mauza_location_ids(
+    mauza: str, *, qanoongoi: str = "", land_type: str | None = None,
+) -> list[int]:
+    """Resolve the Mauza filter to location ids with one locations-first query.
+
+    Resolving the ids once per user action matters because the Mauza scan is
+    the dominant cost (~40+ ms on a 295k-row table); downstream statements
+    become trivial lookups. Callers that embed the ids in more than one
+    statement must respect :data:`_LOCATION_ID_LITERAL_LIMIT` via
+    :func:`_match_locations_expression`; this helper only reads the ids.
+    """
+    with SessionLocal() as session:
+        return list(session.scalars(
+            _mauza_location_match(
+                mauza, qanoongoi=qanoongoi, land_type=land_type,
+            )
+        ).all())
 
 
 # Matched location id sets up to this size are passed as literal SQL ids so the
@@ -2078,34 +2194,30 @@ def summarize_dc_rates(
     *, mauza: str = "", qanoongoi: str = "", rate_unit: str | None = None,
     schedule_type: str | None = None, land_type: str | None = None,
 ) -> dict[str, Any]:
-    """Aggregate rate extremes for the selected location filters."""
+    """Aggregate rate extremes for the selected location filters.
+
+    With a Mauza filter the query takes the *locations-first* plan: matching
+    location ids are resolved once (see :func:`_mauza_location_match`) and the
+    rate aggregate, cadastral extraction, and the lowest/highest lookup all
+    reuse that id set, so the dominant cost is one indexed Mauza scan instead
+    of four rate-table joins per statement.
+    """
     statement: Any = None
     if mauza.strip():
-        # Locations-first plan: match the Mauza (and other location-side
-        # filters) inside a location-id subquery so SQLite probes rates
-        # through their location index instead of scanning the rate table
-        # joined against every location.
-        location_match = select(PropertyLocation.id).where(
-            PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
+        # Locations-first plan (comment detail in _mauza_location_match): the
+        # id set is resolved once here; each statement below then filters the
+        # rate table by location id, which SQLite serves from the
+        # ix_dc_valuation_rates_location_id index.
+        location_match = _mauza_location_match(
+            mauza, qanoongoi=qanoongoi, land_type=land_type,
         )
-        location_match = _apply_qanoongoi_filter(location_match, qanoongoi)
-        if land_type in {"rural", "urban"}:
-            location_match = location_match.where(
-                PropertyLocation.land_type == land_type
-            )
         with SessionLocal() as session:
             matched_ids = session.scalars(location_match).all()
-        if len(matched_ids) <= _LOCATION_ID_LITERAL_LIMIT:
-            # A small Mauza match set is resolved once here; the aggregate,
-            # cadastral, and extreme-value statements below then reuse plain id
-            # lists instead of re-running the location scan each time.
-            statement = select(DCValuationRate.id).where(
-                DCValuationRate.location_id.in_(matched_ids)
+        statement = select(DCValuationRate.id).where(
+            DCValuationRate.location_id.in_(
+                _match_locations_expression(matched_ids, location_match)
             )
-        else:
-            statement = select(DCValuationRate.id).where(
-                DCValuationRate.location_id.in_(location_match)
-            )
+        )
     else:
         statement = (
             select(DCValuationRate.id)

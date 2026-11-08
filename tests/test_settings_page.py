@@ -115,6 +115,75 @@ def test_settings_page_preview_updates_and_save_persists(settings_database):
     )
 
 
+def test_card_content_editor_saves_fields_and_formula_lines(settings_database):
+    page = FakePage()
+    root = settings.build_settings_page(page)
+    checkboxes = [
+        control
+        for control in _walk(root)
+        if isinstance(control, ft.Checkbox)
+        and control.label in ("Rate (value + unit)", "Classification")
+    ]
+    assert checkboxes, "Card content checkboxes must be offered"
+    for checkbox in checkboxes:
+        checkbox.value = True
+
+    _button(root, "Add formula line").on_click(None)
+    _field(root, "Formula 1 label").value = "Per 1 kanal"
+    _field(root, "Expression").value = "{rate_value} * 20"
+    _field(root, "Expression").on_change(None)
+
+    _button(root, "Save content").on_click(None)
+
+    saved = settings_service.get_card_fields()
+    assert saved["fields"] == [
+        "classification", "rate",
+    ] or saved["fields"] == ["rate", "classification"]
+    assert saved["formulas"] == [
+        {"label": "Per 1 kanal", "expression": "{rate_value} * 20"}
+    ]
+    # The preview must show a computed result, not just the stored formula.
+    assert any(
+        "Per 1 kanal: 250005" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_card_content_editor_blocks_invalid_formula(settings_database):
+    root = settings.build_settings_page(FakePage())
+    _button(root, "Add formula line").on_click(None)
+    _field(root, "Formula 1 label").value = "Broken"
+    _field(root, "Expression").value = "{rate_value} ** 2"
+
+    _button(root, "Save content").on_click(None)
+
+    assert settings_service.get_card_fields() == {"fields": [], "formulas": []}
+    assert any(
+        "Card formula problem" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_card_content_reset_restores_built_in_layout(settings_database):
+    settings_service.set_card_fields({
+        "fields": ["rate"],
+        "formulas": [{"label": "X", "expression": "{rate_value}"}],
+    })
+    root = settings.build_settings_page(FakePage())
+
+    _button(root, "Reset to built-in layout").on_click(None)
+
+    assert settings_service.get_card_fields() == {"fields": [], "formulas": []}
+    assert all(
+        checkbox.value is False
+        for checkbox in _walk(root) if isinstance(checkbox, ft.Checkbox)
+    )
+    assert any(
+        "built-in layout" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
 def test_settings_page_validation_blocks_invalid_colour(settings_database):
     root = settings.build_settings_page(FakePage())
     background = _field(root, "Card background")

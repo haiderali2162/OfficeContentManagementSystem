@@ -262,6 +262,19 @@ DC_RATE_UNITS = (
     "per_plot",
 )
 
+# Human-readable unit labels shared by UI pages and services so card and
+# report text never drift away from the stored unit keys.
+DC_RATE_UNIT_LABELS = {
+    "per_square_foot": "Per square foot",
+    "per_square_yard": "Per square yard",
+    "per_square_meter": "Per square meter",
+    "per_marla": "Per marla",
+    "per_kanal": "Per kanal",
+    "per_acre": "Per acre",
+    "per_kila": "Per kila",
+    "per_plot": "Per plot",
+}
+
 
 class PropertyLocation(Base):
     """Structured administrative and locality details for valuation rates."""

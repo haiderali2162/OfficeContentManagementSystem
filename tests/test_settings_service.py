@@ -1,5 +1,7 @@
 """Rate-card appearance settings tests on temporary SQLite databases."""
 
+from datetime import date
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -153,6 +155,152 @@ def test_cadastral_storage_preference_round_trip(settings_database):
 
     with pytest.raises(settings_service.SettingsError):
         settings_service.set_cadastral_storage_mode("columns")
+
+
+# --------------------------------------------------------------------------
+# Card content (chosen fields + formula lines) tests.
+# --------------------------------------------------------------------------
+
+def _content_record(**overrides):
+    """A DC-rate record shaped like the service output for card rendering."""
+    record = {
+        "classification": "Commercial",
+        "property_type": "Commercial",
+        "rate_value": "12500",
+        "rate_unit": "per_marla",
+        "floor": None,
+        "land_type": "urban",
+        "district": "Test District",
+        "tehsil": "Test Tehsil",
+        "qanoongoi": "Qanoongoi A",
+        "mauza": "Test Mauza",
+        "committee_town": "",
+        "revenue_circle": None,
+        "property_area": None,
+        "hadbast_number": "123",
+        "serial_no": "45",
+        "square_no": "12",
+        "kila_no": "7",
+        "khasra_no": "30",
+        "published_year": 2025,
+        "source_reference": "Sample schedule",
+        "effective_from": date(2025, 7, 1),
+        "effective_to": None,
+        "verification_status": "unverified",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_card_fields_default_keeps_the_built_in_layout(settings_database):
+    saved = settings_service.set_card_fields({"fields": [], "formulas": []})
+    assert saved == {"fields": [], "formulas": []}
+    # An empty configuration must not render any custom line; the page falls
+    # back to its built-in card body.
+    assert settings_service.format_card_body_lines(
+        _content_record(), saved
+    ) == []
+
+
+def test_card_fields_round_trip_orders_and_deduplicates(settings_database):
+    saved = settings_service.set_card_fields({
+        "fields": ["rate", "classification", "rate", "mauza"],
+        "formulas": [
+            {"label": " Per 1 kanal ", "expression": " {rate_value} * 20 "},
+        ],
+    })
+    assert saved["fields"] == ["rate", "classification", "mauza"]
+    # Labels are trimmed; the placeholder braces stay in the stored text so
+    # the editor shows the user's own wording back.
+    assert saved["formulas"] == [
+        {"label": "Per 1 kanal", "expression": "{rate_value} * 20"},
+    ]
+    assert settings_service.get_card_fields() == saved
+
+
+def test_card_fields_reject_unknown_field(settings_database):
+    with pytest.raises(settings_service.SettingsError) as excinfo:
+        settings_service.set_card_fields({"fields": ["wazirabad"]})
+    assert "Unsupported card field 'wazirabad'" in str(excinfo.value)
+
+
+def test_card_body_lines_render_chosen_fields_and_formulas(settings_database):
+    saved = settings_service.set_card_fields({
+        "fields": ["classification", "rate", "mauza", "kila_no"],
+        "formulas": [
+            {"label": "Per 1 kanal", "expression": "{rate_value} * 20"},
+            {"label": "Per kanal (site 1)", "expression": "{rate_value} * 20"},
+        ],
+    })
+    lines = settings_service.format_card_body_lines(
+        _content_record(), saved
+    )
+    assert lines[0] == (
+        "Classification: Commercial · Rate (value + unit): "
+        "12500 Per marla · Mauza: Test Mauza · Kila no.: 7"
+    )
+    assert lines[1] == "Per 1 kanal: 250000"
+    # Empty record values are skipped instead of printing "Label:".
+    blank = settings_service.format_card_body_lines(
+        _content_record(mauza="", kila_no=""), saved
+    )
+    assert "Mauza" not in blank[0] and "Kila no." not in blank[0]
+
+
+def test_card_formula_results_use_four_decimal_places_only(settings_database):
+    saved = settings_service.set_card_fields({
+        "formulas": [
+            {"label": "Per sq ft", "expression": "{rate_value} / 272.25"},
+        ],
+    })
+    lines = settings_service.format_card_body_lines(
+        _content_record(rate_value="12500"), saved
+    )
+    assert lines[0] == "Per sq ft: 45.9137"
+
+
+def test_card_formula_rejects_unsafe_or_invalid_expressions(settings_database):
+    for bad in (
+        "{rate_value} *",
+        "1/0",
+        "{profile_source}",
+        "__import__('os')",
+        "'a' * 2",
+        "{1, 2} * 3",
+        "{rate_value} ** 2",
+        "{rate_value} > 100",
+    ):
+        with pytest.raises(settings_service.SettingsError) as excinfo:
+            settings_service.set_card_fields({
+                "formulas": [{"label": "X", "expression": bad}],
+            })
+        assert "Card formula problem" in str(excinfo.value)
+
+
+def test_card_lines_render_uncomputable_formulas_as_a_placeholder(settings_database):
+    saved = settings_service.set_card_fields({
+        "formulas": [{"label": "Per 1 kanal", "expression": "{rate_value} * 20"}],
+    })
+    # A legacy record without a numeric rate value renders a visible gap.
+    lines = settings_service.format_card_body_lines(
+        _content_record(rate_value=""), saved
+    )
+    assert lines == ["Per 1 kanal: —"]
+
+
+def test_invalid_stored_card_fields_fall_back_to_defaults(settings_database):
+    from services.settings_service import set_setting
+    set_setting(settings_service.CARD_FIELDS_KEY, {"fields": ["not-a-field"]})
+    assert settings_service.get_card_fields() == {"fields": [], "formulas": []}
+
+
+def test_reset_card_fields_restores_the_built_in_layout(settings_database):
+    settings_service.set_card_fields({
+        "fields": ["rate"],
+        "formulas": [{"label": "X", "expression": "{rate_value}"}],
+    })
+    settings_service.reset_card_fields()
+    assert settings_service.get_card_fields() == {"fields": [], "formulas": []}
 
 
 def test_default_file_location_round_trip_and_clear(settings_database, tmp_path):

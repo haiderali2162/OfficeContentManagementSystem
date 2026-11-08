@@ -1102,6 +1102,55 @@ def test_rate_card_uses_saved_heading_and_colours(monkeypatch):
     assert card.content.controls[1].color == "#1E293B"
 
 
+def test_rate_card_renders_chosen_fields_and_formula_lines(monkeypatch):
+    """Custom card content replaces the built-in body with chosen fields."""
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    record = _rate_record()
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [record])
+    monkeypatch.setattr(dc_rates, "get_card_fields", lambda: {
+        "fields": ["classification", "rate", "mauza"],
+        "formulas": [{"label": "Per 1 kanal", "expression": "{rate_value} * 20"}],
+    })
+
+    root = dc_rates.build_dc_rates_page(FakePage())
+    card = _first_rate_card(root)
+    body_values = [
+        control.value for control in card.content.controls
+        if isinstance(control, ft.Text)
+    ]
+
+    assert body_values[0] == (
+        "Classification: Residential · Rate (value + unit): "
+        "1 Per marla · Mauza: Test Mauza"
+    )
+    assert body_values[1] == "Per 1 kanal: 20"
+    # The built-in body lines are replaced, not duplicated.
+    assert not any("Floor:" in value for value in body_values if value)
+    assert not any("Published year:" in value for value in body_values if value)
+
+
+def test_rate_card_formula_without_a_number_shows_a_visible_gap(monkeypatch):
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    # A record without a numeric rate value cannot compute the formula.
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [{
+        **_rate_record(), "rate_value": "",
+    }])
+    # A formula alone switches the card to custom rendering, because the
+    # formula needs somewhere to render even with no chosen fields.
+    monkeypatch.setattr(dc_rates, "get_card_fields", lambda: {
+        "fields": [],
+        "formulas": [{"label": "Per 1 kanal", "expression": "{rate_value} * 20"}],
+    })
+
+    root = dc_rates.build_dc_rates_page(FakePage())
+    card = _first_rate_card(root)
+    body_values = [
+        control.value for control in card.content.controls
+        if isinstance(control, ft.Text)
+    ]
+    assert "Per 1 kanal: —" in body_values
+
+
 def _stub_empty_rate_page(monkeypatch):
     monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
