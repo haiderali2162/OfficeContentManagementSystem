@@ -333,3 +333,33 @@ def test_hybrid_snapshot_keeps_threshold_and_missing_base_skips():
     )
     assert missing["charges"] == []
     assert "Missing calculation base" in missing["skipped_rules"][0]["reason"]
+
+def test_delete_tax_fee_rule_removes_row_and_reports_missing(tax_database):
+    """Removal is explicit; saved estimates outside this table are untouched."""
+    rule_id = tax_service.create_tax_fee_rule(**_rule())
+    tax_service.delete_tax_fee_rule(rule_id)
+    assert tax_service.list_tax_fee_rules() == []
+
+    # Deleting an unknown id stays an explicit, catchable error.
+    with pytest.raises(tax_service.TaxRuleError) as raised:
+        tax_service.delete_tax_fee_rule(rule_id)
+    assert "was not found" in str(raised.value)
+
+
+def test_deleted_rule_id_survives_as_estimate_snapshot(tax_database):
+    """estimate_charges references tax_fee_rules so removal keeps snapshots."""
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(tax_database)
+    foreign_keys = inspector.get_foreign_keys("valuation_estimate_charges")
+    rule_links = [key for key in foreign_keys if key["referred_table"] == "tax_fee_rules"]
+    assert rule_links, "estimate charges must reference tax fee rules"
+    # The database is instructed to keep the charge row after a rule removal;
+    # the snapshot column then explains what the original rule said.
+    create_sql = None
+    with tax_database.connect() as connection:
+        create_sql = connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='valuation_estimate_charges'"
+        ).scalar()
+    assert "ON DELETE SET NULL" in str(create_sql).upper()

@@ -918,6 +918,7 @@ def export_import_issues(issues: list[dict[str, Any]]) -> bytes:
 LOCATION_HINT_FIELDS = (
     "district",
     "tehsil",
+    "qanoongoi",
     "mauza",
     "committee_town",
     "revenue_circle",
@@ -930,6 +931,10 @@ LOCATION_HINT_FIELDS = (
 _LOCATION_HINT_COLUMNS = {
     "district": PropertyLocation.district,
     "tehsil": PropertyLocation.tehsil,
+    # Qanoongoi is a rural schedule hierarchy level (district → tehsil →
+    # qanoongoi → patwar circle → mauza); the calculator accepts it as an
+    # optional filter next to the Mauza inputs.
+    "qanoongoi": PropertyLocation.qanoongoi,
     "mauza": PropertyLocation.mauza,
     "committee_town": PropertyLocation.committee_town,
     "revenue_circle": PropertyLocation.revenue_circle,

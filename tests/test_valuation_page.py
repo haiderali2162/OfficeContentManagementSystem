@@ -2,6 +2,7 @@
 
 import asyncio
 import flet as ft
+import json
 import pytest
 from types import SimpleNamespace
 
@@ -413,4 +414,192 @@ def test_empty_rule_list_collapses_and_grows_only_for_saved_rules(monkeypatch):
     assert rules_list.visible is True
     assert rules_list.height == 112
     assert empty_state.visible is False
+
+
+def _rule_record(**overrides):
+    record = {
+        "id": 1, "name": "Example stamp", "jurisdiction": "Punjab",
+        "category": "stamp", "calculation_method": "percentage",
+        "rate_value": "2", "fixed_amount": None, "percentage_threshold": None,
+        "rate_unit": None, "currency_code": "PKR",
+        "effective_from": valuation.date.today(), "effective_to": None,
+        "verification_status": "unverified",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_remove_rule_asks_first_then_calls_delete_service(monkeypatch):
+    """List rows offer Remove behind a confirmation; nothing is deleted silently."""
+    rule_rows = [_rule_record()]
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: list(rule_rows))
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    deleted = []
+    monkeypatch.setattr(valuation, "delete_tax_fee_rule", lambda rule_id: deleted.append(rule_id))
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    page = LoadingPage()
+    root = valuation.build_valuation_page(page)
+    controls = list(walk_controls(root))
+    remove_button = next(control for control in controls
+                         if isinstance(control, ft.TextButton) and control.content == "Remove")
+    assert not deleted, "nothing may be removed before confirmation"
+
+    remove_button.on_click(SimpleNamespace(control=remove_button))
+    assert len(page.dialogs) == 1
+    confirm = page.dialogs[0]
+    assert isinstance(confirm, ft.AlertDialog)
+    assert confirm.title.value == "Remove tax/fee rule?"
+    assert not deleted, "the confirmation dialog alone must not delete anything"
+
+    # The Confirm action is the last dialog action ("Remove").
+    confirm.actions[-1].on_click(None)
+    assert deleted == [1]
+    texts = [control.value for control in walk_controls(root)
+             if isinstance(control, ft.Text)]
+    assert any("Removed rule 'Example stamp'" in value for value in texts)
+
+
+def test_236_preset_asks_filer_case_and_saves_condition(monkeypatch):
+    """236C/236K first choose the filer case, then fill name/category/condition."""
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    saved = []
+    monkeypatch.setattr(valuation, "create_tax_fee_rule", lambda **values: saved.append(values) or 42)
+
+    page = FakePage()
+    root = valuation.build_valuation_page(page)
+    rule_page = root.controls[2].content.controls[1].controls[1]
+    add_rule = rule_page.controls[2].controls[0]
+    add_rule.on_click(SimpleNamespace(control=add_rule))
+    form_dialog = page.dialogs[0]
+
+    preset_236c = next(control for control in walk_controls(form_dialog.content)
+                       if isinstance(control, ft.OutlinedButton) and control.content == "236C")
+    preset_236c.on_click(SimpleNamespace(control=preset_236c))
+    # The chooser is a separate dialog above the rule form.
+    chooser = page.dialogs[-1]
+    assert chooser.title.value == "236C case rate"
+    case_buttons = [control for control in walk_controls(chooser.content)
+                    if isinstance(control, ft.OutlinedButton)]
+    assert [button.content for button in case_buttons] == [
+        "Active filer", "In-active case", "Late filer (previous years)",
+    ]
+
+    case_buttons[1].on_click(SimpleNamespace(control=case_buttons[1]))
+    assert page.popped_dialogs == 1  # Only the chooser closed.
+
+    form_controls = list(walk_controls(form_dialog.content))
+    fields = {control.label: control for control in form_controls if isinstance(control, ft.TextField)}
+    assert fields["Rule name"].value == "236C (In-active case)"
+    assert fields["Category"].value == "236c"
+
+    save_button = form_dialog.actions[-1]
+    save_button.on_click(SimpleNamespace(control=save_button))
+    conditions = json.loads(saved[0]["eligibility_conditions_json"])
+    assert conditions["when"]["seller_filer_status"] == "non_ATL"
+    assert conditions["payer"] == "seller"
+    assert saved[0]["name"] == "236C (In-active case)"
+    assert saved[0]["category"] == "236c"
+
+    # Also verify 236K (buyer tax)
+    preset_236k = next(control for control in walk_controls(form_dialog.content)
+                       if isinstance(control, ft.OutlinedButton) and control.content == "236K")
+    preset_236k.on_click(SimpleNamespace(control=preset_236k))
+    chooser_236k = page.dialogs[-1]
+    assert chooser_236k.title.value == "236K case rate"
+    k_buttons = [control for control in walk_controls(chooser_236k.content)
+                 if isinstance(control, ft.OutlinedButton)]
+    k_buttons[0].on_click(SimpleNamespace(control=k_buttons[0]))
+    assert fields["Rule name"].value == "236K (Active filer)"
+    assert fields["Category"].value == "236k"
+    save_button.on_click(SimpleNamespace(control=save_button))
+    k_conditions = json.loads(saved[1]["eligibility_conditions_json"])
+    assert k_conditions["when"]["buyer_filer_status"] == "ATL"
+    assert k_conditions["payer"] == "buyer"
+
+
+def test_remove_rule_from_edit_dialog_asks_first_then_deletes(monkeypatch):
+    """Edit dialog has a Remove rule action which confirms and deletes."""
+    rule_rows = [_rule_record()]
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: list(rule_rows))
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    deleted = []
+    monkeypatch.setattr(valuation, "delete_tax_fee_rule", lambda rule_id: deleted.append(rule_id))
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    page = LoadingPage()
+    root = valuation.build_valuation_page(page)
+    controls = list(walk_controls(root))
+    edit_button = next(control for control in controls
+                       if isinstance(control, ft.TextButton) and control.content == "Edit")
+    edit_button.on_click(SimpleNamespace(control=edit_button))
+    edit_dialog = page.dialogs[0]
+    remove_action = next(control for control in edit_dialog.actions
+                         if isinstance(control, ft.TextButton) and control.content == "Remove rule")
+    remove_action.on_click(SimpleNamespace(control=remove_action))
+    confirm_dialog = page.dialogs[-1]
+    assert confirm_dialog.title.value == "Remove tax/fee rule?"
+    confirm_dialog.actions[-1].on_click(None)
+    assert deleted == [1]
+
+
+def test_calculate_tab_offers_qanoongoi_location_filter(monkeypatch):
+    """Rural schedule search accepts an optional Qanoongoi level like the DC page."""
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    qanoongoi = next(control for control in controls
+                     if isinstance(control, ft.AutoComplete) and control.data == "qanoongoi")
+    district = next(control for control in controls
+                    if isinstance(control, ft.AutoComplete) and control.data == "district")
+    assert district.visible is True  # Rural default: qanoongoi sits beside district.
+
+    # Typing a Qanoongoi value feeds the same schedule-backed hint pipeline
+    # used by the other location fields, so both filters narrow Mauza results.
+    hint_calls = []
+
+    def current_hints(**kwargs):
+        hint_calls.append(kwargs)
+        return {"qanoongoi": ["Qanoongoi A"], "mauza": ["Chak 1"]}
+
+    monkeypatch.setattr(valuation, "list_location_hint_values", current_hints)
+    qanoongoi.value = "Qanoong"
+    qanoongoi.on_change(SimpleNamespace(control=qanoongoi))
+    assert hint_calls[-1]["context"]["qanoongoi"] == "Qanoong"
+    assert "qanoongoi" in hint_calls[-1]["fields"]
+    assert {suggestion.value for suggestion in qanoongoi.suggestions} == {"Qanoongoi A"}
+
 

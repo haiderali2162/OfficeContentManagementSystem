@@ -32,6 +32,7 @@ from services.tax_service import (
     TaxRuleError,
     calculate_charges,
     create_tax_fee_rule,
+    delete_tax_fee_rule,
     list_tax_fee_rules,
     update_tax_fee_rule,
 )
@@ -85,7 +86,31 @@ def build_valuation_page(
 
     status = ft.Text("", size=12, color="#475569")
     form_error = ft.Text("", color="#B91C1C", size=12)
-    result_panel = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO, expand=True)
+    result_panel = ft.Column(
+        spacing=8,
+        scroll=ft.ScrollMode.AUTO,
+        expand=True,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
+
+    def _reset_result_panel():
+        result_panel.controls.clear()
+        result_panel.controls.append(
+            ft.Container(
+                ft.Column([
+                    ft.Icon(ft.Icons.CALCULATE_OUTLINED, size=40, color="#94A3B8"),
+                    ft.Text("Calculation Breakdown", size=15, weight=ft.FontWeight.BOLD, color="#334155"),
+                    ft.Text(
+                        "Enter location, area (K-M-F), and DC/FBR rate above, then click 'Calculate estimate'.",
+                        size=13, color="#64748B", text_align=ft.TextAlign.CENTER,
+                    ),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
+                alignment=ft.Alignment.CENTER,
+                padding=ft.Padding(16, 28, 16, 28),
+            )
+        )
+
+    _reset_result_panel()
     history_list = ft.ListView(height=230, spacing=6)
     last_calculation: dict[str, Any] = {}
     file_picker = next(
@@ -156,6 +181,7 @@ def build_valuation_page(
     ], spacing=16))
     district = ft.AutoComplete(data="district", width=220, suggestions_max_height=220)
     tehsil = ft.AutoComplete(data="tehsil", width=220, suggestions_max_height=220)
+    qanoongoi = ft.AutoComplete(data="qanoongoi", width=220, suggestions_max_height=220)
     mauza = ft.AutoComplete(data="mauza", width=240, suggestions_max_height=220)
     town = ft.AutoComplete(data="town", width=220, suggestions_max_height=220)
     revenue_circle = ft.AutoComplete(data="revenue_circle", width=220, suggestions_max_height=220)
@@ -228,7 +254,8 @@ def build_valuation_page(
 
     def _active_location_fields():
         if property_profile.value == "rural":
-            return [("district", district), ("tehsil", tehsil), ("mauza", mauza),
+            return [("district", district), ("tehsil", tehsil),
+                    ("qanoongoi", qanoongoi), ("mauza", mauza),
                     ("locality", schedule_location), ("square_no", square_no), ("kila_no", kila_no)]
         return [("tehsil", tehsil), ("committee_town", town), ("revenue_circle", revenue_circle),
                 ("property_area", property_area), ("locality", schedule_location),
@@ -383,7 +410,7 @@ def build_valuation_page(
         schedule_location_hint_refresh()
         refresh_rate_matches()
 
-    for control in (district, tehsil, mauza, town, revenue_circle, property_area,
+    for control in (district, tehsil, qanoongoi, mauza, town, revenue_circle, property_area,
                     schedule_location, square_no, kila_no, khasra_no, classification,
                     dc_rate_unit, fbr_rate_unit, location_match):
         control.on_change = refresh_location_state
@@ -834,28 +861,52 @@ def build_valuation_page(
     # query schedule-backed locations, the rate selectors expose the matching
     # DC/FBR rows, and Calculate passes those exact rows to the valuation
     # service rather than asking it to guess from a partial address.
-    rural_fields_panel = ft.ResponsiveRow([
-        ft.Container(ft.Column([ft.Text("District"), district]), col={"xs": 12, "md": 4}),
-        ft.Container(ft.Column([ft.Text("Mauza (type to search schedules)"), mauza]), col={"xs": 12, "md": 4}),
-    ], run_spacing=5)
-    urban_fields_panel = ft.ResponsiveRow([
-        ft.Container(ft.Column([ft.Text("Town / city"), town]), col={"xs": 12, "md": 4}),
-        ft.Container(ft.Column([ft.Text("Revenue circle"), revenue_circle]), col={"xs": 12, "md": 4}),
-        ft.Container(ft.Column([ft.Text("Property area"), property_area]), col={"xs": 12, "md": 4}),
-        ft.Container(classification, col={"xs": 12, "md": 4}),
-        ft.Container(khasra_no, col={"xs": 12, "md": 4}),
-    ], run_spacing=5, visible=False)
-    advanced_inputs = ft.ResponsiveRow([
-        ft.Container(client, col={"xs": 12, "md": 6}),
-        ft.Container(registry_written_value, col={"xs": 12, "md": 6}),
-        ft.Container(constructed, col={"xs": 12, "md": 4}),
-        ft.Container(building_material_value, col={"xs": 12, "md": 4}),
-        ft.Container(transaction_type, col={"xs": 12, "md": 4}),
-        ft.Container(buyer_filer, col={"xs": 12, "md": 4}),
-        ft.Container(seller_filer, col={"xs": 12, "md": 4}),
-        ft.Container(floor, col={"xs": 12, "md": 4}),
-        ft.Container(marla_setting, col={"xs": 12, "md": 4}),
-    ], run_spacing=5, visible=False)
+    district_col = ft.Container(ft.Column([ft.Text("District", size=12, weight=ft.FontWeight.W_500), district], spacing=4), col={"xs": 12, "sm": 6, "md": 3})
+    tehsil_col = ft.Container(ft.Column([ft.Text("Tehsil", size=12, weight=ft.FontWeight.W_500), tehsil], spacing=4), col={"xs": 12, "sm": 6, "md": 3})
+    qanoongoi_col = ft.Container(ft.Column([ft.Text("Qanoongoi (optional)", size=12, weight=ft.FontWeight.W_500), qanoongoi], spacing=4), col={"xs": 12, "sm": 6, "md": 3})
+    mauza_col = ft.Container(ft.Column([ft.Text("Mauza (type to search schedules)", size=12, weight=ft.FontWeight.W_500), mauza], spacing=4), col={"xs": 12, "sm": 6, "md": 3})
+    town_col = ft.Container(ft.Column([ft.Text("Town / city", size=12, weight=ft.FontWeight.W_500), town], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
+    revenue_circle_col = ft.Container(ft.Column([ft.Text("Revenue circle", size=12, weight=ft.FontWeight.W_500), revenue_circle], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
+    property_area_col = ft.Container(ft.Column([ft.Text("Property area", size=12, weight=ft.FontWeight.W_500), property_area], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
+    classification_col = ft.Container(ft.Column([ft.Text("Classification", size=12, weight=ft.FontWeight.W_500), classification], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
+    locality_col = ft.Container(ft.Column([ft.Text("Locality / sub-area (optional)", size=12, weight=ft.FontWeight.W_500), schedule_location], spacing=4), col={"xs": 12, "sm": 6, "md": 6})
+    square_col = ft.Container(ft.Column([ft.Text("Square no. (optional)", size=12, weight=ft.FontWeight.W_500), square_no], spacing=4), col={"xs": 6, "sm": 3, "md": 3})
+    kila_col = ft.Container(ft.Column([ft.Text("Kila no. (optional)", size=12, weight=ft.FontWeight.W_500), kila_no], spacing=4), col={"xs": 6, "sm": 3, "md": 3})
+    khasra_col = ft.Container(ft.Column([ft.Text("Khasra no. (optional)", size=12, weight=ft.FontWeight.W_500), khasra_no], spacing=4), col={"xs": 6, "sm": 3, "md": 3}, visible=False)
+
+    location_fields_row = ft.ResponsiveRow([
+        district_col,
+        tehsil_col,
+        qanoongoi_col,
+        mauza_col,
+        town_col,
+        revenue_circle_col,
+        property_area_col,
+        classification_col,
+        locality_col,
+        square_col,
+        kila_col,
+        khasra_col,
+    ], run_spacing=8)
+
+    advanced_inputs = ft.Container(
+        ft.ResponsiveRow([
+            ft.Container(client, col={"xs": 12, "md": 6}),
+            ft.Container(registry_written_value, col={"xs": 12, "md": 6}),
+            ft.Container(constructed, col={"xs": 12, "md": 4}),
+            ft.Container(building_material_value, col={"xs": 12, "md": 4}),
+            ft.Container(transaction_type, col={"xs": 12, "md": 4}),
+            ft.Container(buyer_filer, col={"xs": 12, "md": 4}),
+            ft.Container(seller_filer, col={"xs": 12, "md": 4}),
+            ft.Container(floor, col={"xs": 12, "md": 4}),
+            ft.Container(marla_setting, col={"xs": 12, "md": 4}),
+        ], run_spacing=8),
+        padding=12,
+        bgcolor="#F8FAFC",
+        border=ft.Border.all(1, "#E2E8F0"),
+        border_radius=8,
+        visible=False,
+    )
     advanced_button = ft.TextButton("Show advanced calculation fields")
 
     def toggle_advanced_inputs(_=None):
@@ -865,8 +916,23 @@ def build_valuation_page(
 
     def switch_property_profile(_=None):
         is_rural = property_profile.value == "rural"
-        rural_fields_panel.visible = is_rural
-        urban_fields_panel.visible = not is_rural
+        district_col.visible = is_rural
+        qanoongoi_col.visible = is_rural
+        mauza_col.visible = is_rural
+        town_col.visible = not is_rural
+        revenue_circle_col.visible = not is_rural
+        property_area_col.visible = not is_rural
+        classification_col.visible = not is_rural
+        khasra_col.visible = not is_rural
+        if is_rural:
+            locality_col.col = {"xs": 12, "sm": 6, "md": 6}
+            square_col.col = {"xs": 6, "sm": 3, "md": 3}
+            kila_col.col = {"xs": 6, "sm": 3, "md": 3}
+        else:
+            locality_col.col = {"xs": 12, "sm": 6, "md": 3}
+            square_col.col = {"xs": 4, "sm": 2, "md": 2}
+            kila_col.col = {"xs": 4, "sm": 2, "md": 2}
+            khasra_col.col = {"xs": 4, "sm": 2, "md": 2}
         fbr_rate_choice.visible = not is_rural
         fbr_rate_unit.visible = not is_rural
         refresh_rate_matches()
@@ -875,35 +941,61 @@ def build_valuation_page(
     property_profile.on_change = switch_property_profile
     switch_property_profile()
 
+    result_card = ft.Container(
+        result_panel,
+        padding=16,
+        bgcolor="#FFFFFF",
+        border=ft.Border.all(1, "#E2E8F0"),
+        border_radius=10,
+        height=360,
+        alignment=ft.Alignment.TOP_LEFT,
+        expand=False,
+    )
+
     estimate_form = ft.Column([
         ft.Text("Estimate inputs", size=19, weight=ft.FontWeight.BOLD),
         ft.Text("Choose Rural or Urban, enter schedule-backed location details, then enter the area in K-M-F format. Matching DC and FBR rates are fetched from saved schedules.", size=12, color="#9A3412"),
-        ft.ResponsiveRow([
-            ft.Container(property_profile, col=12),
-            ft.Container(rural_fields_panel, col=12),
-            ft.Container(urban_fields_panel, col=12),
-            ft.Container(ft.ResponsiveRow([
-                ft.Container(ft.Column([ft.Text("Tehsil"), tehsil]), col={"xs": 12, "md": 4}),
-                ft.Container(ft.Column([ft.Text("Location"), schedule_location]), col={"xs": 12, "md": 4}),
-                ft.Container(ft.Column([ft.Text("Square no. (optional)"), square_no], spacing=3), col={"xs": 12, "md": 2}),
-                ft.Container(ft.Column([ft.Text("Kila no. (optional)"), kila_no], spacing=3), col={"xs": 12, "md": 2}),
-            ], run_spacing=5), col=12),
-            ft.Container(location_match, col={"xs": 12, "md": 6}),
-            ft.Container(dc_rate_unit, col={"xs": 12, "md": 4}),
-            ft.Container(dc_rate_choice, col={"xs": 12, "md": 8}),
-            ft.Container(fbr_rate_unit, col={"xs": 12, "md": 4}),
-            ft.Container(fbr_rate_choice, col={"xs": 12, "md": 8}),
-            ft.Container(rate_match_status, col=12),
-            ft.Container(area_value, col={"xs": 12, "md": 4}),
-        ], run_spacing=5),
+        ft.Container(
+            ft.Column([
+                ft.Text("Property Profile & Location", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
+                property_profile,
+                location_fields_row,
+                location_match,
+                rate_match_status,
+            ], spacing=10),
+            padding=14,
+            bgcolor="#FFFFFF",
+            border=ft.Border.all(1, "#E2E8F0"),
+            border_radius=10,
+        ),
+        ft.Container(
+            ft.Column([
+                ft.Text("Valuation Rates & Area", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
+                ft.ResponsiveRow([
+                    ft.Container(dc_rate_unit, col={"xs": 12, "md": 4}),
+                    ft.Container(dc_rate_choice, col={"xs": 12, "md": 8}),
+                    ft.Container(fbr_rate_unit, col={"xs": 12, "md": 4}),
+                    ft.Container(fbr_rate_choice, col={"xs": 12, "md": 8}),
+                    ft.Container(area_value, col={"xs": 12, "md": 4}),
+                ], run_spacing=8),
+            ], spacing=10),
+            padding=14,
+            bgcolor="#FFFFFF",
+            border=ft.Border.all(1, "#E2E8F0"),
+            border_radius=10,
+        ),
         advanced_button,
         advanced_inputs,
         custom_field_controls,
-        ft.Row([ft.Button("Calculate estimate", on_click=calculate),
-                ft.OutlinedButton("Save estimate", on_click=save_current)], wrap=True, spacing=8),
+        ft.Row([
+            ft.Button("Calculate estimate", on_click=calculate),
+            ft.OutlinedButton("Save estimate", on_click=save_current),
+        ], wrap=True, spacing=8),
         form_error,
         status,
-        ft.Container(result_panel, padding=14, bgcolor="#FFFFFF", border=ft.Border.all(1, "#E2E8F0"), border_radius=10, height=360),
+        ft.ResponsiveRow([
+            ft.Container(result_card, col=12),
+        ]),
         ft.Text("Saved estimate history", size=18, weight=ft.FontWeight.BOLD),
         ft.Row([
             ft.OutlinedButton("Export history CSV", on_click=history_export_handler("csv")),
@@ -911,7 +1003,7 @@ def build_valuation_page(
             ft.OutlinedButton("Export history PDF", on_click=history_export_handler("pdf")),
         ], wrap=True, spacing=6),
         history_list,
-    ], spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
+    ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
     history_list.controls.append(ft.Text("Loading estimate history…", color="#64748B"))
     formula_list.controls.append(ft.Text("Loading saved formulas…", color="#64748B"))
 
@@ -963,6 +1055,7 @@ def build_valuation_page(
                                    ft.Text(details, size=12),
                                    ft.Text(f"{amount} · {rule['effective_from']} to {rule.get('effective_to') or 'open'}", size=12)],
                                   spacing=3, expand=True),
+                        ft.TextButton("Remove", on_click=lambda _, record=rule: confirm_remove_rule(record)),
                         ft.TextButton("Edit", on_click=lambda _, record=rule: open_rule_dialog(record)),
                     ]),
                 ))
@@ -978,6 +1071,56 @@ def build_valuation_page(
             rules_empty_state.color = "#B91C1C"
             rules_empty_state.visible = True
         page.update()
+
+    def confirm_remove_rule(record: dict[str, Any]) -> None:
+        """Ask before deleting one rule; nothing is removed without approval.
+
+        Saved estimates keep their own charge snapshots, so removal affects
+        only future calculations.
+        """
+
+        def do_remove(_=None):
+            try:
+                delete_tax_fee_rule(int(record["id"]))
+                page.pop_dialog()
+                refresh_rules()
+                rule_status.value = (
+                    f"Removed rule '{record['name']}'. Saved estimates keep "
+                    "their recorded charges."
+                )
+                notification = ft.SnackBar(
+                    content=ft.Text("Tax / fee rule removed."), duration=2500
+                )
+            except TaxRuleError as exc:
+                page.pop_dialog()
+                rule_status.value = str(exc)
+                rule_status.color = "#B91C1C"
+            except Exception as exc:
+                page.pop_dialog()
+                rule_status.value = f"Could not remove rule: {exc}"
+                rule_status.color = "#B91C1C"
+            page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Remove tax/fee rule?"),
+            content=ft.Column([
+                ft.Text(
+                    f"Remove rule '{record['name']}'? It will stop applying to "
+                    "future calculations.",
+                    size=13,
+                ),
+                ft.Text(
+                    "Saved estimates are not changed; each one keeps the charge "
+                    "snapshot recorded when it was saved.",
+                    size=12, color="#64748B",
+                ),
+            ], tight=True, spacing=8),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                ft.TextButton("Remove", on_click=do_remove),
+            ],
+        ))
 
     def open_rule_dialog(existing: dict[str, Any] | None = None):
         existing = existing or {}
@@ -1039,6 +1182,63 @@ def build_valuation_page(
             rate.value = ""
             conditions.value = '{"base":"dc_value","payer":"buyer"}'
             update_rule_method()
+
+        def open_236_case_chooser(section: str):
+            """Preset for 236C/236K, which apply different rates by filer case.
+
+            Section 236C applies to the seller (transferor), while Section 236K
+            applies to the buyer (purchaser). Each section has its own rate for
+            active filers (ATL), in-active cases, and late filers (previous years).
+            """
+            cases = [
+                ("Active filer", "ATL"),
+                ("In-active case", "non_ATL"),
+                ("Late filer (previous years)", "late_filer"),
+            ]
+            payer = "seller" if section == "236C" else "buyer"
+            filer_key = "seller_filer_status" if section == "236C" else "buyer_filer_status"
+            role_label = "seller (transferor)" if section == "236C" else "buyer (purchaser)"
+
+            def choose(case_label, status, _=None):
+                rule_name.value = f"{section} ({case_label})"
+                category.value = "236c" if section == "236C" else "236k"
+                method.value = "percentage"
+                rate.value = ""
+                conditions.value = json.dumps({
+                    "base": "dc_value",
+                    "payer": payer,
+                    "when": {filer_key: status},
+                }, sort_keys=True)
+                update_rule_method()
+                page.pop_dialog()
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text(f"{section} case rate"),
+                content=ft.Column([
+                    ft.Text(
+                        f"Section {section} applies a different rate in each filer "
+                        f"case. For {section}, the tax is payable by the {role_label}.\n"
+                        f"Choose the filer case below, then enter the applicable rate "
+                        f"from your verified source.",
+                        size=12, color="#475569",
+                    ),
+                    ft.Row([
+                        ft.OutlinedButton(
+                            label,
+                            on_click=lambda _, c=label, s=status: choose(c, s),
+                        )
+                        for label, status in cases
+                    ], wrap=True),
+                    ft.Text(
+                        "Late filer (previous years) usually needs an "
+                        "effective date range covering the earlier years; set "
+                        "it after saving via Edit.",
+                        size=12, color="#475569",
+                    ),
+                ], tight=True, spacing=10),
+                actions=[ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog())],
+            ))
 
         def use_custom_preset(_=None):
             """Preset for a fee the user names themselves.
@@ -1131,13 +1331,13 @@ def build_valuation_page(
             modal=True,
             title=ft.Text("Edit tax/fee rule" if existing.get("id") else "Add tax/fee rule"),
             content=ft.Column([
-                ft.Text("Start with a common rule type. Enter the applicable percentage or amount from your verified source.", size=12, color="#475569"),
+                ft.Text("Start with a common rule type. Enter the applicable percentage or amount from your verified source. 236C and 236K first ask for the filer case (active, non-active, or late filer) because each case has its own rate.", size=12, color="#475569"),
                 ft.Row([
                     ft.OutlinedButton("Stamp fee", on_click=lambda _: use_percentage_preset("Stamp fee")),
                     ft.OutlinedButton("Mutation fee", on_click=lambda _: use_percentage_preset("Mutation fee")),
                     ft.OutlinedButton("Committee fee", on_click=lambda _: use_percentage_preset("Committee fee")),
-                    ft.OutlinedButton("236C", on_click=lambda _: use_percentage_preset("236C")),
-                    ft.OutlinedButton("236K", on_click=lambda _: use_percentage_preset("236K")),
+                    ft.OutlinedButton("236C", on_click=lambda _: open_236_case_chooser("236C")),
+                    ft.OutlinedButton("236K", on_click=lambda _: open_236_case_chooser("236K")),
                     ft.OutlinedButton("PLRA fee", on_click=lambda _: use_percentage_preset("PLRA fee")),
                     ft.OutlinedButton("Commission fee", on_click=lambda _: use_percentage_preset("Commission fee")),
                     ft.OutlinedButton("Custom fee", on_click=use_custom_preset),
@@ -1157,7 +1357,17 @@ def build_valuation_page(
                 ], run_spacing=8),
                 conditions, error,
             ], tight=True, scroll=ft.ScrollMode.AUTO, width=720, height=540, spacing=10),
-            actions=[ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()), ft.Button("Save rule", on_click=save)],
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                *([
+                    ft.TextButton(
+                        "Remove rule",
+                        style=ft.ButtonStyle(color="#B91C1C"),
+                        on_click=lambda _, record=existing: [page.pop_dialog(), confirm_remove_rule(record)],
+                    )
+                ] if existing.get("id") else []),
+                ft.Button("Save rule", on_click=save),
+            ],
         ))
 
     rule_page = ft.Column([

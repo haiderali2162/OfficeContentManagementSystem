@@ -254,6 +254,20 @@ def update_tax_fee_rule(*, rule_id: int, **values: Any) -> None:
             rule.verified_at = None
 
 
+def delete_tax_fee_rule(rule_id: int) -> None:
+    """Remove one rule explicitly.
+
+    Saved estimates are unaffected: their `estimate_charges` rows keep the
+    rule snapshot and the rule foreign key is deleted with the database's
+    `ondelete=SET NULL` behaviour, so history stays intact.
+    """
+    with SessionLocal.begin() as session:
+        rule = session.get(TaxFeeRule, rule_id)
+        if rule is None:
+            raise TaxRuleError("Tax or fee rule was not found.")
+        session.delete(rule)
+
+
 def list_tax_fee_rules(*, jurisdiction: str | None = None, category: str | None = None) -> list[dict[str, Any]]:
     statement = select(TaxFeeRule).order_by(TaxFeeRule.jurisdiction, TaxFeeRule.category, TaxFeeRule.name, TaxFeeRule.id)
     if jurisdiction:
