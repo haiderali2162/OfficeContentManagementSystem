@@ -35,6 +35,21 @@ def _isolate_cadastral_settings(monkeypatch):
     return saved_modes
 
 
+@pytest.fixture(autouse=True)
+def _builtin_card_layout(monkeypatch):
+    """Pin the built-in card layout for every rate-card test.
+
+    ``get_card_fields`` usually reads the developer's *live* saved settings;
+    the new card-content editor means a configured card body would replace
+    the built-in text this module asserts on. Tests that exercise custom
+    card content patch ``get_card_fields`` again with their own
+    ``monkeypatch.setattr``, which simply overrides this default.
+    """
+    monkeypatch.setattr(
+        dc_rates, "get_card_fields", lambda: {"fields": [], "formulas": []}
+    )
+
+
 def _mock_duplicate_profiles(monkeypatch):
     monkeypatch.setattr(
         dc_rates,

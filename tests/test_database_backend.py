@@ -427,12 +427,15 @@ def test_initialize_database_runs_migrations_on_sqlite_dialects(monkeypatch):
         core_database, "migrate_valuation_columns", lambda: calls.append("valuation")
     )
     monkeypatch.setattr(
+        core_database, "migrate_tax_rule_columns", lambda: calls.append("tax_rules")
+    )
+    monkeypatch.setattr(
         core_database, "migrate_khewat_schema", lambda: calls.append("khewat")
     )
 
     core_database.initialize_database()
 
-    assert calls == ["create_all", "client", "valuation", "khewat"]
+    assert calls == ["create_all", "client", "valuation", "tax_rules", "khewat"]
 
 
 # --------------------------------------------------------------------------
@@ -643,3 +646,101 @@ def test_database_section_clear_password_checkbox_removes_it(
     # The saved, encrypted token was replaced by an empty string in the
     # options handed to the connection test (and therefore to the file).
     assert capture_test_connection.captured["password"] == ""
+
+
+def _checkbox(root, label: str) -> ft.Checkbox:
+    for control in _walk(root):
+        if isinstance(control, ft.Checkbox) and control.label == label:
+            return control
+    raise AssertionError(f"Checkbox '{label}' not found on the settings page.")
+
+
+def test_copy_data_checkbox_is_visible_only_for_sqlite(options_home):
+    """The copy offer only makes sense for whole-file SQLite switches."""
+    root = settings_page.build_database_section(_FakePage(), None)
+    copy_box = _checkbox(root, "Copy current application data to this SQLite file")
+    assert copy_box.visible is True
+
+    dropdown = next(
+        control for control in _walk(root) if isinstance(control, ft.Dropdown)
+    )
+    dropdown.value = "postgres"
+    dropdown.on_change(None)
+    assert copy_box.visible is False
+
+    dropdown.value = "sqlite"
+    dropdown.on_change(None)
+    assert copy_box.visible is True
+
+
+def test_ticked_copy_checkbox_copies_before_connecting(
+    isolated_database_section, options_home, monkeypatch
+):
+    """Copy → test → save → reconfigure → initialize, in that order."""
+    recorded = isolated_database_section
+    copy_calls = []
+
+    def fake_copy(source_engine, target_path):
+        copy_calls.append((source_engine, target_path))
+        return {
+            "source": "source.sqlite3", "target": str(target_path),
+            "tables": 5, "status": "copied",
+        }
+
+    monkeypatch.setattr(settings_page, "copy_sqlite_database", fake_copy)
+    root = settings_page.build_database_section(_FakePage(), None)
+    target = options_home.parent / "copied.sqlite3"
+    _field(root, "SQLite database file").value = str(target)
+    _checkbox(
+        root, "Copy current application data to this SQLite file"
+    ).value = True
+
+    import asyncio
+
+    asyncio.run(_button(root, "Save & connect").on_click(None))
+
+    # The copy ran once, aimed at the chosen file, from the live engine.
+    from core import database as core_database
+
+    assert copy_calls == [(core_database.engine, str(target))]
+    # The rest of the normal switching chain still happened.
+    assert recorded["reconfigured"] == f"sqlite:///{target.as_posix()}"
+    assert recorded["initialized"] == 1
+    texts = " ".join(
+        control.value or "" for control in _walk(root)
+        if isinstance(control, ft.Text)
+    )
+    assert "data from the previous database was copied" in texts
+
+
+def test_failed_copy_blocks_the_whole_switch(
+    isolated_database_section, options_home, monkeypatch
+):
+    """A copy failure must not save options or swap the engine."""
+    recorded = isolated_database_section
+    from core.database_copy import DatabaseCopyError
+
+    def failing_copy(source_engine, target_path):
+        raise DatabaseCopyError("The folder does not exist, so the file cannot be created.")
+
+    monkeypatch.setattr(settings_page, "copy_sqlite_database", failing_copy)
+    root = settings_page.build_database_section(_FakePage(), None)
+    _field(root, "SQLite database file").value = str(
+        options_home.parent / "blocked.sqlite3"
+    )
+    _checkbox(
+        root, "Copy current application data to this SQLite file"
+    ).value = True
+
+    import asyncio
+
+    asyncio.run(_button(root, "Save & connect").on_click(None))
+
+    assert recorded["reconfigured"] is None
+    assert recorded["initialized"] == 0
+    assert not (options_home / "database.json").exists()
+    texts = " ".join(
+        control.value or "" for control in _walk(root)
+        if isinstance(control, ft.Text)
+    )
+    assert "Data was not copied" in texts

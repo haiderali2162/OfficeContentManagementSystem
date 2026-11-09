@@ -1,9 +1,9 @@
 """Application settings pages.
 
-This module exposes the DC/FBR rate-card appearance editor and the default
-import/export folder preference. Values are persisted through
-``services.settings_service`` and applied the next time the relevant page is
-built.
+The settings page is organised into collapsible categories (Flet
+``ExpansionTile``): Database, Files, Rate-card appearance, and Rate-card
+content. Values are persisted through ``services.settings_service`` and,
+for the database choice, ``core.database_config``.
 
 It also exposes the database-connection editor (``build_database_section``):
 the user can point the running application at SQLite, PostgreSQL,
@@ -20,7 +20,12 @@ import asyncio
 import flet as ft
 
 from core import database_config
+# Imported as a module (not ``from ... import engine``) so the live engine is
+# looked up at save time: ``reconfigure_database`` reassigns the module's
+# ``engine`` global after a successful switch to another database.
+from core import database as core_database
 from core.database import initialize_database, reconfigure_database
+from core.database_copy import DatabaseCopyError, copy_sqlite_database
 from services.settings_service import (
     CARD_BODY_FIELD_LABELS,
     CARD_COLOR_FIELDS,
@@ -75,10 +80,59 @@ def _placeholder_help() -> ft.Text:
     )
 
 
-def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Container:
-    """Build the database-connection editor card.
+def _category_tile(
+    title: str,
+    summary: str,
+    content: ft.Control,
+    *,
+    expanded: bool = False,
+) -> ft.Control:
+    """Wrap one settings category in a collapsible white tile.
 
-    The card lets the user choose a backend and its connection details,
+    Categories use Flet's :class:`ft.ExpansionTile`: a collapsed tile shows
+    only the title and one-line summary, keeping the page short, and the
+    category's controls appear only while it is expanded. The white card
+    styling (rounded corners, hairline border) matches the rest of the app
+    so one settings page looks consistent.
+
+    Args:
+        title: short category name shown in the tile header.
+        summary: one-line explanation shown under the title when collapsed.
+        content: the section's controls (usually a tight ``ft.Column``).
+        expanded: initial state; used to open the most-used category.
+    """
+    return ft.Container(
+        bgcolor="#FFFFFF",
+        border=ft.Border.all(1, "#E2E8F0"),
+        border_radius=12,
+        content=ft.ExpansionTile(
+            title=ft.Text(
+                title, size=16, weight=ft.FontWeight.BOLD, color="#172033"
+            ),
+            subtitle=ft.Text(summary, size=12, color="#64748B"),
+            controls=[content],
+            expanded=expanded,
+            # Padding around the clickable header and, once expanded, the
+            # section body. Horizontal alignment START keeps inner controls
+            # anchored to the left instead of Flet's default centering.
+            tile_padding=ft.Padding(left=16, right=16, top=6, bottom=10),
+            controls_padding=10,
+            expanded_cross_axis_alignment=ft.CrossAxisAlignment.START,
+            bgcolor="#FFFFFF",
+            collapsed_bgcolor="#FFFFFF",
+            icon_color="#334155",
+            collapsed_icon_color="#334155",
+        ),
+    )
+
+
+def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Column:
+    """Build the database-connection editor controls.
+
+    Returns the section body as a plain :class:`ft.Column`; the caller wraps
+    it in a collapsible category tile (see :func:`_category_tile`).
+
+    The section lets the user choose a backend and its connection details,
     verify them with "Test connection", and then apply them live with
     "Save & connect". Details:
 
@@ -87,12 +141,18 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
       because the file decides *which* database to open.
     * An empty password field keeps the previously saved (encrypted)
       password, so editing other fields cannot silently drop it.
+    * **Opt-in data copy (SQLite only):** when the "Copy current application
+      data" checkbox is ticked, the currently connected SQLite database is
+      snapshotted to the chosen file *before* the switch (see
+      :mod:`core.database_copy`). That file's previous content, if any, is
+      replaced. Unticked, nothing is copied and the new database starts
+      empty.
     * "Save & connect" tests first, saves only on success, swaps the live
       engine via :func:`core.database.reconfigure_database`, and creates the
       application tables in an empty database via
       :func:`core.database.initialize_database`.
-    * **No data is copied** between databases; the previous database stays
-      untouched and the card states this next to the buttons.
+    * A failed copy blocks the switch: the previous database stays connected
+      and the saved configuration is untouched.
     """
     saved_options = database_config.load_options()
 
@@ -110,30 +170,33 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
 
     # One editor control per stored option. The password field starts empty
     # on purpose: stored passwords are encrypted on disk and are never shown.
+    # Server fields get explicit widths instead of expand=True: expand inside
+    # a wrapped row is a known Flet layout hazard (fields can grow to huge
+    # empty areas), so widths keep the row layout predictable on any OS.
     db_fields: dict[str, ft.TextField] = {
         "host": ft.TextField(
-            label="Server host", value=saved_options["host"], expand=True
+            label="Server host", value=saved_options["host"], width=280
         ),
         "port": ft.TextField(
-            label="Port (optional)", value=saved_options["port"], width=160
+            label="Port (optional)", value=saved_options["port"], width=130
         ),
         "database": ft.TextField(
-            label="Database name", value=saved_options["database"], expand=True
+            label="Database name", value=saved_options["database"], width=280
         ),
         "user": ft.TextField(
-            label="User", value=saved_options["user"], expand=True
+            label="User", value=saved_options["user"], width=280
         ),
         "password": ft.TextField(
             label="Password (leave empty to keep the saved one)",
             value="",
             password=True,
             can_reveal_password=True,
-            expand=True,
+            width=300,
         ),
         "driver": ft.TextField(
             label="Driver (leave empty to auto-select)",
             value=saved_options["driver"],
-            expand=True,
+            width=380,
         ),
         "url": ft.TextField(
             label="SQLAlchemy URL",
@@ -148,6 +211,13 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
         label="Clear the saved password",
         value=False,
     )
+    # Opt-in whole-file copy for SQLite switches. Unticked (the default) the
+    # new database starts empty; ticked, the currently connected SQLite file
+    # is snapshotted into the chosen file before the app switches to it.
+    copy_data_checkbox = ft.Checkbox(
+        label="Copy current application data to this SQLite file",
+        value=False,
+    )
     path_field = ft.TextField(
         label="SQLite database file",
         value=saved_options["path"],
@@ -155,7 +225,7 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
     )
     odbc_driver_field = ft.TextField(
         label="ODBC driver (for example: ODBC Driver 17 for SQL Server)",
-        expand=True,
+        width=460,
     )
 
     async def browse_database_file(_=None):
@@ -218,6 +288,10 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
         backend = backend_dropdown.value
         path_row.visible = backend == "sqlite"
         sqlite_hint.visible = backend == "sqlite"
+        # Only whole-file SQLite switches can copy data; server databases
+        # start empty and the checkbox would be a misleading promise.
+        copy_data_checkbox.visible = backend == "sqlite"
+        copy_hint.visible = backend == "sqlite"
         url_row.visible = backend == "custom"
         server_fields.visible = backend in ("postgres", "mysql", "mssql")
         driver_row.visible = backend in ("postgres", "mysql", "mssql")
@@ -241,15 +315,26 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
         page.update()
 
     async def save_and_connect_click(_=None) -> None:
-        """Validate, save, and switch the running app to the new database."""
+        """Validate, optionally copy data, save, and switch the database."""
         options = collect_options()
         db_status.value = "Validating and connecting…"
         db_status.color = "#475569"
         page.update()
+        # Tick the checkbox (SQLite only) and the currently connected SQLite
+        # database is snapshotted into the chosen file before the switch.
+        copy_requested = (
+            options["backend"] == "sqlite" and copy_data_checkbox.value
+        )
         try:
             # Validation first so obviously incomplete data never reaches a
             # connect attempt or the saved configuration file.
             database_config.normalize_options(options)
+            if copy_requested:
+                db_status.value = "Copying current data to the new file…"
+                page.update()
+                await asyncio.to_thread(
+                    copy_sqlite_database, core_database.engine, options["path"]
+                )
             ok, message = await asyncio.to_thread(
                 database_config.test_connection, options
             )
@@ -260,6 +345,9 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
             await asyncio.to_thread(reconfigure_database, url)
             # Create any application tables missing from an empty database.
             await asyncio.to_thread(initialize_database)
+        except DatabaseCopyError as exc:
+            db_status.value = f"Data was not copied: {exc}"
+            db_status.color = "#B91C1C"
         except database_config.DatabaseConfigError as exc:
             db_status.value = f"Not connected: {exc}"
             db_status.color = "#B91C1C"
@@ -267,11 +355,18 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
             db_status.value = f"Could not switch to the new database: {exc}"
             db_status.color = "#B91C1C"
         else:
-            db_status.value = (
-                f"Connected to {database_config.backend_label(options['backend'])}. "
-                "The previous database was not changed and no data was copied "
-                "between databases."
-            )
+            if copy_requested:
+                db_status.value = (
+                    f"Connected to {database_config.backend_label(options['backend'])}. "
+                    "The data from the previous database was copied into "
+                    "this file before the switch."
+                )
+            else:
+                db_status.value = (
+                    f"Connected to {database_config.backend_label(options['backend'])}. "
+                    "The previous database was not changed and no data was "
+                    "copied between databases."
+                )
             db_status.color = "#15803D"
         page.update()
 
@@ -326,56 +421,62 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
         spacing=8,
         wrap=True,
     )
+    # Explains exactly what the copy checkbox does and warns that a chosen
+    # file's previous content is replaced. Visible only for SQLite together
+    # with the checkbox itself.
+    copy_hint = ft.Text(
+        "Ticked: the currently connected SQLite database is fully copied "
+        "into the chosen file before the switch; anything already in that "
+        "file is replaced. Unticked: the new file starts empty.",
+        size=11,
+        color="#92400E",
+        selectable=True,
+    )
 
-    card = ft.Container(
-        padding=18,
-        bgcolor="#FFFFFF",
-        border=ft.Border.all(1, "#E2E8F0"),
-        border_radius=12,
-        content=ft.Column(
-            controls=[
-                ft.Text("Database", size=18, weight=ft.FontWeight.BOLD),
-                ft.Text(
-                    "Choose which database the application uses. SQLite "
-                    "works out of the box; other servers need their Python "
-                    "driver installed (pip install psycopg2-binary, pymysql, "
-                    "or pyodbc). The choice is saved in data/database.json "
-                    "and works the same on Windows, macOS, and Linux.",
-                    size=12,
-                    color="#64748B",
-                ),
-                ft.Divider(height=1, color="#E2E8F0"),
-                backend_dropdown,
-                path_row,
-                sqlite_hint,
-                url_row,
-                server_fields,
-                credentials_row,
-                driver_row,
-                odbc_row,
-                ft.Text(
-                    "Saving does not copy any data: the new database must "
-                    "already hold what you need (an empty database gets the "
-                    "application tables created automatically).",
-                    size=11,
-                    color="#92400E",
-                    selectable=True,
-                ),
-                ft.Row(
-                    controls=[
-                        ft.Button("Save & connect", on_click=save_and_connect_click),
-                        ft.OutlinedButton(
-                            "Test connection", on_click=test_connection_click
-                        ),
-                    ],
-                    spacing=8,
-                    wrap=True,
-                ),
-                db_status,
-            ],
-            spacing=10,
-            tight=True,
-        ),
+    card = ft.Column(
+        controls=[
+            ft.Text(
+                "Choose which database the application uses. SQLite "
+                "works out of the box; other servers need their Python "
+                "driver installed (pip install psycopg2-binary, pymysql, "
+                "or pyodbc). The choice is saved in data/database.json "
+                "and works the same on Windows, macOS, and Linux.",
+                size=12,
+                color="#64748B",
+            ),
+            backend_dropdown,
+            path_row,
+            sqlite_hint,
+            copy_data_checkbox,
+            copy_hint,
+            url_row,
+            server_fields,
+            credentials_row,
+            driver_row,
+            odbc_row,
+            ft.Text(
+                "By default the new database starts empty (tables are "
+                "created automatically). For SQLite you can choose to copy "
+                "the current data with the checkbox above; server "
+                "databases always start empty.",
+                size=11,
+                color="#92400E",
+                selectable=True,
+            ),
+            ft.Row(
+                controls=[
+                    ft.Button("Save & connect", on_click=save_and_connect_click),
+                    ft.OutlinedButton(
+                        "Test connection", on_click=test_connection_click
+                    ),
+                ],
+                spacing=8,
+                wrap=True,
+            ),
+            db_status,
+        ],
+        spacing=10,
+        tight=True,
     )
     sync_backend_visibility(None)
     return card
@@ -399,7 +500,19 @@ def _adopted_file_picker(page: ft.Page) -> ft.FilePicker:
 
 
 def build_settings_page(page: ft.Page) -> ft.Control:
-    """Build the settings page with rate-card and file-location preferences."""
+    """Build the settings page as collapsible categories.
+
+    Categories (see :func:`_category_tile`):
+
+    * **Database** — backend choice and live connection (open by default).
+    * **Files** — the default import/export folder preference.
+    * **Rate cards — appearance** — heading template and colours.
+    * **Rate cards — shown fields and formulas** — card content editor.
+
+    Each category owns its own status messages: opening one never disturbs
+    another, and collapsed categories stay collapsed while other controls
+    repaint themselves.
+    """
     appearance = get_card_appearance()
     database_card = build_database_section(
         page, _adopted_file_picker(page)
@@ -472,53 +585,41 @@ def build_settings_page(page: ft.Page) -> ft.Control:
             location_status.color = "#15803D"
         page.update()
 
-    location_card = ft.Container(
-        padding=18,
-        bgcolor="#FFFFFF",
-        border=ft.Border.all(1, "#E2E8F0"),
-        border_radius=12,
-        content=ft.Column(
-            controls=[
-                ft.Text(
-                    "Default import / export folder",
-                    size=18,
-                    weight=ft.FontWeight.BOLD,
-                ),
-                ft.Text(
-                    "When a default folder is set, the app asks before every "
-                    "import and export whether to use it or choose another "
-                    "location. Leave it empty to always choose a location.",
-                    size=12,
-                    color="#64748B",
-                ),
-                ft.Divider(height=1, color="#E2E8F0"),
-                ft.Row(
-                    controls=[
-                        location_field,
-                        ft.OutlinedButton(
-                            "Browse folder", on_click=browse_for_folder
-                        ),
-                    ],
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                ft.Row(
-                    controls=[
-                        ft.Button(
-                            "Save folder", on_click=save_default_location
-                        ),
-                        ft.OutlinedButton(
-                            "Clear default", on_click=clear_default_location
-                        ),
-                    ],
-                    spacing=8,
-                    wrap=True,
-                ),
-                location_status,
-            ],
-            spacing=10,
-            tight=True,
-        ),
+    location_card = ft.Column(
+        controls=[
+            ft.Text(
+                "When a default folder is set, the app asks before every "
+                "import and export whether to use it or choose another "
+                "location. Leave it empty to always choose a location.",
+                size=12,
+                color="#64748B",
+            ),
+            ft.Row(
+                controls=[
+                    location_field,
+                    ft.OutlinedButton(
+                        "Browse folder", on_click=browse_for_folder
+                    ),
+                ],
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            ft.Row(
+                controls=[
+                    ft.Button(
+                        "Save folder", on_click=save_default_location
+                    ),
+                    ft.OutlinedButton(
+                        "Clear default", on_click=clear_default_location
+                    ),
+                ],
+                spacing=8,
+                wrap=True,
+            ),
+            location_status,
+        ],
+        spacing=10,
+        tight=True,
     )
 
     heading_field = ft.TextField(
@@ -640,52 +741,40 @@ def build_settings_page(page: ft.Page) -> ft.Control:
         run_spacing=8,
     )
 
-    editor_card = ft.Container(
-        padding=18,
-        bgcolor="#FFFFFF",
-        border=ft.Border.all(1, "#E2E8F0"),
-        border_radius=12,
-        content=ft.Column(
-            controls=[
-                ft.Text(
-                    "DC / FBR rate-card appearance",
-                    size=18,
-                    weight=ft.FontWeight.BOLD,
-                ),
-                ft.Text(
-                    "Choose the card heading and colours used by the DC "
-                    "Valuation Rates list. Defaults preserve the current cards.",
-                    size=12,
-                    color="#64748B",
-                ),
-                ft.Divider(height=1, color="#E2E8F0"),
-                heading_field,
-                _placeholder_help(),
-                ft.Text(
-                    "Example: {schedule} schedule · {location}",
-                    size=11,
-                    color="#64748B",
-                    selectable=True,
-                ),
-                ft.Text("Colors", size=13, weight=ft.FontWeight.BOLD),
-                colour_fields_row,
-                ft.Text("Preview", size=13, weight=ft.FontWeight.BOLD),
-                preview_card,
-                ft.Row(
-                    controls=[
-                        ft.Button("Save appearance", on_click=save),
-                        ft.OutlinedButton(
-                            "Reset to defaults", on_click=restore_defaults
-                        ),
-                    ],
-                    spacing=8,
-                    wrap=True,
-                ),
-                status_text,
-            ],
-            spacing=10,
-            tight=True,
-        ),
+    editor_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Choose the card heading and colours used by the DC "
+                "Valuation Rates list. Defaults preserve the current cards.",
+                size=12,
+                color="#64748B",
+            ),
+            heading_field,
+            _placeholder_help(),
+            ft.Text(
+                "Example: {schedule} schedule · {location}",
+                size=11,
+                color="#64748B",
+                selectable=True,
+            ),
+            ft.Text("Colors", size=13, weight=ft.FontWeight.BOLD),
+            colour_fields_row,
+            ft.Text("Preview", size=13, weight=ft.FontWeight.BOLD),
+            preview_card,
+            ft.Row(
+                controls=[
+                    ft.Button("Save appearance", on_click=save),
+                    ft.OutlinedButton(
+                        "Reset to defaults", on_click=restore_defaults
+                    ),
+                ],
+                spacing=8,
+                wrap=True,
+            ),
+            status_text,
+        ],
+        spacing=10,
+        tight=True,
     )
 
     # -------------------------------------------------------------------
@@ -890,50 +979,38 @@ def build_settings_page(page: ft.Page) -> ft.Control:
         color="#64748B",
         selectable=True,
     )
-    content_card = ft.Container(
-        padding=18,
-        bgcolor="#FFFFFF",
-        border=ft.Border.all(1, "#E2E8F0"),
-        border_radius=12,
-        content=ft.Column(
-            controls=[
-                ft.Text(
-                    "DC / FBR rate-card content",
-                    size=18,
-                    weight=ft.FontWeight.BOLD,
-                ),
-                ft.Text(
-                    "Choose what each schedule card shows. With nothing "
-                    "selected the card keeps its built-in layout. Formula "
-                    "lines calculate values from the schedule numbers, for "
-                    "example a per-kanal equivalent of a per-marla rate.",
-                    size=12,
-                    color="#64748B",
-                ),
-                ft.Divider(height=1, color="#E2E8F0"),
-                ft.Text("Shown information", size=13, weight=ft.FontWeight.BOLD),
-                field_checkboxes_row,
-                ft.Text("Formula lines", size=13, weight=ft.FontWeight.BOLD),
-                formula_help,
-                formula_editor,
-                ft.OutlinedButton("Add formula line", on_click=add_content_formula),
-                ft.Text("Preview", size=13, weight=ft.FontWeight.BOLD),
-                content_preview,
-                ft.Row(
-                    controls=[
-                        ft.Button("Save content", on_click=save_content),
-                        ft.OutlinedButton(
-                            "Reset to built-in layout", on_click=reset_content
-                        ),
-                    ],
-                    spacing=8,
-                    wrap=True,
-                ),
-                content_status,
-            ],
-            spacing=10,
-            tight=True,
-        ),
+    content_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Choose what each schedule card shows. With nothing "
+                "selected the card keeps its built-in layout. Formula "
+                "lines calculate values from the schedule numbers, for "
+                "example a per-kanal equivalent of a per-marla rate.",
+                size=12,
+                color="#64748B",
+            ),
+            ft.Text("Shown information", size=13, weight=ft.FontWeight.BOLD),
+            field_checkboxes_row,
+            ft.Text("Formula lines", size=13, weight=ft.FontWeight.BOLD),
+            formula_help,
+            formula_editor,
+            ft.OutlinedButton("Add formula line", on_click=add_content_formula),
+            ft.Text("Preview", size=13, weight=ft.FontWeight.BOLD),
+            content_preview,
+            ft.Row(
+                controls=[
+                    ft.Button("Save content", on_click=save_content),
+                    ft.OutlinedButton(
+                        "Reset to built-in layout", on_click=reset_content
+                    ),
+                ],
+                spacing=8,
+                wrap=True,
+            ),
+            content_status,
+        ],
+        spacing=10,
+        tight=True,
     )
     apply_content_to_controls(saved_content)
     update_content_preview()
@@ -942,14 +1019,37 @@ def build_settings_page(page: ft.Page) -> ft.Control:
         controls=[
             ft.Text("Settings", size=25, weight=ft.FontWeight.BOLD),
             ft.Text(
-                "Application preferences. Settings are stored in this "
-                "application's database and persist between launches.",
+                "Application preferences in collapsible categories. Open a "
+                "category, change what you need; saved preferences keep "
+                "between launches.",
                 color="#64748B",
             ),
-            database_card,
-            location_card,
-            editor_card,
-            content_card,
+            _category_tile(
+                "Database",
+                "SQLite file, PostgreSQL, MySQL, SQL Server, or a custom "
+                "URL — applied live with Save & connect.",
+                database_card,
+                # Opened by default so the newest settings area is visible.
+                expanded=True,
+            ),
+            _category_tile(
+                "Files — default import / export folder",
+                "Where exports go by default, and whether the app asks "
+                "before every import/export action.",
+                location_card,
+            ),
+            _category_tile(
+                "Rate cards — appearance",
+                "Card heading text and the colours used by the DC/FBR "
+                "rate list.",
+                editor_card,
+            ),
+            _category_tile(
+                "Rate cards — shown fields and formulas",
+                "Which schedule fields appear on each card, plus formula "
+                "lines such as a per-kanal equivalent.",
+                content_card,
+            ),
         ],
         spacing=12,
         scroll=ft.ScrollMode.AUTO,

@@ -172,6 +172,7 @@ def initialize_database() -> None:
     if engine.dialect.name == "sqlite":
         migrate_client_columns()
         migrate_valuation_columns()
+        migrate_tax_rule_columns()
         migrate_khewat_schema()
 
 
@@ -404,6 +405,37 @@ def migrate_valuation_columns(database_engine=None) -> None:
                 "CAST(strftime('%Y', effective_from) AS INTEGER) "
                 "WHERE published_year IS NULL"
             ))
+
+
+def migrate_tax_rule_columns(database_engine=None) -> None:
+    """Add the ``fixed_or_percentage`` threshold column to tax rules safely.
+
+    The hybrid calculation method stores its cut-over value in
+    ``tax_fee_rules.percentage_threshold``. SQLite's ``create_all`` cannot add
+    a column to an existing table, so startup inspects the table and performs
+    a plain additive ``ALTER TABLE`` only when the column is missing. Older
+    rows keep ``NULL`` there, which is correct: only the new method uses the
+    threshold, and the tax service enforces which methods may supply one.
+    """
+    # An optional engine argument keeps migration tests on temporary SQLite
+    # files exactly like the other column migrations above.
+    database_engine = database_engine or engine
+    tables = set(inspect(database_engine).get_table_names())
+    if "tax_fee_rules" not in tables:
+        return
+    tax_rule_additions = {
+        "percentage_threshold": "NUMERIC(18, 2)",
+    }
+    with database_engine.begin() as connection:
+        present = {
+            column["name"]
+            for column in inspect(database_engine).get_columns("tax_fee_rules")
+        }
+        for name, sql_type in tax_rule_additions.items():
+            if name not in present:
+                connection.execute(text(
+                    f'ALTER TABLE tax_fee_rules ADD COLUMN "{name}" {sql_type}'
+                ))
 
 
 def migrate_client_columns() -> None:

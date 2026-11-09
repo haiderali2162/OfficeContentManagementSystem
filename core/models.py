@@ -519,7 +519,8 @@ class TaxFeeRule(Base):
     __tablename__ = "tax_fee_rules"
     __table_args__ = (
         CheckConstraint(
-            "calculation_method IN ('percentage', 'fixed_amount', 'per_unit')",
+            "calculation_method IN ('percentage', 'fixed_amount', 'per_unit', "
+            "'fixed_or_percentage')",
             name="ck_tax_fee_calculation_method",
         ),
         CheckConstraint(
@@ -551,6 +552,10 @@ class TaxFeeRule(Base):
             "maximum_amount IS NULL OR maximum_amount >= 0",
             name="ck_tax_fee_max_non_negative",
         ),
+        CheckConstraint(
+            "percentage_threshold IS NULL OR percentage_threshold >= 0",
+            name="ck_tax_fee_threshold_non_negative",
+        ),
         Index(
             "ix_tax_fee_rule_lookup", "jurisdiction", "category",
             "effective_from",
@@ -570,6 +575,12 @@ class TaxFeeRule(Base):
     )
     rate_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 8))
     fixed_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
+    # Only used by the "fixed_or_percentage" method: when the calculation
+    # base is lower than this value the fixed amount applies, otherwise the
+    # percentage does. Kept nullable so the other methods never need it.
+    percentage_threshold: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(18, 2)
+    )
     rate_unit: Mapped[Optional[str]] = mapped_column(String(32))
     minimum_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
     maximum_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))

@@ -3,8 +3,63 @@
 from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.orm import Session
 
-from core.database import migrate_khewat_schema, migrate_valuation_columns
+from core.database import (
+    migrate_khewat_schema,
+    migrate_tax_rule_columns,
+    migrate_valuation_columns,
+)
 from core.models import KhewatReference, PropertyKhewat
+
+
+def test_legacy_tax_rules_table_gets_threshold_column_additively(tmp_path):
+    """Old tax_fee_rules tables gain percentage_threshold without data loss."""
+    engine = create_engine(f"sqlite:///{(tmp_path / 'legacy_tax.sqlite3').as_posix()}")
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE tax_fee_rules ("
+                "id INTEGER PRIMARY KEY, name VARCHAR(200) NOT NULL, "
+                "rate_value NUMERIC(12, 8), fixed_amount NUMERIC(18, 2))"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO tax_fee_rules (id, name, rate_value, fixed_amount) "
+                "VALUES (1, 'Legacy rule', 2.5, NULL)"
+            )
+
+        migrate_tax_rule_columns(engine)
+
+        columns = {item["name"] for item in inspect(engine).get_columns("tax_fee_rules")}
+        assert "percentage_threshold" in columns
+        with engine.connect() as connection:
+            # Pre-existing rows keep their values and a NULL threshold,
+            # which the tax service treats as "method does not use one".
+            row = connection.exec_driver_sql(
+                "SELECT name, rate_value, fixed_amount, percentage_threshold "
+                "FROM tax_fee_rules WHERE id=1"
+            ).first()
+            assert row[0] == "Legacy rule" and row[1] is not None
+            assert row[3] is None
+    finally:
+        engine.dispose()
+
+
+def test_tax_rule_migration_is_a_noop_on_current_tables(tmp_path):
+    """A table created from the current model already has the column."""
+    from core.database import Base
+    from core.models import TaxFeeRule  # noqa: F401 - registers the table
+
+    engine = create_engine(f"sqlite:///{(tmp_path / 'current_tax.sqlite3').as_posix()}")
+    try:
+        Base.metadata.create_all(
+            engine, tables=[TaxFeeRule.__table__]
+        )
+        # Running twice must be safe: the column exists after the first pass.
+        migrate_tax_rule_columns(engine)
+        migrate_tax_rule_columns(engine)
+        columns = {item["name"] for item in inspect(engine).get_columns("tax_fee_rules")}
+        assert "percentage_threshold" in columns
+    finally:
+        engine.dispose()
 
 
 def test_legacy_location_table_gets_mauza_column_additively(tmp_path):

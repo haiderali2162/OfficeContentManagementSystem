@@ -219,3 +219,117 @@ def test_per_unit_charge_skips_mismatched_measurement_units_and_separates_curren
     assert result["totals_by_currency"] == {"USD": Decimal("3.00")}
     assert result["total_charges"] == Decimal("3.00")
     assert result["total_currency"] == "USD"
+
+
+# ---------------------------------------------------------------------------
+# fixed_or_percentage (hybrid) rules: fixed below a threshold, % at/above it
+# ---------------------------------------------------------------------------
+
+
+def test_hybrid_rule_validation_and_persistence(tax_database):
+    """The hybrid method stores its threshold with the rule and rejects gaps."""
+    rule_id = tax_service.create_tax_fee_rule(**_rule(
+        calculation_method="fixed_or_percentage",
+        rate_value="2", fixed_amount="5000", percentage_threshold="100000",
+    ))
+    stored = tax_service.list_tax_fee_rules()[0]
+    assert stored["calculation_method"] == "fixed_or_percentage"
+    assert stored["percentage_threshold"] == Decimal("100000.00")
+    assert stored["fixed_amount"] == Decimal("5000.00")
+
+    # Missing threshold cannot exist for the hybrid method.
+    with pytest.raises(tax_service.TaxRuleError, match="threshold"):
+        tax_service._rule_data(_rule(
+            calculation_method="fixed_or_percentage",
+            rate_value="2", fixed_amount="5000",
+        ))
+    # The same for the fixed amount and the percentage itself.
+    with pytest.raises(tax_service.TaxRuleError, match="fixed amount"):
+        tax_service._rule_data(_rule(
+            calculation_method="fixed_or_percentage",
+            rate_value="2", fixed_amount=None, percentage_threshold="100000",
+        ))
+    with pytest.raises(tax_service.TaxRuleError, match="percentage rate"):
+        tax_service._rule_data(_rule(
+            calculation_method="fixed_or_percentage",
+            rate_value=None, fixed_amount="5000", percentage_threshold="100000",
+        ))
+    # A negative threshold is rejected like every other money field.
+    with pytest.raises(tax_service.TaxRuleError, match="negative"):
+        tax_service._rule_data(_rule(
+            calculation_method="fixed_or_percentage",
+            rate_value="2", fixed_amount="5000", percentage_threshold="-1",
+        ))
+    # Other methods must not carry a stale threshold value.
+    with pytest.raises(tax_service.TaxRuleError, match="threshold"):
+        tax_service._rule_data(_rule(percentage_threshold="50000"))
+    with pytest.raises(tax_service.TaxRuleError, match="threshold"):
+        tax_service._rule_data(_rule(
+            calculation_method="fixed_amount", rate_value=None,
+            fixed_amount="300", percentage_threshold="50000",
+        ))
+    # Hybrid rules, like percentages, require an explicit base.
+    with pytest.raises(tax_service.TaxRuleError, match="explicitly name"):
+        tax_service._rule_data(_rule(
+            calculation_method="fixed_or_percentage",
+            rate_value="2", fixed_amount="5000", percentage_threshold="100000",
+            eligibility_conditions_json={"payer": "buyer"},
+        ))
+    assert stored["id"] == rule_id
+
+
+def _hybrid_record(**overrides):
+    """A verified hybrid rule: 2000 fixed below 50000, else 2 percent."""
+    values = _record(
+        id=4, name="Hypothetical hybrid fee", category="hybrid",
+        calculation_method="fixed_or_percentage", rate_value=Decimal("2"),
+        fixed_amount=Decimal("2000"), percentage_threshold=Decimal("50000"),
+        eligibility_conditions_json={
+            "base": "transferred_value", "payer": "buyer",
+        },
+    )
+    values.update(overrides)
+    return values
+
+
+def test_hybrid_charge_uses_fixed_below_threshold_and_percent_at_or_above():
+    """Literal rule behaviour: lower base takes fixed, at/above takes %."""
+    below = tax_service.calculate_charges(
+        rules=[_hybrid_record()], transaction_date=date(2026, 1, 1),
+        context={"transferred_value": "49999.99"},
+    )
+    assert below["charges"][0]["amount"] == Decimal("2000.00")
+
+    # Exactly at the threshold the percentage applies (base is not lower).
+    at = tax_service.calculate_charges(
+        rules=[_hybrid_record()], transaction_date=date(2026, 1, 1),
+        context={"transferred_value": "50000"},
+    )
+    assert at["charges"][0]["amount"] == Decimal("1000.00")
+
+    above = tax_service.calculate_charges(
+        rules=[_hybrid_record()], transaction_date=date(2026, 1, 1),
+        context={"transferred_value": "100000"},
+    )
+    assert above["charges"][0]["amount"] == Decimal("2000.00")
+    # The calculation line records the base that drove the decision.
+    assert above["charges"][0]["calculation_base"] == Decimal("100000.00")
+    assert above["charges"][0]["calculation_method"] == "fixed_or_percentage"
+
+
+def test_hybrid_snapshot_keeps_threshold_and_missing_base_skips():
+    """Saved estimates embed the threshold so later edits cannot rewrite them."""
+    result = tax_service.calculate_charges(
+        rules=[_hybrid_record()], transaction_date=date(2026, 1, 1),
+        context={"transferred_value": "100000"},
+    )
+    snapshot = result["charges"][0]["rule_snapshot"]
+    assert snapshot["percentage_threshold"] == "50000"
+
+    # Without the base value the hybrid rule is skipped with a reason.
+    missing = tax_service.calculate_charges(
+        rules=[_hybrid_record()], transaction_date=date(2026, 1, 1),
+        context={},
+    )
+    assert missing["charges"] == []
+    assert "Missing calculation base" in missing["skipped_rules"][0]["reason"]

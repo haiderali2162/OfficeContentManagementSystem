@@ -2953,7 +2953,7 @@ def build_dc_rates_page(
                                 "View / edit",
                                 on_click=lambda _, saved=record: open_saved_khewat(saved),
                             ),
-                        ], wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     ))
             except Exception as exc:
                 search_status.value = f"Could not search Khewats: {exc}"

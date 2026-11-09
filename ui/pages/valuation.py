@@ -459,7 +459,7 @@ def build_valuation_page(
                             ft.Text(f"{record.get('client_name') or 'Unlinked client'} · transferred {_money(record['transferred_value'])}", size=12),
                         ], spacing=3, expand=True),
                         ft.TextButton("Open", on_click=lambda _, estimate_id=record["id"]: show_estimate(estimate_id)),
-                    ], wrap=True),
+                    ]),
                 ))
         except Exception as exc:
             history_list.controls.append(ft.Text(f"Could not load saved estimates: {exc}", color="#B91C1C"))
@@ -679,7 +679,7 @@ def build_valuation_page(
                         ft.Text(f"{formula['formula_expression']} · {formula['verification_status']}", size=12),
                     ], expand=True, spacing=2),
                     ft.TextButton("Edit", on_click=lambda _, row=formula: open_formula_dialog(row)),
-                ], wrap=True))
+                ]))
         except Exception as exc:
             formula_list.controls.append(ft.Text(f"Could not load registry formulas: {exc}", color="#B91C1C"))
 
@@ -934,9 +934,26 @@ def build_valuation_page(
                 page.update()
                 return
             for rule in rules:
-                details = f"{rule['jurisdiction']} · {rule['category']} · {rule['calculation_method']} · {rule.get('verification_status', 'unverified').upper()}"
-                if rule["calculation_method"] == "fixed_amount":
+                method_value = rule["calculation_method"]
+                # Human-readable method name; falls back to the raw value so
+                # an old rule saved with an unexpected method still shows up.
+                method_label = {
+                    "percentage": "Percentage",
+                    "fixed_amount": "Fixed amount",
+                    "per_unit": "Per unit",
+                    "fixed_or_percentage": "Fixed or percentage",
+                }.get(method_value, method_value)
+                details = f"{rule['jurisdiction']} · {rule['category']} · {method_label} · {rule.get('verification_status', 'unverified').upper()}"
+                if method_value == "fixed_amount":
                     amount = _money(rule.get("fixed_amount"), rule.get("currency_code", "PKR"))
+                elif method_value == "fixed_or_percentage":
+                    # Show both halves of the hybrid rule explicitly so the
+                    # list explains the same behaviour the calculation uses.
+                    amount = (
+                        f"{_money(rule.get('fixed_amount'), rule.get('currency_code', 'PKR'))}"
+                        f" if value below {rule.get('percentage_threshold')}, "
+                        f"otherwise {rule.get('rate_value')}%"
+                    )
                 else:
                     amount = f"{rule.get('rate_value')} {rule.get('rate_unit') or '%'}"
                 rules_list.controls.append(ft.Container(
@@ -947,7 +964,7 @@ def build_valuation_page(
                                    ft.Text(f"{amount} · {rule['effective_from']} to {rule.get('effective_to') or 'open'}", size=12)],
                                   spacing=3, expand=True),
                         ft.TextButton("Edit", on_click=lambda _, record=rule: open_rule_dialog(record)),
-                    ], wrap=True),
+                    ]),
                 ))
             # One compact row is enough for one rule; larger collections grow
             # to a capped viewport and scroll independently of the page.
@@ -968,10 +985,20 @@ def build_valuation_page(
         category = ft.TextField(label="Category", value=existing.get("category", ""), width=220)
         rule_jurisdiction = ft.TextField(label="Jurisdiction", value=existing.get("jurisdiction", "Punjab"), width=220)
         method = ft.Dropdown(label="Calculation method", value=existing.get("calculation_method", "percentage"), width=220, options=[
-            ft.dropdown.Option("percentage", "Percentage"), ft.dropdown.Option("fixed_amount", "Fixed amount"), ft.dropdown.Option("per_unit", "Per unit")
+            ft.dropdown.Option("percentage", "Percentage"),
+            ft.dropdown.Option("fixed_amount", "Fixed amount"),
+            ft.dropdown.Option("per_unit", "Per unit"),
+            ft.dropdown.Option("fixed_or_percentage", "Fixed or percentage"),
         ])
         rate = ft.TextField(label="Rate / percent", value=str(existing.get("rate_value") or ""), width=180)
         fixed = ft.TextField(label="Fixed amount", value=str(existing.get("fixed_amount") or ""), width=180)
+        # Hybrid method only: base value below this number takes the fixed
+        # amount, otherwise the percentage applies. Never shown for the
+        # other methods so it cannot gather a stale value.
+        threshold = ft.TextField(
+            label="Use fixed below this value (% above)",
+            value=str(existing.get("percentage_threshold") or ""), width=200,
+        )
         rate_unit_field = ft.TextField(label="Rate unit (required for per-unit)", value=existing.get("rate_unit") or "", width=220)
         minimum = ft.TextField(label="Minimum charge", value=str(existing.get("minimum_amount") or ""), width=180)
         maximum = ft.TextField(label="Maximum charge", value=str(existing.get("maximum_amount") or ""), width=180)
@@ -985,13 +1012,21 @@ def build_valuation_page(
 
         def update_rule_method(_=None):
             """Keep method-specific fields visible and clear stale values."""
-            rate.visible = method.value != "fixed_amount"
-            fixed.visible = method.value == "fixed_amount"
+            # Rate applies everywhere except the pure fixed rule; the fixed
+            # amount applies to fixed and the hybrid; the threshold only to
+            # the hybrid; the unit only to per-unit.
+            rate.visible = method.value in ("percentage", "per_unit", "fixed_or_percentage")
+            fixed.visible = method.value in ("fixed_amount", "fixed_or_percentage")
+            threshold.visible = method.value == "fixed_or_percentage"
             rate_unit_field.visible = method.value == "per_unit"
-            if method.value == "fixed_amount":
+            # Clear fields that the chosen method ignores so switching
+            # method cannot leave a hidden stale value in the saved rule.
+            if not rate.visible:
                 rate.value = ""
-            else:
+            if not fixed.visible:
                 fixed.value = ""
+            if not threshold.visible:
+                threshold.value = ""
             page.update()
 
         method.on_select = update_rule_method
@@ -1003,6 +1038,21 @@ def build_valuation_page(
             method.value = "percentage"
             rate.value = ""
             conditions.value = '{"base":"dc_value","payer":"buyer"}'
+            update_rule_method()
+
+        def use_custom_preset(_=None):
+            """Preset for a fee the user names themselves.
+
+            Clears the name so the typed value is always the user's own fee
+            name; everything else matches the percentage presets. The name
+            field is required by the service, so saving without one is
+            caught there.
+            """
+            rule_name.value = ""
+            category.value = "custom_fee"
+            method.value = "percentage"
+            rate.value = ""
+            conditions.value = '{"base":"transferred_value","payer":"buyer"}'
             update_rule_method()
 
         def use_fixed_preset(_=None):
@@ -1021,6 +1071,7 @@ def build_valuation_page(
                     "calculation_method": method.value,
                     "rate_value": (rate.value or "").strip() or None,
                     "fixed_amount": (fixed.value or "").strip() or None,
+                    "percentage_threshold": (threshold.value or "").strip() or None,
                     "rate_unit": rate_unit_field.value,
                     # The compact dialog hides schedule metadata. Existing
                     # metadata is preserved on edit; new rules start today
@@ -1052,6 +1103,7 @@ def build_valuation_page(
                     method.value = "percentage"
                     rate.value = ""
                     fixed.value = ""
+                    threshold.value = ""
                     rate_unit_field.value = ""
                     minimum.value = ""
                     maximum.value = ""
@@ -1082,9 +1134,13 @@ def build_valuation_page(
                 ft.Text("Start with a common rule type. Enter the applicable percentage or amount from your verified source.", size=12, color="#475569"),
                 ft.Row([
                     ft.OutlinedButton("Stamp fee", on_click=lambda _: use_percentage_preset("Stamp fee")),
+                    ft.OutlinedButton("Mutation fee", on_click=lambda _: use_percentage_preset("Mutation fee")),
                     ft.OutlinedButton("Committee fee", on_click=lambda _: use_percentage_preset("Committee fee")),
                     ft.OutlinedButton("236C", on_click=lambda _: use_percentage_preset("236C")),
                     ft.OutlinedButton("236K", on_click=lambda _: use_percentage_preset("236K")),
+                    ft.OutlinedButton("PLRA fee", on_click=lambda _: use_percentage_preset("PLRA fee")),
+                    ft.OutlinedButton("Commission fee", on_click=lambda _: use_percentage_preset("Commission fee")),
+                    ft.OutlinedButton("Custom fee", on_click=use_custom_preset),
                     ft.OutlinedButton("Fixed service charge", on_click=use_fixed_preset),
                 ], wrap=True),
                 ft.ResponsiveRow([
@@ -1094,6 +1150,7 @@ def build_valuation_page(
                     ft.Container(method, col={"xs": 12, "md": 4}),
                     ft.Container(rate, col={"xs": 12, "md": 4}),
                     ft.Container(fixed, col={"xs": 12, "md": 4}),
+                    ft.Container(threshold, col={"xs": 12, "md": 4}),
                     ft.Container(rate_unit_field, col={"xs": 12, "md": 4}),
                     ft.Container(minimum, col={"xs": 12, "md": 4}),
                     ft.Container(maximum, col={"xs": 12, "md": 4}),
@@ -1114,7 +1171,7 @@ def build_valuation_page(
             ft.Text("Custom registry formulas", size=18, weight=ft.FontWeight.BOLD, expand=True),
             ft.OutlinedButton("Add formula", on_click=lambda _: open_formula_dialog()),
             ft.OutlinedButton("Manage custom fields", on_click=open_custom_fields_dialog),
-        ], wrap=True),
+        ]),
         ft.Text("Formula fields are numeric inputs shown on Calculate. Formulas are dated and default to unverified. Example: area * 2.5% + 2000.", size=12, color="#64748B"),
         custom_fields_status,
         formula_list,
@@ -1204,7 +1261,7 @@ def build_valuation_page(
                     ft.Text(f"{formula['formula_expression']} · {formula['verification_status']}", size=12),
                 ], expand=True, spacing=2),
                 ft.TextButton("Edit", on_click=lambda _, row=formula: open_formula_dialog(row)),
-            ], wrap=True))
+            ]))
 
     if hasattr(page, "run_task"):
         page.run_task(load_initial_data)

@@ -202,6 +202,92 @@ def test_saving_tax_rule_hides_metadata_clears_form_and_shows_snackbar(monkeypat
     assert isinstance(page.dialogs[-1], ft.SnackBar)
 
 
+def test_hybrid_tax_rule_method_reveal_field_and_save(monkeypatch):
+    """Choosing "Fixed or percentage" reveals rate, fixed, and threshold."""
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    saved = []
+    monkeypatch.setattr(valuation, "create_tax_fee_rule", lambda **values: saved.append(values) or 42)
+
+    page = FakePage()
+    root = valuation.build_valuation_page(page)
+    rule_page = root.controls[2].content.controls[1].controls[1]
+    add_rule = rule_page.controls[2].controls[0]
+    add_rule.on_click(SimpleNamespace(control=add_rule))
+    form_dialog = page.dialogs[0]
+    form_controls = list(walk_controls(form_dialog.content))
+    fields = {control.label: control for control in form_controls if isinstance(control, ft.TextField)}
+    method = next(control for control in form_controls
+                  if isinstance(control, ft.Dropdown) and control.label == "Calculation method")
+
+    # The dialog supports all four calculation methods.
+    option_values = [option.key for option in method.options]
+    assert option_values == ["percentage", "fixed_amount", "per_unit", "fixed_or_percentage"]
+
+    # On the default percentage method the threshold is hidden and cleared.
+    threshold_label = "Use fixed below this value (% above)"
+    threshold = fields[threshold_label]
+    assert threshold.visible is False
+    assert fields["Rate / percent"].visible is True
+
+    # Selecting the hybrid method reveals all three interlocking fields.
+    method.value = "fixed_or_percentage"
+    method.on_select()  # same handler Flet invokes for a dropdown selection
+    assert threshold.visible is True
+    assert fields["Rate / percent"].visible is True
+    assert fields["Fixed amount"].visible is True
+    assert threshold.visible is True
+
+    fields["Rule name"].value = "Hybrid example"
+    fields["Category"].value = "hybrid"
+    fields["Rate / percent"].value = "2"
+    fields["Fixed amount"].value = "2000"
+    threshold.value = "50000"
+    save_button = form_dialog.actions[-1]
+    save_button.on_click(SimpleNamespace(control=save_button))
+
+    assert saved[0]["calculation_method"] == "fixed_or_percentage"
+    assert saved[0]["percentage_threshold"] == "50000"
+    assert saved[0]["fixed_amount"] == "2000"
+    assert saved[0]["rate_value"] == "2"
+
+
+def test_hybrid_rule_row_renders_fixed_and_percent_halves(monkeypatch):
+    """The rules list spells out the hybrid rule so users can audit it."""
+    rule_rows = [{
+        "id": 1, "name": "Hybrid example", "jurisdiction": "Punjab",
+        "category": "hybrid", "calculation_method": "fixed_or_percentage",
+        "rate_value": "2", "fixed_amount": "2000", "percentage_threshold": "50000",
+        "rate_unit": None, "currency_code": "PKR",
+        "effective_from": valuation.date.today(), "effective_to": None,
+        "verification_status": "unverified",
+    }]
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: list(rule_rows))
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    page = LoadingPage()
+    root = valuation.build_valuation_page(page)
+    controls = list(walk_controls(root))
+    texts = [control.value for control in controls if isinstance(control, ft.Text)]
+    assert any("Fixed or percentage" in value for value in texts)
+    assert any("PKR 2,000.00" in value and "50000" in value and "2%" in value
+               for value in texts)
+
+
 def test_square_and_kila_suggestions_follow_selected_mauza_and_square(monkeypatch):
     location_row = {
         "id": 7, "name": "Chak 1", "district": "District A", "tehsil": "Tehsil A",

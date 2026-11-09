@@ -23,7 +23,12 @@ class TaxRuleError(ValueError):
 
 
 CENT = Decimal("0.01")
-CALCULATION_METHODS = {"percentage", "fixed_amount", "per_unit"}
+CALCULATION_METHODS = {
+    "percentage", "fixed_amount", "per_unit", "fixed_or_percentage",
+}
+# Methods that express their rate as a percent of a named base. Both require
+# an explicit base and (for the hybrid method) a threshold value.
+PERCENT_METHODS = {"percentage", "fixed_or_percentage"}
 PERCENTAGE_BASES = {
     "property_value", "transferred_value", "declared_consideration",
     "dc_value", "fbr_value", "registry_written_value", "building_material_value",
@@ -117,15 +122,44 @@ def _rule_data(values: dict[str, Any]) -> dict[str, Any]:
         raise TaxRuleError("Rule name, category, and jurisdiction are required.")
     method = str(values.get("calculation_method") or "").strip().lower()
     if method not in CALCULATION_METHODS:
-        raise TaxRuleError("Choose percentage, fixed_amount, or per_unit calculation.")
+        raise TaxRuleError(
+            "Choose percentage, fixed_amount, per_unit, or fixed_or_percentage calculation."
+        )
     rate = _decimal(values.get("rate_value"), "Rate", optional=True)
     fixed = _decimal(values.get("fixed_amount"), "Fixed amount", optional=True)
+    # The threshold only applies to fixed_or_percentage; every other method
+    # must leave it empty so a stale dialog value cannot silently change the
+    # meaning of an existing rule.
+    threshold = _decimal(
+        values.get("percentage_threshold"), "Threshold", optional=True
+    )
+    if method == "fixed_amount" and threshold is not None:
+        raise TaxRuleError(
+            "Only fixed_or_percentage rules use a threshold value."
+        )
     if method == "fixed_amount":
         if fixed is None or fixed < 0 or rate is not None:
             raise TaxRuleError("A fixed rule needs a non-negative fixed amount and no rate.")
-    elif rate is None or rate < 0 or fixed is not None:
-        raise TaxRuleError("Percentage and per-unit rules need a non-negative rate and no fixed amount.")
-    if method == "percentage":
+    elif method == "fixed_or_percentage":
+        if rate is None or rate < 0:
+            raise TaxRuleError(
+                "A fixed_or_percentage rule needs a non-negative percentage rate."
+            )
+        if fixed is None or fixed < 0:
+            raise TaxRuleError(
+                "A fixed_or_percentage rule needs a non-negative fixed amount."
+            )
+        if threshold is None or threshold < 0:
+            raise TaxRuleError(
+                "A fixed_or_percentage rule needs a non-negative threshold value "
+                "(the base amount below which the fixed amount is used)."
+            )
+    elif rate is None or rate < 0 or fixed is not None or threshold is not None:
+        raise TaxRuleError(
+            "Percentage and per-unit rules need a non-negative rate, no fixed "
+            "amount, and no threshold."
+        )
+    if method in PERCENT_METHODS:
         conditions = _conditions(values.get("eligibility_conditions_json"))
         if conditions.get("base") not in PERCENTAGE_BASES:
             raise TaxRuleError("Percentage rules must explicitly name their calculation base.")
@@ -160,6 +194,9 @@ def _rule_data(values: dict[str, Any]) -> dict[str, Any]:
         "calculation_method": method,
         "rate_value": rate,
         "fixed_amount": fixed,
+        # Only non-None for fixed_or_percentage; other methods store NULL so
+        # the database CHECK and later edits see a clean rule shape.
+        "percentage_threshold": threshold if method == "fixed_or_percentage" else None,
         "rate_unit": str(values.get("rate_unit") or "").strip() or None,
         "minimum_amount": minimum,
         "maximum_amount": maximum,
@@ -179,7 +216,8 @@ def _record(rule: TaxFeeRule) -> dict[str, Any]:
         field: getattr(rule, field)
         for field in (
             "id", "name", "category", "jurisdiction", "calculation_method",
-            "rate_value", "fixed_amount", "rate_unit", "minimum_amount",
+            "rate_value", "fixed_amount", "percentage_threshold", "rate_unit",
+            "minimum_amount",
             "maximum_amount", "currency_code", "effective_from", "effective_to",
             "eligibility_conditions_json", "source_reference", "source_date",
             "verification_status", "verified_at", "verified_by", "created_at", "updated_at",
@@ -235,6 +273,12 @@ def _snapshot(rule: dict[str, Any], conditions: dict[str, Any]) -> dict[str, Any
         "calculation_method": rule["calculation_method"],
         "rate_value": str(rule["rate_value"]) if rule.get("rate_value") is not None else None,
         "fixed_amount": str(rule["fixed_amount"]) if rule.get("fixed_amount") is not None else None,
+        # Hybrid rules embed their threshold in each estimate snapshot so a
+        # later edit of the rule cannot reinterpret saved historical charges.
+        "percentage_threshold": (
+            str(rule["percentage_threshold"])
+            if rule.get("percentage_threshold") is not None else None
+        ),
         "rate_unit": rule.get("rate_unit"),
         "minimum_amount": str(rule["minimum_amount"]) if rule.get("minimum_amount") is not None else None,
         "maximum_amount": str(rule["maximum_amount"]) if rule.get("maximum_amount") is not None else None,
@@ -323,6 +367,33 @@ def calculate_charges(
             if threshold_max is not None and base > threshold_max:
                 continue
             exact = base * applied_rate / Decimal(100)
+        elif method == "fixed_or_percentage":
+            base_key = conditions.get("base")
+            if base_key not in PERCENTAGE_BASES:
+                raise TaxRuleError(f"Rule {rule['name']} has no valid percentage base.")
+            if base_key not in context or context[base_key] in (None, "", "unknown"):
+                skipped.append({"rule": rule["name"], "reason": f"Missing calculation base: {base_key}."})
+                continue
+            base = _decimal(context[base_key], base_key)
+            applied_rate = _decimal(rule.get("rate_value"), "Rule rate")
+            cutoff = _decimal(rule.get("percentage_threshold"), "Rule threshold")
+            if base < 0 or applied_rate < 0 or cutoff is None or cutoff < 0:
+                raise TaxRuleError("Charge base, rate, and threshold cannot be negative.")
+            threshold_min = _decimal(conditions.get("minimum_base"), "Minimum base", optional=True)
+            threshold_max = _decimal(conditions.get("maximum_base"), "Maximum base", optional=True)
+            if threshold_min is not None and base < threshold_min:
+                continue
+            if threshold_max is not None and base > threshold_max:
+                continue
+            # Hybrid wording, kept literal: if the base value is lower than
+            # the rule's threshold use the fixed amount, otherwise apply the
+            # percentage. Values exactly at the threshold take the percent.
+            if base < cutoff:
+                exact = _decimal(rule.get("fixed_amount"), "Fixed rule amount")
+                if exact < 0:
+                    raise TaxRuleError("Fixed charge cannot be negative.")
+            else:
+                exact = base * applied_rate / Decimal(100)
         elif method == "fixed_amount":
             exact = _decimal(rule.get("fixed_amount"), "Fixed rule amount")
             if exact < 0:
