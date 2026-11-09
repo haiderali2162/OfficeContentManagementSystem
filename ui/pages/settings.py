@@ -142,6 +142,12 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
             expand=True,
         ),
     }
+    # Separate from the field dict: clearing is an explicit user decision, so
+    # an untouched password never accidentally disappears from the config.
+    clear_password_checkbox = ft.Checkbox(
+        label="Clear the saved password",
+        value=False,
+    )
     path_field = ft.TextField(
         label="SQLite database file",
         value=saved_options["path"],
@@ -192,13 +198,19 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
         options = dict(database_config.load_options())
         options["backend"] = backend_dropdown.value
         for field_name, field in db_fields.items():
+            # The password is special-cased below: putting the empty field
+            # value here would wipe the saved encrypted token.
+            if field_name == "password":
+                continue
             options[field_name] = field.value or ""
+        if db_fields["password"].value:
+            options["password"] = db_fields["password"].value
         options["path"] = path_field.value or ""
         options["odbc_driver"] = odbc_driver_field.value or ""
-        # An empty password field means "keep the saved encrypted password";
-        # only a typed value replaces it.
-        if not db_fields["password"].value:
-            options.pop("password", None)
+        # The explicit checkbox is the only way to clear a saved password;
+        # a field left empty always keeps the previously stored token.
+        if clear_password_checkbox.value:
+            options["password"] = ""
         return options
 
     def sync_backend_visibility(_=None) -> None:
@@ -299,6 +311,7 @@ def build_database_section(page: ft.Page, file_picker: ft.FilePicker) -> ft.Cont
         controls=[
             db_fields["user"],
             db_fields["password"],
+            clear_password_checkbox,
         ],
         spacing=8,
         wrap=True,
