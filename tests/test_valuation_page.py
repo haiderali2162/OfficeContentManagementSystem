@@ -603,3 +603,37 @@ def test_calculate_tab_offers_qanoongoi_location_filter(monkeypatch):
     assert {suggestion.value for suggestion in qanoongoi.suggestions} == {"Qanoongoi A"}
 
 
+def test_remove_formula_asks_first_then_deletes(monkeypatch):
+    """Formula row Remove button confirms before deleting."""
+    formula_row = {
+        "id": 99, "name": "Custom stamp", "category": "stamp",
+        "formula_expression": "area * 10", "verification_status": "unverified",
+    }
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [formula_row])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    deleted = []
+    monkeypatch.setattr(valuation, "delete_registry_fee_formula", lambda f_id: deleted.append(f_id))
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    page = LoadingPage()
+    root = valuation.build_valuation_page(page)
+    # The formula row is on Tab 1 (Tax / fee rules)
+    rule_page = root.controls[2].content.controls[1].controls[1]
+    formula_list_ctrl = rule_page.controls[9]
+    remove_btn = next(c for c in walk_controls(formula_list_ctrl)
+                      if isinstance(c, ft.TextButton) and c.content == "Remove")
+    remove_btn.on_click(SimpleNamespace(control=remove_btn))
+    confirm_dialog = page.dialogs[-1]
+    assert confirm_dialog.title.value == "Remove registry formula?"
+    confirm_dialog.actions[-1].on_click(None)
+    assert deleted == [99]
+
+

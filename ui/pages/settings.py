@@ -1015,6 +1015,79 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     apply_content_to_controls(saved_content)
     update_content_preview()
 
+    guide_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Guide & Reference: How to write and use Custom Registry Fee Formulas in the Land Office application.",
+                size=13,
+                weight=ft.FontWeight.BOLD,
+                color="#1E293B",
+            ),
+            ft.Text(
+                "Custom formulas allow calculating dynamic registry expenses, stamp duties, PLRA fees, and mutation charges "
+                "based on property valuation and land area.",
+                size=12,
+                color="#64748B",
+            ),
+            ft.Container(
+                ft.Column([
+                    ft.Text("1. Available Variables", size=13, weight=ft.FontWeight.BOLD, color="#334155"),
+                    ft.Text("• area: Area in Marlas", size=12),
+                    ft.Text("• area_marla: Explicit area in Marlas", size=12),
+                    ft.Text("• area_kanal: Area in Kanals (1 Kanal = 20 Marlas)", size=12),
+                    ft.Text("• area_acre: Area in Acres (1 Acre = 8 Kanals / 160 Marlas)", size=12),
+                    ft.Text("• area_square_feet: Total land area in square feet", size=12),
+                    ft.Text("• dc_value: Calculated DC Valuation (PKR)", size=12),
+                    ft.Text("• fbr_value: Calculated FBR Valuation (PKR)", size=12),
+                    ft.Text("• property_value: Full calculated property value (PKR)", size=12),
+                    ft.Text("• transferred_value: Transferred consideration value (PKR)", size=12),
+                    ft.Text("• registry_written_value: Declared/written deed amount (PKR)", size=12),
+                    ft.Text("• building_material_value: Constructed structure value (PKR)", size=12),
+                    ft.Text("• Custom fields: Any custom numeric field defined under Manage custom fields (e.g. plot_count, surcharge)", size=12, italic=True),
+                ], spacing=4),
+                padding=10, bgcolor="#F8FAFC", border=ft.Border.all(1, "#E2E8F0"), border_radius=8,
+            ),
+            ft.Container(
+                ft.Column([
+                    ft.Text("2. Operators & Syntax", size=13, weight=ft.FontWeight.BOLD, color="#334155"),
+                    ft.Text("• Arithmetic: + (addition), - (subtraction), * (multiplication), / (division)", size=12),
+                    ft.Text("• Grouping: Parentheses ( ) to group operations, e.g. (dc_value + 1000) * 2%", size=12),
+                    ft.Text("• Percentages: Use % sign directly (e.g. 2.5%, 0.1%, 1%), equivalent to multiplying by rate / 100", size=12),
+                    ft.Text("• Slabs / Conditionals: Python ternary syntax is supported:", size=12),
+                    ft.Text("    fixed_amount if condition else rate_or_formula", size=12, color="#0369A1"),
+                    ft.Text("    Example: 3300 if dc_value < 3000000 else dc_value * 0.1%", size=12, color="#0369A1"),
+                    ft.Text("• Capping: min(value, cap) or max(value, floor)", size=12),
+                ], spacing=4),
+                padding=10, bgcolor="#F8FAFC", border=ft.Border.all(1, "#E2E8F0"), border_radius=8,
+            ),
+            ft.Container(
+                ft.Column([
+                    ft.Text("3. Step-by-Step Practical Examples", size=13, weight=ft.FontWeight.BOLD, color="#334155"),
+                    ft.Text("Example A — Percentage with Base Surcharge:", weight=ft.FontWeight.W_500, size=12),
+                    ft.Text("    transferred_value * 2% + 500", size=12, color="#0F766E"),
+                    ft.Text("Example B — Per-Kanal Rate with Flat Registration Fee:", weight=ft.FontWeight.W_500, size=12),
+                    ft.Text("    area_kanal * 1200 + 2000", size=12, color="#0F766E"),
+                    ft.Text("Example C — Surcharge with Maximum Cap (e.g. Capped at 50,000 PKR):", weight=ft.FontWeight.W_500, size=12),
+                    ft.Text("    min(transferred_value * 1%, 50000)", size=12, color="#0F766E"),
+                    ft.Text("Example D — PLRA Official Fee Slab:", weight=ft.FontWeight.W_500, size=12),
+                    ft.Text("    3300 if dc_value < 3000000 else dc_value * 0.1%", size=12, color="#0F766E"),
+                ], spacing=4),
+                padding=10, bgcolor="#F8FAFC", border=ft.Border.all(1, "#E2E8F0"), border_radius=8,
+            ),
+            ft.Container(
+                ft.Column([
+                    ft.Text("4. Eligibility Conditions (Optional JSON)", size=13, weight=ft.FontWeight.BOLD, color="#334155"),
+                    ft.Text("Formulas can be limited to specific locations or transactions by setting conditions in JSON:", size=12),
+                    ft.Text("    {\"when\": {\"mauza\": \"Chak 1\", \"transaction_type\": \"sale\"}}", size=12, color="#B45309"),
+                    ft.Text("Leave blank to apply to all calculations in the jurisdiction.", size=12, color="#64748B"),
+                ], spacing=4),
+                padding=10, bgcolor="#F8FAFC", border=ft.Border.all(1, "#E2E8F0"), border_radius=8,
+            ),
+        ],
+        spacing=10,
+        tight=True,
+    )
+
     return ft.Column(
         controls=[
             ft.Text("Settings", size=25, weight=ft.FontWeight.BOLD),
@@ -1049,6 +1122,11 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Which schedule fields appear on each card, plus formula "
                 "lines such as a per-kanal equivalent.",
                 content_card,
+            ),
+            _category_tile(
+                "Custom registry formulas — user guide",
+                "How to write formula expressions, available variables (area, DC/FBR values), percentage syntax, and conditional slabs.",
+                guide_card,
             ),
         ],
         spacing=12,

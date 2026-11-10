@@ -46,6 +46,7 @@ from services.registry_fee_service import (
     RegistryFeeFormulaError,
     calculate_registry_fee_formulas,
     create_registry_fee_formula,
+    delete_registry_fee_formula,
     list_registry_fee_formulas,
     update_registry_fee_formula,
     create_registry_fee_custom_field,
@@ -692,6 +693,39 @@ def build_valuation_page(
 
     formula_list = ft.ListView(height=180, spacing=5)
 
+    def confirm_remove_formula(record: dict[str, Any]) -> None:
+        """Ask before deleting one formula; nothing is removed without approval."""
+
+        def do_remove(_=None):
+            try:
+                delete_registry_fee_formula(int(record["id"]))
+                page.pop_dialog()
+                refresh_formulas()
+                status.value = f"Removed formula '{record['name']}'."
+                status.color = "#15803D"
+            except RegistryFeeFormulaError as exc:
+                page.pop_dialog()
+                status.value = str(exc)
+                status.color = "#B91C1C"
+            except Exception as exc:
+                page.pop_dialog()
+                status.value = f"Could not remove formula: {exc}"
+                status.color = "#B91C1C"
+            page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Remove registry formula?"),
+            content=ft.Column([
+                ft.Text(f"Remove formula '{record['name']}' ({record.get('formula_expression', '')})? It will stop applying to future calculations.", size=13),
+                ft.Text("Saved estimates keep the charge snapshots recorded when they were saved.", size=12, color="#64748B"),
+            ], tight=True, spacing=8),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                ft.TextButton("Remove", on_click=do_remove),
+            ],
+        ))
+
     def refresh_formulas():
         """Reload persisted fee formulas shown directly under the calculator."""
         formula_list.controls.clear()
@@ -705,6 +739,7 @@ def build_valuation_page(
                         ft.Text(f"{formula['name']} · {formula['category']}", weight=ft.FontWeight.BOLD),
                         ft.Text(f"{formula['formula_expression']} · {formula['verification_status']}", size=12),
                     ], expand=True, spacing=2),
+                    ft.TextButton("Remove", on_click=lambda _, row=formula: confirm_remove_formula(row)),
                     ft.TextButton("Edit", on_click=lambda _, row=formula: open_formula_dialog(row)),
                 ]))
         except Exception as exc:
@@ -791,8 +826,17 @@ def build_valuation_page(
                 ], run_spacing=4),
                 formula_error,
             ], tight=True, scroll=ft.ScrollMode.AUTO, width=620, height=460),
-            actions=[ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
-                     ft.FilledButton("Save formula", on_click=save_formula)],
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                *([
+                    ft.TextButton(
+                        "Remove formula",
+                        style=ft.ButtonStyle(color="#B91C1C"),
+                        on_click=lambda _, row=existing: [page.pop_dialog(), confirm_remove_formula(row)],
+                    )
+                ] if existing.get("id") else []),
+                ft.FilledButton("Save formula", on_click=save_formula),
+            ],
         ))
 
     custom_fields_status = ft.Text("", size=12, color="#475569")
@@ -1470,6 +1514,7 @@ def build_valuation_page(
                     ft.Text(f"{formula['name']} · {formula['category']}", weight=ft.FontWeight.BOLD),
                     ft.Text(f"{formula['formula_expression']} · {formula['verification_status']}", size=12),
                 ], expand=True, spacing=2),
+                ft.TextButton("Remove", on_click=lambda _, row=formula: confirm_remove_formula(row)),
                 ft.TextButton("Edit", on_click=lambda _, row=formula: open_formula_dialog(row)),
             ]))
 

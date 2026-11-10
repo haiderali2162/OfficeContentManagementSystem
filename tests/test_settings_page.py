@@ -290,3 +290,13 @@ def test_settings_page_browse_uses_the_folder_picker(
         for control in _walk(root)
         if isinstance(control, ft.Text)
     )
+
+
+def test_settings_page_renders_custom_formulas_guide(settings_database):
+    root = settings.build_settings_page(FakePage())
+    titles = [
+        control.title.value
+        for control in _walk(root)
+        if isinstance(control, ft.ExpansionTile)
+    ]
+    assert "Custom registry formulas — user guide" in titles

@@ -1,3 +1,5 @@
-1. add rule does not have an option to remove a rule on the "Valuation & taxes" page and the tab "tax / fee rules".
-2. also in case of 236k and 236c, we need to adjust rule as these two have three different categories like late filer rate for previous years, in-active case rate and active filer case rate. these all are differents. adjust rules dialog accordingly.
-3. on the calculate page, also add qanoongoi option and it should provide hints for all the available qanoongoi. also there is a vertical white bar which shows nothing. also adjust the layout professionally.
+1. on the calculate tab of "valuation & taxes" page, make an option to select if the buyer is active filer or in-active and in case of old years "late active" to calculate fees accordingly. also add an option to add more than one buyer and seller with their buying/selling area as there could be in a single registry to calcualte their taxes accordingly.
+2. on the "tax / fee rules" tab, under the custom registry formulas, there is only edit option. I need you to make a remove option too.
+3. provide a in build guide about how to use custom formulas in the settings page and add it in its own category.
+4. on the calculate page, fetch matching dc rate based on mauza, square no, killa no in case or rural. also the choose matching schedule location only shows the village, district, tehsil and village again. improve it by showing square & killa no also. also make it a searchable field by typing "square/killa" or "square - killa" format whichever user choose it should work. remember killas and khasra could be in a/b/c/d format.
+5. also allow user to export the current estimated calculation in pdf/excel/csv/odf format. make pdf export professional.

@@ -289,6 +289,15 @@ def update_registry_fee_formula(*, formula_id: int, **values: Any) -> None:
         record.verified_at = datetime.now(timezone.utc) if data["verification_status"] == "verified" else None
 
 
+def delete_registry_fee_formula(formula_id: int) -> None:
+    """Remove one saved formula explicitly."""
+    with SessionLocal.begin() as session:
+        record = session.get(RegistryFeeFormula, formula_id)
+        if record is None:
+            raise RegistryFeeFormulaError("Registry fee formula was not found.")
+        session.delete(record)
+
+
 def list_registry_fee_formulas() -> list[dict[str, Any]]:
     statement = select(RegistryFeeFormula).order_by(
         RegistryFeeFormula.category, RegistryFeeFormula.name, RegistryFeeFormula.id

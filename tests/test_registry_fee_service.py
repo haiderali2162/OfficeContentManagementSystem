@@ -96,3 +96,16 @@ def test_user_supplied_plra_formula_condition(dc_value, expected):
         {"dc_value": dc_value},
     )
     assert result == expected
+
+
+def test_delete_registry_fee_formula_removes_record(formula_database):
+    formula_id = formula_service.create_registry_fee_formula(
+        name="Deletable fee", category="stamp", formula_expression="area * 10",
+        jurisdiction="Punjab", effective_from="2025-07-01",
+    )
+    assert len(formula_service.list_registry_fee_formulas()) == 1
+    formula_service.delete_registry_fee_formula(formula_id)
+    assert formula_service.list_registry_fee_formulas() == []
+
+    with pytest.raises(formula_service.RegistryFeeFormulaError, match="not found"):
+        formula_service.delete_registry_fee_formula(formula_id)

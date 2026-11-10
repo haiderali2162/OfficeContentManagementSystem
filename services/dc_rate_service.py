@@ -1081,8 +1081,8 @@ def _location_matches_context(location: dict[str, Any], context: dict[str, Any])
             continue
         if field_name in _LOCATION_REFERENCE_FIELDS:
             try:
-                requested = set(_reference_values(value))
-                stored = set(_reference_values(location.get(field_name)))
+                requested = {token.casefold() for token in _reference_values(value)}
+                stored = {token.casefold() for token in _reference_values(location.get(field_name))}
             except DCRateServiceError:
                 return False
             if not requested.intersection(stored):
