@@ -1153,6 +1153,50 @@ LOCATION_HIERARCHY_PARENTS: dict[str, tuple[str, ...]] = {
     "khasra_no": ("district", "tehsil", "qanoongoi", "mauza", "square_no", "kila_no"),
 }
 
+# Levels whose suggestions must stay empty until the essential parent levels
+# above them are filled in. Without this, an unfinished form (for example a
+# District typed while the Tehsil is still empty) offers Qanoongoi values
+# from every other tehsil, and Square values "wildly" from every Mauza —
+# exactly what the developer reported. Qanoongoi itself is optional, so
+# Mauza suggestions do not require it.
+LOCATION_REQUIRED_PARENTS: dict[str, tuple[str, ...]] = {
+    "tehsil": ("district",),
+    "qanoongoi": ("district", "tehsil"),
+    "mauza": ("district", "tehsil"),
+    "square_no": ("district", "tehsil", "mauza"),
+    "kila_no": ("district", "tehsil", "mauza", "square_no"),
+    "khasra_no": ("district", "tehsil", "mauza", "square_no", "kila_no"),
+}
+
+# Type-ahead values are queried on every keystroke against a table that can
+# hold hundreds of thousands of rows. Results for a given search context are
+# cached until the developer's refresh button clears the cache, so repeated
+# keystrokes over the same prefix and re-entering the tab stay fast.
+_LOCATION_HINT_CACHE: dict[str, dict[str, list[str]]] = {}
+
+
+def _location_hint_cache_token() -> str:
+    """Identify the database behind SessionLocal for the hint cache key.
+
+    The app always uses the same SQLite file, but tests install isolated
+    per-test sessionmakers; keying on the engine URL (falling back to the
+    sessionmaker's identity) keeps one test's cached rows out of another.
+    """
+    bind = (getattr(SessionLocal, "kw", {}) or {}).get("bind")
+    if bind is None:
+        bind = getattr(SessionLocal, "bind", None)
+    url = getattr(bind, "url", None)
+    return str(url) if url is not None else f"sessionmaker:{id(SessionLocal)}"
+
+
+def clear_location_hint_cache() -> None:
+    """Drop all cached location-hint values so the next query re-reads the DB.
+
+    Wired to the Calculate tab's refresh button; also useful after a schedule
+    import that should be visible in the suggestions immediately.
+    """
+    _LOCATION_HINT_CACHE.clear()
+
 
 def list_location_hint_values(
     *,
@@ -1174,9 +1218,32 @@ def list_location_hint_values(
     ]
     context = dict(context or {})
     hint_limit = max(1, limit)
+    cache_key_parts = [
+        _location_hint_cache_token(),
+        str(land_type), str(bool(hierarchy)), str(hint_limit),
+        ",".join(requested),
+        "|".join(f"{key}={context[key]}" for key in sorted(context)
+                 if _text(context.get(key))),
+    ]
+    cache_key = "\n".join(cache_key_parts)
+    cached = _LOCATION_HINT_CACHE.get(cache_key)
+    if cached is not None:
+        return {field: list(cached.get(field, [])) for field in requested}
     result: dict[str, list[str]] = {}
     with SessionLocal() as session:
         for field_name in requested:
+            if hierarchy and field_name in LOCATION_REQUIRED_PARENTS:
+                # Strict rural scoping: a level stays empty until the
+                # essential levels above it are filled, so Qanoongoi never
+                # offers values from other tehsils and Square/Kila never
+                # offer values from unselected Mauzas.
+                missing = [
+                    parent for parent in LOCATION_REQUIRED_PARENTS[field_name]
+                    if not _text(context.get(parent))
+                ]
+                if missing:
+                    result[field_name] = []
+                    continue
             if hierarchy and field_name in LOCATION_HIERARCHY_PARENTS:
                 # Keep only the parents of this level; unrelated typed values
                 # (children, sibling urban fields) must not filter it.
@@ -1240,6 +1307,9 @@ def list_location_hint_values(
                     cleaned.append(text_value)
             cleaned.sort(key=str.casefold)
             result[field_name] = cleaned[:hint_limit]
+    _LOCATION_HINT_CACHE[cache_key] = {
+        field: list(result.get(field, [])) for field in requested
+    }
     return result
 
 

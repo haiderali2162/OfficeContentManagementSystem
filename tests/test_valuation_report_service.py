@@ -209,3 +209,76 @@ def test_export_estimate_ods_uses_unsaved_label_for_current_results():
     )
     content = zipfile.ZipFile(BytesIO(export_estimate_ods(record))).read("content.xml").decode("utf-8")
     assert "Unsaved" in content
+
+
+def test_json_export_round_trips_the_full_record():
+    import json as json_module
+
+    from services.valuation_report_service import export_estimate_json
+
+    estimate = _estimate()
+    payload = export_estimate_json(estimate)
+    parsed = json_module.loads(payload.decode("utf-8"))
+    assert parsed["id"] == 12
+    assert parsed["charges"][0]["name"] == "Hypothetical fee"
+    assert parsed["result_snapshot"]["charges"]["totals_by_currency"] == {"PKR": "250.00"}
+
+
+def test_estimate_rows_include_parties_fbr_and_deficient_lines():
+    from services.valuation_report_service import _estimate_rows
+
+    estimate = _estimate()
+    estimate["input_snapshot"]["parties"] = [
+        {"role": "buyer", "name": None, "area_marla": "22", "filer_status": "ATL"},
+        {"role": "seller", "name": "Khalid", "area_marla": "20", "filer_status": "non_ATL"},
+    ]
+    estimate["result_snapshot"]["valuation"].update({
+        "fbr_value": None,
+        "comparison": {
+            "declared_consideration": "70000.00",
+            "transferred_valuation": "80000.00",
+            "difference_declared_minus_valuation": "-10000.00",
+            "declared_is_below_valuation": True,
+        },
+    })
+    rows = dict(_estimate_rows(estimate))
+    assert rows["Deed parties (area marla, filer status)"] == (
+        "buyer: 22 marla (ATL); Khalid: 20 marla (non_ATL)"
+    )
+    assert rows["FBR valuation"] == "Schedule unavailable"
+    assert rows["Deficient amount"] == "PKR 10000.00"
+
+
+def test_deficient_line_reports_none_when_written_value_covers():
+    from services.valuation_report_service import _estimate_rows
+
+    estimate = _estimate()
+    estimate["result_snapshot"]["valuation"]["comparison"] = {
+        "declared_consideration": "90000.00",
+        "transferred_valuation": "80000.00",
+        "difference_declared_minus_valuation": "10000.00",
+        "declared_is_below_valuation": False,
+    }
+    rows = dict(_estimate_rows(estimate))
+    assert rows["Deficient amount"] == "None (written value covers the calculated valuation)"
+
+
+def test_charge_rows_carry_party_labels_and_json_history_export():
+    import json as json_module
+
+    from services.valuation_report_service import (
+        _charge_rows, export_estimate_history, export_estimate_json,
+    )
+
+    estimate = _estimate()
+    estimate["charges"][0]["party"] = {"label": "Buyer 1", "role": "buyer"}
+    rows = _charge_rows(estimate)
+    assert rows[0][3] == "Party"
+    assert rows[1][3] == "Buyer 1 (buyer)"
+
+    history = export_estimate_history([estimate], "json")
+    parsed = json_module.loads(history.decode("utf-8"))
+    assert parsed[0]["id"] == 12
+
+    record = export_estimate_json(estimate)
+    assert record.startswith(b"{")

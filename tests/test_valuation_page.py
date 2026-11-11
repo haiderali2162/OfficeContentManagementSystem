@@ -1170,14 +1170,15 @@ def test_calculate_splits_filer_taxes_per_party(monkeypatch):
     buyer = roles[0]
     buyer.value = "buyer"
     areas = [control for control in walk_controls(root)
-             if isinstance(control, ft.TextField) and control.label == "Area share (marla)"]
-    areas[0].value = "12"
+             if isinstance(control, ft.TextField) and control.label == "Area share (K-M-F or 10k5m)"]
+    areas[0].value = "12m"
     button = next(control for control in walk_controls(root)
                   if isinstance(control, ft.Button)
                   and getattr(control, "content", None) == "Calculate estimate")
     button.on_click(SimpleNamespace(control=button))
 
     parties = captured["parties"]
+    # "12m" parses to exactly 12 marla; the stored share is the parsed value.
     assert parties[0] == {"role": "buyer", "name": None, "area_marla": "12",
                           "filer_status": "unknown"}
     assert len(parties) == 2
@@ -1259,3 +1260,178 @@ def test_tehsil_change_clears_stale_child_suggestions(monkeypatch):
     tehsil.value = "Tehsil A"
     tehsil.on_change(SimpleNamespace(control=tehsil))
     assert qanoongoi.suggestions == []
+
+
+def test_deed_party_areas_accept_kmf_and_compact_formats(monkeypatch):
+    """Party area shares parse 1k2m, 3-0-0, and friends into exact marla."""
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    captured: dict[str, object] = {}
+
+    def fake_party_charges(*, rules, transaction_date, context, parties, jurisdiction):
+        captured["parties"] = parties
+        return {"charges": [], "totals_by_currency": {}, "total_charges": Decimal("0"),
+                "total_currency": "PKR", "warnings": [], "skipped_rules": []}
+
+    monkeypatch.setattr(valuation, "calculate_charges_for_parties", fake_party_charges)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    areas = [control for control in walk_controls(root)
+             if isinstance(control, ft.TextField) and control.label == "Area share (K-M-F or 10k5m)"]
+    # "1k2m" is 1 kanal 2 marla = 22 marla; "3-0-0" is 3 kanal = 60 marla.
+    areas[0].value = "1k2m"
+    areas[1].value = "3-0-0"
+    deed_area = next(control for control in walk_controls(root)
+                     if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+    deed_area.value = "0-20-0"
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    parties = captured["parties"]
+    assert [party["area_marla"] for party in parties] == ["22", "60"]
+    assert _form_error(root).value == ""
+
+
+def test_deed_party_area_rejects_ambiguous_text_with_party_name(monkeypatch):
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    def failing_party_charges(*, rules, transaction_date, context, parties, jurisdiction):
+        raise AssertionError("Charges must not run with an unparsed area.")
+
+    monkeypatch.setattr(valuation, "calculate_charges_for_parties", failing_party_charges)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    areas = [control for control in walk_controls(root)
+             if isinstance(control, ft.TextField) and control.label == "Area share (K-M-F or 10k5m)"]
+    buyer_name = next(control for control in walk_controls(root)
+                      if isinstance(control, ft.TextField) and control.label == "Name (optional)")
+    buyer_name.value = "Ali"
+    areas[0].value = "5m10"
+    deed_area = next(control for control in walk_controls(root)
+                     if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+    deed_area.value = "0-20-0"
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    message = _form_error(root).value
+    assert "Ali" in message
+    assert "Attach a unit" in message
+
+
+def test_identical_exact_pairs_auto_select_location_unit_and_rate(monkeypatch):
+    """Mauza + Square + Kila fetch the exact schedule without dropdown picks.
+
+    Two candidate rows can carry the same square/kila pair (duplicate
+    schedule rows for road-side variants). When their DC rates are identical,
+    the first pair is selected automatically and the single remaining rate
+    plus its unit are preselected too.
+    """
+    matches = [
+        _location_row(7, square_no="2", kila_no="12"),
+        _location_row(8, square_no="2", kila_no="12"),
+    ]
+    rates = {"dc": [_dc_rate(11, 7), _dc_rate(12, 8)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    square = _auto(controls, "square_no")
+    square.value = "2"
+    square.on_change(SimpleNamespace(control=square))
+    kila = _auto(controls, "kila_no")
+    kila.value = "12"
+    kila.on_change(SimpleNamespace(control=kila))
+
+    location_match = _dropdown(controls, "Choose matching schedule location")
+    unit = _dropdown(controls, "DC rate unit")
+    rate = _dropdown(controls, "Matched DC rate")
+    assert location_match.value == "7"
+    assert unit.value == "per_kanal"
+    assert rate.value == "11"
+    status = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Text)
+                  and "DC rate found" in (control.value or ""))
+    assert "Rs. 100.00" in status.value
+
+
+def test_dc_rate_dropdowns_stay_visible_and_searchable_when_nothing_matches(monkeypatch):
+    _patch_estimate_services(monkeypatch, matches=[], rates={"dc": []})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Wrong Mauza"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    unit = _dropdown(controls, "DC rate unit")
+    rate = _dropdown(controls, "Matched DC rate")
+    assert unit.visible is True
+    assert rate.visible is True
+    assert rate.enable_filter is True
+    assert rate.editable is True
+    status = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Text)
+                  and "No schedule location matches" in (control.value or ""))
+
+
+def test_refresh_lists_button_clears_the_hint_cache(monkeypatch):
+    cleared = []
+    monkeypatch.setattr(valuation, "clear_location_hint_cache",
+                        lambda: cleared.append(True))
+    _patch_estimate_services(monkeypatch, matches=[_location_row(7)],
+                             rates={"dc": [_dc_rate(11, 7)]})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.OutlinedButton)
+                  and getattr(control, "content", None) == "Refresh lists")
+    button.on_click(SimpleNamespace(control=button))
+    assert cleared == [True]
+    status_texts = [control.value for control in walk_controls(root)
+                    if isinstance(control, ft.Text) and control.value]
+    assert any("Location suggestion lists refreshed" in text for text in status_texts)
+
+
+def test_schedule_display_radio_sits_beside_the_profile_selector(monkeypatch):
+    _patch_estimate_services(monkeypatch, matches=[_location_row(7)],
+                             rates={"dc": [_dc_rate(11, 7)]})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    profile = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.RadioGroup)
+                   and any(isinstance(radio, ft.Radio) and radio.value == "rural"
+                           for radio in walk_controls(control)))
+    holder = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Row) and profile in control.controls)
+    schedule_radio = _schedule_display_radio(controls)
+    assert schedule_radio in holder.controls
+    assert any(isinstance(item, ft.VerticalDivider) for item in holder.controls)
+    assert schedule_radio.visible is True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 import json
 import os
@@ -92,6 +93,9 @@ def build_current_export_record(
                 "applied_rate": charge.get("applied_rate"),
                 "amount": charge.get("amount"),
                 "currency_code": charge.get("currency_code", "PKR"),
+                # Per-party filer charges carry the buyer/seller label so the
+                # reports can show which party each charge belongs to.
+                "party": charge.get("party"),
                 "rule_snapshot": charge.get("rule_snapshot") or {},
             }
             for charge in charges.get("charges", [])
@@ -128,6 +132,32 @@ def _estimate_rows(estimate: dict[str, Any]) -> list[list[str]]:
     fbr_rate = rate_snapshot.get("fbr") or {}
     result = estimate.get("result_snapshot") or {}
     valuation = result.get("valuation") or {}
+    # The current-result export passes the DC rate row as the location
+    # snapshot (it has no "name" key), so fall back through the joined
+    # location fields before giving up.
+    location_name = (
+        location.get("name") or location.get("mauza")
+        or location.get("location_name") or location.get("locality")
+    )
+    parties_text = ""
+    for party in inputs.get("parties") or []:
+        label = str(party.get("name") or "").strip() or party.get("role") or "party"
+        area = party.get("area_marla")
+        parties_text += (
+            f"{label}: {area if area not in (None, '') else 'whole deed'} marla"
+            f" ({party.get('filer_status') or 'unknown'}); "
+        )
+    parties_text = parties_text.rstrip("; ")
+    comparison = valuation.get("comparison") or {}
+    if comparison and comparison.get("declared_is_below_valuation"):
+        try:
+            deficient = f"PKR {abs(Decimal(str(comparison['difference_declared_minus_valuation'])))}"
+        except (InvalidOperation, ValueError, TypeError):
+            deficient = str(comparison['difference_declared_minus_valuation'])
+    elif comparison:
+        deficient = "None (written value covers the calculated valuation)"
+    else:
+        deficient = "Not checked (no written value entered)"
     details = [
         ("Estimate ID", estimate.get("id") or "Unsaved"),
         ("Transaction date", estimate.get("transaction_date")),
@@ -136,7 +166,7 @@ def _estimate_rows(estimate: dict[str, Any]) -> list[list[str]]:
         ("Jurisdiction", inputs.get("jurisdiction")),
         ("Property type", estimate.get("property_type")),
         ("Classification", estimate.get("classification")),
-        ("Location", location.get("name")),
+        ("Location", location_name),
         ("District", location.get("district")),
         ("Tehsil", location.get("tehsil")),
         ("Mauza", location.get("mauza")),
@@ -145,6 +175,7 @@ def _estimate_rows(estimate: dict[str, Any]) -> list[list[str]]:
         ("Khasra no.", inputs.get("khasra_no")),
         ("Original area", f"{inputs.get('area_value', '')} {inputs.get('area_unit', '')}"),
         ("Square feet per marla", inputs.get("square_feet_per_marla")),
+        ("Deed parties (area marla, filer status)", parties_text or "Not entered"),
         ("DC rate", f"{rate.get('rate_value', '')} {rate.get('rate_unit', '')}"),
         ("FBR rate", f"{fbr_rate.get('rate_value', '')} {fbr_rate.get('rate_unit', '')}" if fbr_rate else "Unavailable"),
         ("Rate publication year", rate.get("published_year")),
@@ -152,9 +183,11 @@ def _estimate_rows(estimate: dict[str, Any]) -> list[list[str]]:
         ("DC rate source", rate.get("source_reference")),
         ("DC rate verification", rate.get("verification_status")),
         ("Full property value", estimate.get("property_value")),
+        ("FBR valuation", valuation.get("fbr_value") if valuation.get("fbr_value") is not None else "Schedule unavailable"),
         ("Transferred share", f"{estimate.get('share_numerator')}/{estimate.get('share_denominator')}"),
         ("Transferred value", estimate.get("transferred_value")),
         ("Registry written value", inputs.get("registry_written_value", estimate.get("declared_consideration"))),
+        ("Deficient amount", deficient),
         ("Building material value", inputs.get("building_material_value")),
         ("Total saved charges (PKR)", estimate.get("total_charges")),
         ("Warnings", "; ".join(estimate.get("warnings", [])) or "None"),
@@ -163,13 +196,20 @@ def _estimate_rows(estimate: dict[str, Any]) -> list[list[str]]:
 
 
 def _charge_rows(estimate: dict[str, Any]) -> list[list[str]]:
-    rows = [["Charge", "Category", "Payer", "Method", "Base", "Rate", "Amount", "Currency", "Source", "Effective dates", "Verification"]]
+    rows = [["Charge", "Category", "Payer", "Party", "Method", "Base", "Rate", "Amount", "Currency", "Source", "Effective dates", "Verification"]]
     for charge in estimate.get("charges", []):
         snapshot = charge.get("rule_snapshot") or {}
+        party = charge.get("party") or {}
+        party_label = ""
+        if party.get("label"):
+            party_label = str(party["label"])
+            if party.get("role"):
+                party_label += f" ({party['role']})"
         rows.append([
             str(charge.get("name", "")),
             str(charge.get("category", "")),
             str(charge.get("payer") or "Not specified"),
+            party_label,
             str(charge.get("calculation_method", "")),
             str(charge.get("calculation_base") if charge.get("calculation_base") is not None else ""),
             str(charge.get("applied_rate") if charge.get("applied_rate") is not None else ""),
@@ -180,6 +220,18 @@ def _charge_rows(estimate: dict[str, Any]) -> list[list[str]]:
             str(snapshot.get("verification_status", "unverified")),
         ])
     return rows
+
+
+def export_estimate_json(estimate: dict[str, Any]) -> bytes:
+    """Return the full estimate record as pretty-printed UTF-8 JSON.
+
+    JSON keeps every snapshot field (including deed parties and per-charge
+    rule snapshots) machine-readable, so the report can be re-processed
+    later without lossy flattening.
+    """
+    return json.dumps(
+        estimate, ensure_ascii=False, indent=2, sort_keys=True, default=str,
+    ).encode("utf-8")
 
 
 def export_estimate_csv(estimate: dict[str, Any]) -> bytes:
@@ -370,7 +422,7 @@ def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
         charge_style = ParagraphStyle("ValuationChargeCell", parent=body, fontSize=7, leading=9)
         header_style = ParagraphStyle("ValuationChargeHead", parent=charge_style,
                                       textColor=colors.white)
-        header_labels = ["Charge", "Category", "Payer", "Method", "Base", "Rate",
+        header_labels = ["Charge", "Category", "Payer", "Party", "Method", "Base", "Rate",
                          "Amount", "Currency", "Source", "Effective dates", "Verification"]
         chart_data = [[Paragraph(f"<b>{escape(label)}</b>", header_style)
                        for label in header_labels]]
@@ -381,8 +433,8 @@ def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
             ])
         charge_table = Table(
             chart_data,
-            colWidths=[26 * mm, 22 * mm, 16 * mm, 16 * mm, 24 * mm, 14 * mm,
-                       24 * mm, 14 * mm, 30 * mm, 22 * mm, 18 * mm],
+            colWidths=[24 * mm, 20 * mm, 14 * mm, 20 * mm, 14 * mm, 22 * mm, 13 * mm,
+                       22 * mm, 13 * mm, 26 * mm, 20 * mm, 16 * mm],
             repeatRows=1,
         )
         charge_table.setStyle(TableStyle([
@@ -434,7 +486,7 @@ def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
 
 
 def export_estimate_history(records: list[dict[str, Any]], file_format: str) -> bytes:
-    """Export a compact estimate-history summary to CSV, XLSX, or PDF."""
+    """Export a compact estimate-history summary to CSV, XLSX, PDF, or JSON."""
     normalized = file_format.strip().lower()
     headers = ["Estimate ID", "Date", "Client", "Property", "Classification", "Transferred value", "Charges (PKR)"]
     rows = [[str(record.get(key, "") or "") for key in (
@@ -447,6 +499,12 @@ def export_estimate_history(records: list[dict[str, Any]], file_format: str) -> 
         writer.writerow(headers)
         writer.writerows(rows)
         return text_output.getvalue().encode("utf-8-sig")
+    if normalized == "json":
+        # Full machine-readable records, same shape as the single-estimate
+        # JSON export, so history keeps every snapshot field.
+        return json.dumps(
+            records, ensure_ascii=False, indent=2, sort_keys=True, default=str,
+        ).encode("utf-8")
     if normalized == "xlsx":
         workbook = Workbook()
         sheet = workbook.active
@@ -477,4 +535,4 @@ def export_estimate_history(records: list[dict[str, Any]], file_format: str) -> 
         ]))
         document.build([Paragraph("Valuation Estimate History", getSampleStyleSheet()["Title"]), table])
         return output.getvalue()
-    raise ValuationReportError("Choose CSV, XLSX, or PDF for estimate reports.")
+    raise ValuationReportError("Choose CSV, XLSX, PDF, or JSON for estimate reports.")

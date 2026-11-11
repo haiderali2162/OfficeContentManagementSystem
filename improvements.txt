@@ -1,6 +1,11 @@
-still there are a number of issues. here is what i actually want to do.
-in the calculate tab:
-    1. we inspect registry deeds for any kind of under valuation. we manually check each registry using the excel file and calculate its exact valuation based on the mauza of a tehsil, district & qanoongoi. the muaza is the most important as there are very low chances of the same mauza in ther tehsil & districts. then we find what square no and killa no is used to write registry. from that square and killa we can retrieve its per marla/acre/kanal valuation then we manually do the calculation to check how much area of the deed is. check all the beneficiaries if they are active, in-active or late active etc status. obviously there are some other fees also we take into account like plra fee, some fixed fees etc which we already set on the fee rules page.
-    2. on the calculate page allow user to write more then one buyer/seller aginst a fee calculation with their individual areas and fbr filer related status.
-    3. also make option to find the deficiant amount by asking user to enter the total written amount of the registry (make it option for the user).
-    4. also the when i tested the app, i selected the tehsil but qanoongoi related to other tehsil were also showing and the option at the top about showing the individual square/killa no was also not visible and upon clicking the calculate button it says something about selecting the dc schedule which was not showing and also not displaying anything to select from. it should have auto fetched the value by now since it has the enough information to fetch the exect value.
+on calculate tab.
+1. allow wild cards in the search. not on just the calculate page but wherever an input field is available in the whole app now and in the future. traditional wild cards like *,? etc.
+2. tehsil field suggestion is not showing or working or slow. app should auto fetch the districts, tehsils, qanoongoi and mauzas to prepare a cache and keep that cache for faster search options. fix it.
+3. square no suggestion or list of a selected muaza is not showing fix it.
+4. in the "choose matching schedule location" it shows mauza . tehsil . square xx . kila xx. it is missing the unit or unit of measurement next to it. this field is also not searchable it only shows a list to choose from which is inconvinient.
+5. also the new area writing method like 10k or 10k2m or 10f etc or the old one like k-m-f. allow both methods wherever we are required to enter area.
+6. fbr fees are not calculated on rural schedule on calculate tab.
+
+
+on the DC/FBR rate tab
+1. importing fbr schedule gives error for a square no being blank, which is normal because in case of square no blank we usaully search property fbr valuation by selecting the "revenue circle" and "property area". these two are important if square no is not present but if square no present then revenue circle and square no is important. so fix the fbr schedule import accordingly.

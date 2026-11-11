@@ -17,6 +17,7 @@ losing precision when converting sarsahi and square karam.
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable
+import re
 
 
 class AreaError(ValueError):
@@ -494,3 +495,104 @@ def make_area_settings(
         kila_marla=kila_marla,
         kila_feet=kila_feet,
     )
+
+
+# Deed-party area shares accept compact written forms. ``D`` in the
+# developer's description is a digit placeholder: DKDM is "10k5m", DKDMDF is
+# "10k5m9f". A plain number means kanal, and the unit letters are
+# case-insensitive.
+_AREA_EXPRESSION_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*([kmf]?)")
+
+
+def parse_area_expression(
+    value: str,
+    settings: AreaSettings | None = None,
+) -> Decimal:
+    """Parse a written area share and return it in marla.
+
+    Accepted formats (case-insensitive, spaces allowed between parts):
+
+    - ``"10"``            10 kanal (a plain number means kanal)
+    - ``"10k"``           10 kanal
+    - ``"5m"``            5 marla
+    - ``"100f"``          100 square feet
+    - ``"10k5m"``         10 kanal 5 marla
+    - ``"10k5m9f"``       10 kanal 5 marla 9 square feet (order kept as k, m, f)
+    - ``"10-5"``          10 kanal 5 marla
+    - ``"10-5-9"``        Kanal-Marla-Square Feet, same as the deed area field
+
+    The result is exact Decimal marla; square feet convert through the
+    configured square-feet-per-marla convention.
+    """
+
+    settings = settings or AreaSettings()
+    if isinstance(value, bool) or not isinstance(value, str) or not value.strip():
+        raise AreaError(
+            "Enter the party's area share, for example 10k5m, 5m, 100f, or 2-5-0."
+        )
+
+    text = value.strip()
+    if "-" in text:
+        parts = [part.strip() for part in text.split("-")]
+        if any(part == "" for part in parts):
+            raise AreaError(
+                "Use Kanal-Marla-Square Feet without empty parts, for example 10-5-9."
+            )
+        try:
+            numbers = [int(part) for part in parts]
+        except ValueError:
+            raise AreaError(
+                "Dash formats need whole numbers, for example 10-5-9 (or write "
+                "the compact form 10k5m9f)."
+            ) from None
+        if len(numbers) == 1:
+            # A lone dashed number ("10") is the same as a plain number: kanal.
+            kanal, marla, feet = numbers[0], 0, 0
+        elif len(numbers) == 2:
+            kanal, marla, feet = numbers[0], numbers[1], 0
+        elif len(numbers) == 3:
+            kanal, marla, feet = numbers
+        else:
+            raise AreaError(
+                "Use Kanal-Marla-Square Feet with at most three parts, for example 10-5-9."
+            )
+        land_area = LandArea.from_kmf(kanal, marla, feet, settings=settings)
+        return land_area.square_feet / Decimal(settings.square_feet_per_marla)
+
+    normalized = re.sub(r"\s+", " ", text).casefold()
+    if not re.fullmatch(r"\s*(?:\d+(?:\.\d+)?\s*[kmf]?\s*)+", normalized):
+        raise AreaError(
+            "Use kanal/marla/feet units, for example 10k5m, 5m, or 100f "
+            "(a plain number means kanal)."
+        )
+
+    amounts: dict[str, Decimal] = {}
+    tokens = list(_AREA_EXPRESSION_TOKEN.finditer(normalized))
+    bare_positions = [index for index, match in enumerate(tokens) if not match.group(2)]
+    if len(bare_positions) > 1 or (len(bare_positions) == 1 and len(tokens) > 1):
+        # A bare number means kanal only on its own; mixed with unit letters
+        # ("5m10") the meaning is ambiguous, so reject it.
+        raise AreaError(
+            "Attach a unit to each number, for example 10k5m or 5m9f; "
+            "a plain number on its own means kanal."
+        )
+    if bare_positions:
+        amounts = {"k": Decimal(tokens[0].group(1))}
+    else:
+        for match in tokens:
+            unit = match.group(2)
+            if unit in amounts:
+                raise AreaError(
+                    f"The unit '{unit}' appears more than once; combine them once, "
+                    "for example 10k5m."
+                )
+            amounts[unit] = Decimal(match.group(1))
+
+    marla_value = Decimal("0")
+    if "k" in amounts:
+        marla_value += amounts["k"] * Decimal(settings.marla_per_kanal)
+    if "m" in amounts:
+        marla_value += amounts["m"]
+    if "f" in amounts:
+        marla_value += amounts["f"] / Decimal(settings.square_feet_per_marla)
+    return marla_value

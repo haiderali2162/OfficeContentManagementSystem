@@ -1,6 +1,7 @@
 import pytest
 from decimal import Decimal
 
+import core.area_engine as area_engine
 from core.area_engine import make_area_settings
 
 from core.area_engine import (
@@ -152,3 +153,40 @@ def test_decimal_acre_conversion():
     area = LandArea.from_kmf(4, 0, 0, settings)
 
     assert area.to_acres(settings) == Decimal("0.5")
+
+
+def test_parse_area_expression_accepts_plain_kanal_and_unit_letters():
+    # A plain number means kanal; "k"/"m"/"f" attach kanal/marla/feet and are
+    # case-insensitive.
+    assert area_engine.parse_area_expression("10") == Decimal(200)
+    assert area_engine.parse_area_expression("10k") == Decimal(200)
+    assert area_engine.parse_area_expression("10K") == Decimal(200)
+    assert area_engine.parse_area_expression("5m") == Decimal(5)
+    assert area_engine.parse_area_expression("5M") == Decimal(5)
+    assert area_engine.parse_area_expression("100f") == Decimal(100) / Decimal(272)
+    assert area_engine.parse_area_expression("100F") == Decimal(100) / Decimal(272)
+
+
+def test_parse_area_expression_accepts_compound_and_dash_forms():
+    assert area_engine.parse_area_expression("10k5m") == Decimal(205)
+    assert area_engine.parse_area_expression("10K5M") == Decimal(205)
+    assert area_engine.parse_area_expression("10k5m9f") == Decimal(205) + Decimal(9) / Decimal(272)
+    assert area_engine.parse_area_expression("10-5") == Decimal(205)
+    assert area_engine.parse_area_expression("10-5-9") == Decimal(205) + Decimal(9) / Decimal(272)
+    # The deed-area K-M-F format keeps working unchanged.
+    assert area_engine.parse_area_expression("2-5-0") == Decimal(45)
+
+
+def test_parse_area_expression_honours_regional_convention():
+    # 225 square feet per marla: 1 kanal stays 20 marla, feet scale changes.
+    settings = make_area_settings(square_feet_per_marla=225)
+    assert area_engine.parse_area_expression("1k", settings=settings) == Decimal(20)
+    assert area_engine.parse_area_expression("100f", settings=settings) == Decimal(100) / Decimal(225)
+
+
+def test_parse_area_expression_rejects_ambiguous_or_invalid_text():
+    for bad_text in (
+        "", "   ", "10 5", "5m10", "10k5k", "abc", "10x", "10-", "-5", "1.0.0k",
+    ):
+        with pytest.raises(area_engine.AreaError):
+            area_engine.parse_area_expression(bad_text)

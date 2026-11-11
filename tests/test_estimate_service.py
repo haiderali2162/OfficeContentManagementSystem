@@ -121,3 +121,66 @@ def test_estimate_snapshots_survive_optional_link_deletion(estimate_database):
     assert saved["location_snapshot"]["name"] == "Test Mauza"
     assert saved["rate_snapshot"]["id"] == ids["rate"]
 
+
+
+def test_reopened_estimate_charges_carry_party_labels_from_snapshot(estimate_database):
+    """Per-party filer charges keep their buyer/seller labels after saving."""
+    _engine, ids = estimate_database
+    inputs = {
+        "location_id": ids["location"],
+        "transaction_date": date(2026, 1, 1),
+        "transaction_type": "sale",
+        "property_type": "Residential",
+        "classification": "Urban",
+        "area_value": "4-0-0",
+        "area_unit": "kmf",
+        "share_numerator": 1,
+        "share_denominator": 5,
+    }
+    valuation = {
+        "rate_id": ids["rate"],
+        "area_square_feet": Decimal("21760"),
+        "property_value": Decimal("400000.00"),
+        "transferred_value": Decimal("80000.00"),
+        "declared_consideration": None,
+        "warnings": [],
+        "rate": {"rate_unit": "per_acre"},
+    }
+    charges = {
+        "totals_by_currency": {"PKR": Decimal("250.00")},
+        "warnings": [],
+        "charges": [
+            {
+                "tax_fee_rule_id": None,
+                "name": "Hypothetical fee",
+                "category": "test_fee",
+                "payer": "buyer",
+                "calculation_method": "fixed_amount",
+                "calculation_base": None,
+                "applied_rate": None,
+                "amount": Decimal("250.00"),
+                "currency_code": "PKR",
+                "rule_snapshot": {},
+            },
+            {
+                "tax_fee_rule_id": None,
+                "name": "236K (Active filer)",
+                "category": "236k",
+                "payer": "buyer",
+                "calculation_method": "percentage",
+                "calculation_base": None,
+                "applied_rate": Decimal("1.25"),
+                "amount": Decimal("208.28"),
+                "currency_code": "PKR",
+                "party": {"label": "Buyer 1", "role": "buyer"},
+                "rule_snapshot": {},
+            },
+        ],
+    }
+    estimate_id = estimate_service.save_estimate(
+        inputs=inputs, valuation=valuation, charges=charges, client_id=ids["client"]
+    )
+
+    saved = estimate_service.get_estimate(estimate_id)
+    assert saved["charges"][0].get("party") is None
+    assert saved["charges"][1]["party"] == {"label": "Buyer 1", "role": "buyer"}

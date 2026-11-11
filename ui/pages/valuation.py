@@ -12,14 +12,16 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 import json
 import re
+from pathlib import Path
 from typing import Any, Callable
 
 import flet as ft
 
-from core.area_engine import AreaSettings
+from core.area_engine import AreaError, AreaSettings, parse_area_expression
 from core.models import DC_RATE_UNITS
 from services.dc_rate_service import (
     DCRateServiceError,
+    clear_location_hint_cache,
     expand_references,
     find_schedule_location_matches,
     list_dc_rates,
@@ -44,6 +46,7 @@ from services.valuation_report_service import (
     build_current_export_record,
     export_estimate_history,
     export_estimate_csv,
+    export_estimate_json,
     export_estimate_pdf,
     export_estimate_xlsx,
     export_estimate_ods,
@@ -147,6 +150,14 @@ def build_valuation_page(
             allowed_extensions=[extension],
             src_bytes=payload,
         )
+        if destination:
+            # Flet's save dialog has been observed to return the chosen path
+            # without always writing src_bytes, which produced empty PDFs.
+            # Guarantee the file holds the payload; writing a few KB is fast
+            # enough to stay in the event handler.
+            path = Path(destination)
+            if not path.is_file() or path.stat().st_size != len(payload):
+                path.write_bytes(payload)
         status.value = f"Report saved to {destination}." if destination else "Report export cancelled."
         page.update()
 
@@ -161,6 +172,7 @@ def build_valuation_page(
                     "xlsx": export_estimate_xlsx,
                     "pdf": export_estimate_pdf,
                     "ods": export_estimate_ods,
+                    "json": export_estimate_json,
                 }
                 payload = exporters[file_format](saved)
                 await save_report(
@@ -195,6 +207,7 @@ def build_valuation_page(
                     "xlsx": export_estimate_xlsx,
                     "pdf": export_estimate_pdf,
                     "ods": export_estimate_ods,
+                    "json": export_estimate_json,
                 }
                 payload = exporters[file_format](record)
                 await save_report(
@@ -248,6 +261,8 @@ def build_valuation_page(
         ft.dropdown.Option("none", "All / not specified"),
     ])
     floor = ft.TextField(label="Floor (if applicable)", width=180)
+    # Searchable rate menus: the developer asked for a permanently visible
+    # DC schedule dropdown with a type-to-filter entry option.
     dc_rate_unit = ft.Dropdown(label="DC rate unit", hint_text="Unit appears when a matching rate is found", width=240, options=[
         ft.dropdown.Option(unit, RATE_UNITS[unit]) for unit in DC_RATE_UNITS
     ])
@@ -258,9 +273,18 @@ def build_valuation_page(
     area_unit = ft.Dropdown(label="Area input unit", value="kmf", visible=False, options=[
         ft.dropdown.Option("kmf", "K-M-F")
     ])
-    dc_rate_choice = ft.Dropdown(label="Matched DC rate", hint_text="No matching rate yet", expand=True, options=[], visible=False)
-    fbr_rate_choice = ft.Dropdown(label="Matched FBR rate (editable)", hint_text="No matching rate yet", expand=True, options=[], visible=False)
-    location_match = ft.Dropdown(label="Choose matching schedule location", expand=True, options=[], visible=False)
+    dc_rate_choice = ft.Dropdown(
+        label="Matched DC rate", hint_text="No matching rate yet", expand=True,
+        options=[], enable_filter=True, editable=True,
+    )
+    fbr_rate_choice = ft.Dropdown(
+        label="Matched FBR rate (editable)", hint_text="No matching rate yet", expand=True,
+        options=[], enable_filter=True, editable=True, visible=False,
+    )
+    location_match = ft.Dropdown(
+        label="Choose matching schedule location", expand=True, options=[],
+        visible=False, enable_filter=True, editable=True,
+    )
     # Display mode for the schedule location choices: the rows exactly as
     # imported ("Square 1, 13, 40-41") or expanded into one choice per
     # individual square/Kila pair using the importer's expansion rules.
@@ -273,6 +297,15 @@ def build_valuation_page(
         ], spacing=14, wrap=True),
         visible=False,
     )
+    # The display-mode radio sits at the top of the card, right after the
+    # Rural/Urban choice and separated by a vertical divider (developer
+    # request); the divider is hidden whenever the radio itself is hidden.
+    schedule_display_divider = ft.VerticalDivider(width=18, visible=False)
+
+    def _set_schedule_display_visible(value: bool, disabled: bool) -> None:
+        schedule_display.visible = value
+        schedule_display.disabled = disabled
+        schedule_display_divider.visible = value
     # Searchable square/Kila filter: typing "2/12" or "2 - 12" fills the two
     # cadastral inputs at once and re-runs the schedule match, so rural DC
     # rates are fetched from Mauza + square + Kila in one place. Alphanumeric
@@ -339,8 +372,8 @@ def build_valuation_page(
                 ft.dropdown.Option("buyer", "Buyer"), ft.dropdown.Option("seller", "Seller"),
             ]),
             "name": ft.TextField(label="Name (optional)", value=name_value, width=170),
-            "area": ft.TextField(label="Area share (marla)", value=area_text, width=160,
-                                 hint_text="Their share of the deed"),
+            "area": ft.TextField(label="Area share (K-M-F or 10k5m)", value=area_text, width=190,
+                                 hint_text="e.g. 2-5-0, 10k5m, 5m, 100f; plain number = kanal"),
             "status": ft.Dropdown(label="Tax status", value=status_value, width=170, options=[
                 ft.dropdown.Option(item, label) for item, label in (
                     ("unknown", "Unknown"), ("ATL", "ATL / active filer"),
@@ -650,8 +683,7 @@ def build_valuation_page(
         # Individual expansion follows the rural import rules only. The radio
         # stays visible for rural so the user always finds it; without
         # candidates it is disabled because there is nothing to display yet.
-        schedule_display.visible = property_profile.value == "rural"
-        schedule_display.disabled = not candidates
+        _set_schedule_display_visible(property_profile.value == "rural", not candidates)
         valid_keys = {entry[0] for entry in entries}
         current_value = str(location_match.value) if location_match.value else ""
         if len(entries) == 1:
@@ -662,21 +694,56 @@ def build_valuation_page(
             # The selected option (for example a row id kept while switching
             # to individual pair keys) no longer exists; clear the stale pick.
             location_match.value = None
+        if location_match.value is None and len(exact_keys) > 1:
+            # Rural auto-fetch: Mauza + Square + Kila can identify the exact
+            # schedule outright. Duplicate schedule rows for the same pair
+            # (for example road-side variants sharing one published rate) are
+            # not a real choice: when every matched location's DC rows carry
+            # the identical rate, select the first exact pair automatically.
+            exact_ids = sorted({key.split(":")[0] for key in exact_keys})
+            dc_exact = [
+                row for row in all_rates
+                if row.get("schedule_type") == "dc" and str(row.get("location_id")) in exact_ids
+            ]
+
+            def _rate_signature(row: dict[str, Any]) -> tuple[str, ...]:
+                return (
+                    str(row.get("rate_value")), str(row.get("rate_unit")),
+                    str(row.get("classification")), str(row.get("floor")),
+                    str(row.get("effective_from")),
+                )
+
+            if dc_exact and len({_rate_signature(row) for row in dc_exact}) == 1:
+                location_match.value = sorted(exact_keys)[0]
         if not candidates:
             rate_records["dc"], rate_records["fbr"] = [], []
             dc_rate_choice.options, fbr_rate_choice.options = [], []
             dc_rate_choice.value, fbr_rate_choice.value = None, None
             dc_rate_unit.options, fbr_rate_unit.options = [], []
             dc_rate_unit.value, fbr_rate_unit.value = None, None
-            dc_rate_unit.visible = dc_rate_choice.visible = False
+            # The DC unit and rate dropdowns stay visible permanently
+            # (developer request): an empty menu with its hint beats a
+            # control that appears and disappears.
+            dc_rate_unit.visible = dc_rate_choice.visible = True
             fbr_rate_unit.visible = fbr_rate_choice.visible = False
             rate_match_status.value = "No schedule location matches these details. Check the selected Mauza, square and Kila."
             # Rural keeps the display radio visible but inactive (no rows to
             # show either way).
-            schedule_display.visible = property_profile.value == "rural"
-            schedule_display.disabled = True
+            _set_schedule_display_visible(property_profile.value == "rural", True)
             page.update()
             return
+
+        # A chosen (or auto-selected) location determines the exact schedule:
+        # only its rate rows feed the unit/rate menus below, so a unique rate
+        # is picked automatically instead of asking the user to disambiguate
+        # rows from other candidate locations.
+        selected_key_value = str(location_match.value) if location_match.value else ""
+        selected_location_id = selected_key_value.split(":")[0]
+        if selected_location_id:
+            all_rates = [
+                row for row in all_rates
+                if str(row.get("location_id")) == selected_location_id
+            ]
 
         if classification.value not in (None, "", "none"):
             all_rates = [row for row in all_rates if str(row.get("classification") or "").casefold()
@@ -687,13 +754,19 @@ def build_valuation_page(
             rows = [row for row in all_rates if row.get("schedule_type") == schedule]
             units = sorted({row["rate_unit"] for row in rows})
             unit_control.options = [ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units]
-            unit_control.visible = bool(units) and (schedule == "dc" or property_profile.value == "urban")
+            # The DC unit and rate menus stay permanently visible (developer
+            # request); the FBR pair follows the urban-only display rule.
+            unit_control.visible = (
+                schedule == "dc" or bool(units) and property_profile.value == "urban"
+            )
             if unit_control.value not in units:
                 unit_control.value = units[0] if len(units) == 1 else None
             rows = [row for row in rows if not unit_control.value or row["rate_unit"] == unit_control.value]
             rate_records[schedule] = rows
             rate_control.options = [ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows]
-            rate_control.visible = bool(rows) and (schedule == "dc" or property_profile.value == "urban")
+            rate_control.visible = (
+                schedule == "dc" or bool(rows) and property_profile.value == "urban"
+            )
             if rate_control.value not in {str(row["id"]) for row in rows}:
                 rate_control.value = str(rows[0]["id"]) if len(rows) == 1 else None
         classes = sorted({str(row.get("classification")) for row in all_rates if row.get("classification")})
@@ -830,6 +903,25 @@ def build_valuation_page(
     property_profile.on_change = refresh_location_state
     # Switching between imported and individual display rebuilds the choices.
     schedule_display.on_change = refresh_rate_matches
+
+    def refresh_cached_location_lists(_=None):
+        """Drop the cached suggestion lists and reload them from the DB.
+
+        The location-hint service caches type-ahead values so repeated
+        keystrokes and tab switches stay fast; this button is the developer's
+        manual escape hatch after a schedule import or any doubt that the
+        cached district/tehsil/qanoongoi/mauza lists are stale.
+        """
+        clear_location_hint_cache()
+        refresh_location_state()
+        status.value = "Location suggestion lists refreshed from the saved schedules."
+        page.update()
+
+    location_refresh_button = ft.OutlinedButton(
+        "Refresh lists", on_click=refresh_cached_location_lists,
+        tooltip=("Clears the cached district/tehsil/qanoongoi/mauza suggestion "
+                 "lists and reloads them from the saved schedules."),
+    )
     dc_rate_choice.on_select = refresh_rate_matches
     fbr_rate_choice.on_select = refresh_rate_matches
 
@@ -865,6 +957,7 @@ def build_valuation_page(
                 ft.OutlinedButton("Export Excel", on_click=estimate_export_handler(estimate_id, "xlsx")),
                 ft.OutlinedButton("Export PDF", on_click=estimate_export_handler(estimate_id, "pdf")),
                 ft.OutlinedButton("Export ODS", on_click=estimate_export_handler(estimate_id, "ods")),
+                ft.OutlinedButton("Export JSON", on_click=estimate_export_handler(estimate_id, "json")),
                 ft.TextButton("Close", on_click=lambda _: page.pop_dialog()),
             ],
         ))
@@ -1050,22 +1143,25 @@ def build_valuation_page(
             # Deed parties replace the previous single buyer/seller status
             # dropdowns. A role with exactly one party keeps its status in the
             # global context; with several parties the filer-dependent rules
-            # are evaluated per party instead.
+            # are evaluated per party instead. Party areas accept the same
+            # written formats as the deed area: "10" or "10k" means 10 kanal,
+            # "5m" marla, "100f" square feet, "10k5m9f" or "10-5-9" the full
+            # K-M-F form (case-insensitive).
             parties = []
             for row in party_rows:
                 area_text = (row["area"].value or "").strip()
+                area_marla_text = None
                 if area_text:
                     try:
-                        Decimal(area_text)
-                    except (InvalidOperation, ValueError):
+                        area_marla_value = parse_area_expression(area_text, settings=settings)
+                    except AreaError as exc:
                         party_name = (row["name"].value or "").strip() or row["role"].value or "party"
-                        raise ValueError(
-                            f"Party '{party_name}': the area share must be a number (marla)."
-                        ) from None
+                        raise ValueError(f"Party '{party_name}': {exc}") from None
+                    area_marla_text = str(area_marla_value)
                 parties.append({
                     "role": row["role"].value or "buyer",
                     "name": (row["name"].value or "").strip() or None,
-                    "area_marla": area_text or None,
+                    "area_marla": area_marla_text,
                     "filer_status": row["status"].value or "unknown",
                 })
             buyer_parties = [party for party in parties if party["role"] == "buyer"]
@@ -1491,12 +1587,16 @@ def build_valuation_page(
         ft.Container(
             ft.Column([
                 ft.Text("Property Profile & Location", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
-                property_profile,
+                # Display-mode radio sits at the top, right after the
+                # Rural/Urban choice and a vertical divider (developer
+                # request); it stays disabled until a Mauza matches.
+                ft.Row([property_profile, schedule_display_divider, schedule_display],
+                       wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 location_fields_row,
-                schedule_display,
                 location_match,
                 location_search,
-                rate_match_status,
+                ft.Row([rate_match_status, location_refresh_button],
+                       wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ], spacing=10),
             padding=14,
             bgcolor="#FFFFFF",
@@ -1526,7 +1626,8 @@ def build_valuation_page(
             ft.Column([
                 ft.Text("Buyers & sellers (deed parties)", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
                 ft.Text(
-                    "Add each buyer and seller with their own area share (marla) and tax status. "
+                    "Add each buyer and seller with their own area share and tax status. "
+                    "Areas accept 2-5-0, 10k5m, 5m, or 100f (a plain number means kanal). "
                     "Taxes that depend on filer status are calculated per party on that party's share.",
                     size=12, color="#64748B",
                 ),
@@ -1551,6 +1652,7 @@ def build_valuation_page(
             ft.OutlinedButton("Excel", on_click=current_export_handler("xlsx")),
             ft.OutlinedButton("PDF", on_click=current_export_handler("pdf")),
             ft.OutlinedButton("ODS", on_click=current_export_handler("ods")),
+            ft.OutlinedButton("JSON", on_click=current_export_handler("json")),
         ], wrap=True, spacing=6),
         form_error,
         status,
@@ -1562,6 +1664,7 @@ def build_valuation_page(
             ft.OutlinedButton("Export history CSV", on_click=history_export_handler("csv")),
             ft.OutlinedButton("Export history Excel", on_click=history_export_handler("xlsx")),
             ft.OutlinedButton("Export history PDF", on_click=history_export_handler("pdf")),
+            ft.OutlinedButton("Export history JSON", on_click=history_export_handler("json")),
         ], wrap=True, spacing=6),
         history_list,
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)

@@ -1910,3 +1910,111 @@ def test_rural_location_hints_follow_hierarchy_parents(rate_database):
         fields=["mauza"], limit=10, hierarchy=True,
     )
     assert fresh["mauza"] == ["Chak 1", "Chak 2", "Chak 3"]
+
+
+def test_rural_hint_scoping_strictly_follows_selected_levels(rate_database):
+    """Qanoongoi stays empty without a Tehsil; Square without a Mauza, etc.
+
+    The developer reported Qanoongoi suggestions from other tehsils and
+    "wild" Square suggestions. Each level now only offers values once the
+    essential levels above it are selected, and Qanoongoi (optional) does not
+    gate Mauza.
+    """
+    first_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Chak 1", mauza="Chak 1", land_type="rural",
+        district="District A", tehsil="Tehsil A", qanoongoi="Qan A",
+        square_no="2", kila_no="12",
+    ))
+    dc_rate_service.create_dc_rate(location_id=first_id, **_rate_values())
+    other_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Chak 9", mauza="Chak 9", land_type="rural",
+        district="District A", tehsil="Tehsil B", qanoongoi="Qan B",
+        square_no="5", kila_no="3",
+    ))
+    dc_rate_service.create_dc_rate(location_id=other_id, **_rate_values())
+
+    # Tehsil empty: Qanoongoi and Mauza offer nothing at all, so the
+    # other tehsil's Qan B can never appear.
+    hints = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A"},
+        fields=["tehsil", "qanoongoi", "mauza", "square_no", "kila_no"],
+        limit=10, hierarchy=True,
+    )
+    assert hints["tehsil"] == ["Tehsil A", "Tehsil B"]
+    assert hints["qanoongoi"] == []
+    assert hints["mauza"] == []
+    assert hints["square_no"] == []
+    assert hints["kila_no"] == []
+
+    # Tehsil selected: Qanoongoi and Mauza scope to it; Square still waits.
+    hints = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A", "tehsil": "Tehsil A"},
+        fields=["qanoongoi", "mauza", "square_no", "kila_no"],
+        limit=10, hierarchy=True,
+    )
+    assert hints["qanoongoi"] == ["Qan A"]
+    assert hints["mauza"] == ["Chak 1"]
+    assert hints["square_no"] == []
+    assert hints["kila_no"] == []
+
+    # Mauza selected: Square appears; Kila waits for the Square.
+    hints = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A", "tehsil": "Tehsil A", "mauza": "Chak 1"},
+        fields=["square_no", "kila_no"],
+        limit=10, hierarchy=True,
+    )
+    assert hints["square_no"] == ["2"]
+    assert hints["kila_no"] == []
+
+    # Square selected: Kila offers only that square's values.
+    hints = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A", "tehsil": "Tehsil A",
+                 "mauza": "Chak 1", "square_no": "2"},
+        fields=["kila_no"],
+        limit=10, hierarchy=True,
+    )
+    assert hints["kila_no"] == ["12"]
+
+
+def test_location_hint_cache_serves_repeats_until_cleared(rate_database):
+    """Repeated identical hint queries hit a cache; the refresh button clears.
+
+    New schedule rows stay invisible in the suggestions until the cache is
+    cleared, which is exactly what the Calculate tab's refresh button is for.
+    """
+    location_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Chak 1", mauza="Chak 1", land_type="rural",
+        district="District A", tehsil="Tehsil A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+    context = {"district": "District A", "tehsil": "Tehsil A"}
+
+    first = dc_rate_service.list_location_hint_values(
+        land_type="rural", context=context, fields=["mauza"], limit=10,
+        hierarchy=True,
+    )
+    assert first["mauza"] == ["Chak 1"]
+
+    # A location added afterwards is not in the cached answer...
+    new_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Chak 2", mauza="Chak 2", land_type="rural",
+        district="District A", tehsil="Tehsil A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=new_id, **_rate_values())
+    cached = dc_rate_service.list_location_hint_values(
+        land_type="rural", context=context, fields=["mauza"], limit=10,
+        hierarchy=True,
+    )
+    assert cached["mauza"] == ["Chak 1"]
+
+    # ...until the cache is cleared (the refresh button's job).
+    dc_rate_service.clear_location_hint_cache()
+    refreshed = dc_rate_service.list_location_hint_values(
+        land_type="rural", context=context, fields=["mauza"], limit=10,
+        hierarchy=True,
+    )
+    assert refreshed["mauza"] == ["Chak 1", "Chak 2"]

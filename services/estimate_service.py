@@ -193,6 +193,7 @@ def get_estimate(estimate_id: int) -> dict[str, Any] | None:
         item = session.execute(statement).unique().scalar_one_or_none()
         if item is None:
             return None
+        charges_rows = _charge_rows_with_party(item)
         return {
             "id": item.id,
             "transaction_date": item.transaction_date,
@@ -213,18 +214,36 @@ def get_estimate(estimate_id: int) -> dict[str, Any] | None:
             "rate_snapshot": json.loads(item.rate_snapshot_json) if item.rate_snapshot_json else None,
             "result_snapshot": json.loads(item.result_snapshot_json) if item.result_snapshot_json else None,
             "warnings": json.loads(item.warnings_json) if item.warnings_json else [],
-            "charges": [
-                {
-                    "name": charge.name,
-                    "category": charge.category,
-                    "payer": charge.payer,
-                    "calculation_method": charge.calculation_method,
-                    "calculation_base": charge.calculation_base,
-                    "applied_rate": charge.applied_rate,
-                    "amount": charge.amount,
-                    "currency_code": charge.currency_code,
-                    "rule_snapshot": json.loads(charge.rule_snapshot_json),
-                }
-                for charge in item.charges
-            ],
+            "charges": charges_rows,
         }
+
+
+def _charge_rows_with_party(item: ValuationEstimate) -> list[dict[str, Any]]:
+    """Rebuild charge rows and restore per-party labels from the snapshot.
+
+    The charge table has no party column; the full result snapshot recorded
+    at save time does. Both lists were written in the same order from one
+    calculation, so rows are matched by position to surface which buyer or
+    seller each filer-dependent charge belongs to in saved-estimate reports.
+    """
+    rows = [
+        {
+            "name": charge.name,
+            "category": charge.category,
+            "payer": charge.payer,
+            "calculation_method": charge.calculation_method,
+            "calculation_base": charge.calculation_base,
+            "applied_rate": charge.applied_rate,
+            "amount": charge.amount,
+            "currency_code": charge.currency_code,
+            "rule_snapshot": json.loads(charge.rule_snapshot_json),
+        }
+        for charge in item.charges
+    ]
+    snapshot = json.loads(item.result_snapshot_json) if item.result_snapshot_json else {}
+    snapshot_charges = ((snapshot.get("charges") or {}).get("charges")) or []
+    for row, snapshot_charge in zip(rows, snapshot_charges):
+        party = (snapshot_charge or {}).get("party")
+        if party:
+            row["party"] = party
+    return rows
