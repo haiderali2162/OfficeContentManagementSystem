@@ -12,7 +12,7 @@ import sqlite3
 import sys
 import re
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import func, or_, select
@@ -214,6 +214,15 @@ def _reference_values(value: Any) -> list[str]:
         else:
             tokens.append(segment)
     return list(dict.fromkeys(tokens))
+
+
+def expand_references(value: Any) -> list[str]:
+    """Public view of :func:`_reference_values` for display code.
+
+    Breaks stored lists such as ``1-3, 5`` and ``3/B`` into the individual
+    tokens the importer documents, without touching the stored record.
+    """
+    return _reference_values(value)
 
 
 def _normalize_reference(value: Any) -> str | None:
@@ -1040,17 +1049,54 @@ def _apply_location_context(statement, context: dict[str, Any] | None):
         value = _text(raw_value)
         if not value or field_name not in _LOCATION_HINT_COLUMNS:
             continue
-        pattern = f"%{value}%"
         if field_name == "locality":
+            pattern = f"%{value}%"
             statement = statement.where(or_(
                 PropertyLocation.locality.ilike(pattern),
                 PropertyLocation.name.ilike(pattern),
             ))
+        elif field_name in _LOCATION_REFERENCE_FIELDS:
+            statement = statement.where(_reference_search_condition(field_name, value))
         else:
             statement = statement.where(
-                _LOCATION_HINT_COLUMNS[field_name].ilike(pattern)
+                _LOCATION_HINT_COLUMNS[field_name].ilike(f"%{value}%")
             )
     return statement
+
+
+def _reference_tokens(values: Iterable[str]) -> set[str]:
+    """Comparison keys for cadastral tokens: case- and separator-insensitive.
+
+    ``3/B`` and ``3b`` denote the same Kila in published schedules, so "3b"
+    must find a stored ``3/B`` too. Pure digit tokens stay canonical.
+    """
+    keys: set[str] = set()
+    for token in values:
+        key = str(token).casefold()
+        if not key.isdigit():
+            key = re.sub(r"[\s/\-]", "", key)
+        keys.add(key)
+    return keys
+
+
+def _reference_search_condition(field_name: str, value: str):
+    """SQL filter for one Square/Kila/Khasra reference value.
+
+    Numeric tokens keep the plain substring semantics; alphanumeric Kila or
+    Khasra references (``3b``, ``12a``) are additionally matched after
+    stripping separators from both sides, so typing "3b" finds stored
+    "3/B" and "3 - B" spellings alike.
+    """
+    column = _LOCATION_HINT_COLUMNS[field_name]
+    condition = column.ilike(f"%{value}%")
+    if not value.isdigit():
+        flat_column = func.replace(func.replace(func.replace(
+            column, "/", ""), "-", ""), " ", "")
+        condition = or_(
+            condition,
+            flat_column.ilike(f"%{re.sub(r'[\s/\-]', '', value)}%"),
+        )
+    return condition
 
 
 def _apply_location_hint_search(statement, field_name: str, raw_value: Any):
@@ -1063,6 +1109,8 @@ def _apply_location_hint_search(statement, field_name: str, raw_value: Any):
             PropertyLocation.locality.ilike(pattern),
             PropertyLocation.name.ilike(pattern),
         ))
+    if field_name in _LOCATION_REFERENCE_FIELDS:
+        return statement.where(_reference_search_condition(field_name, value))
     return statement.where(_LOCATION_HINT_COLUMNS[field_name].ilike(pattern))
 
 
@@ -1081,8 +1129,8 @@ def _location_matches_context(location: dict[str, Any], context: dict[str, Any])
             continue
         if field_name in _LOCATION_REFERENCE_FIELDS:
             try:
-                requested = {token.casefold() for token in _reference_values(value)}
-                stored = {token.casefold() for token in _reference_values(location.get(field_name))}
+                requested = _reference_tokens(_reference_values(value))
+                stored = _reference_tokens(_reference_values(location.get(field_name)))
             except DCRateServiceError:
                 return False
             if not requested.intersection(stored):
@@ -1093,14 +1141,33 @@ def _location_matches_context(location: dict[str, Any], context: dict[str, Any])
     return True
 
 
+# Rural administrative hierarchy: each level's suggestions are constrained
+# only by the (typed or selected) values of the levels above it.
+LOCATION_HIERARCHY_PARENTS: dict[str, tuple[str, ...]] = {
+    "district": (),
+    "tehsil": ("district",),
+    "qanoongoi": ("district", "tehsil"),
+    "mauza": ("district", "tehsil", "qanoongoi"),
+    "square_no": ("district", "tehsil", "qanoongoi", "mauza"),
+    "kila_no": ("district", "tehsil", "qanoongoi", "mauza", "square_no"),
+    "khasra_no": ("district", "tehsil", "qanoongoi", "mauza", "square_no", "kila_no"),
+}
+
+
 def list_location_hint_values(
     *,
     land_type: str | None = None,
     context: dict[str, Any] | None = None,
     fields: list[str] | tuple[str, ...] | None = None,
     limit: int = 100,
+    hierarchy: bool = False,
 ) -> dict[str, list[str]]:
-    """Return schedule-backed type-ahead values from the current database."""
+    """Return schedule-backed type-ahead values from the current database.
+
+    With ``hierarchy=True`` each rural level is queried with only its
+    hierarchy parents from the context, so a stale child value (a Mauza
+    typed before the Tehsil changed) cannot distort a parent's suggestions.
+    """
     requested = [
         field for field in (fields or LOCATION_HINT_FIELDS)
         if field in _LOCATION_HINT_COLUMNS
@@ -1110,12 +1177,18 @@ def list_location_hint_values(
     result: dict[str, list[str]] = {}
     with SessionLocal() as session:
         for field_name in requested:
-            # A stale child value must not hide valid Square choices.
-            field_context = {
-                key: value for key, value in context.items()
-                if key != field_name
-                and not (field_name == "square_no" and key == "kila_no")
-            }
+            if hierarchy and field_name in LOCATION_HIERARCHY_PARENTS:
+                # Keep only the parents of this level; unrelated typed values
+                # (children, sibling urban fields) must not filter it.
+                keep = LOCATION_HIERARCHY_PARENTS[field_name]
+                field_context = {key: value for key, value in context.items() if key in keep}
+            else:
+                # A stale child value must not hide valid Square choices.
+                field_context = {
+                    key: value for key, value in context.items()
+                    if key != field_name
+                    and not (field_name == "square_no" and key == "kila_no")
+                }
             search_value = context.get(field_name)
             if field_name == "locality":
                 statements = []

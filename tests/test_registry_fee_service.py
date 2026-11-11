@@ -42,11 +42,51 @@ def test_formula_supports_percentages_brackets_and_saved_rules(formula_database)
 
 
 @pytest.mark.parametrize("expression", [
-    "__import__('os')", "area.__class__", "unknown_value + 1", "1 / 0",
+    "__import__('os')", "area.__class__", "unknown_value + 1", "1 / 0", "len(area)",
 ])
 def test_formula_rejects_unsafe_or_invalid_expressions(expression):
     with pytest.raises(formula_service.RegistryFeeFormulaError):
         formula_service.evaluate_formula(expression, {"area": 10})
+
+
+def test_formula_supports_guide_documented_variables_and_capping():
+    # The Settings guide documents transferred_value and min()/max() capping:
+    # both must actually evaluate, not just parse.
+    capped = formula_service.evaluate_formula(
+        "transferred_value x 2% + 500", {"transferred_value": Decimal("50000")}
+    )
+    assert capped == Decimal("1500")
+
+    ceiling = formula_service.evaluate_formula(
+        "min(transferred_value * 1%, 2000)", {"transferred_value": Decimal("900000")}
+    )
+    assert ceiling == Decimal("2000")
+
+    floor = formula_service.evaluate_formula(
+        "max(transferred_value - 2%, 100)", {"transferred_value": Decimal("50")}
+    )
+    assert floor == Decimal("100")
+
+
+def test_saved_formula_accepts_transfer_and_capping_expression(formula_database):
+    expression = "transferred_value x 1% + min(area, 10)"
+    validated = formula_service.validate_formula(expression)
+    assert "transferred_value" in validated
+    assert "min" in validated
+
+    formula_service.create_registry_fee_formula(
+        name="Transfer fee", category="stamp", formula_expression=expression,
+        jurisdiction="Punjab", effective_from="2025-01-01",
+    )
+    saved = formula_service.list_registry_fee_formulas()[0]
+    assert saved["verification_status"] == "unverified"
+
+    result = formula_service.calculate_registry_fee_formulas(
+        formulas=[saved], effective_on=date(2026, 1, 1),
+        context={"area": Decimal("25"), "transferred_value": Decimal("200000")},
+    )
+    # 1% of 200000 + min(25, 10) = 2000.00 + 10 = 2010.00
+    assert result["charges"][0]["amount"] == Decimal("2010.00")
 
 
 def test_formulas_match_mauza_and_square_scope():

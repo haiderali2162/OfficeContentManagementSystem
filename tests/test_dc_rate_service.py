@@ -1797,3 +1797,116 @@ def test_db_backed_location_hints_and_matching_use_current_rows(rate_database):
         limit=10,
     )
     assert refreshed["mauza"] == ["New Chak"]
+
+
+def test_kila_match_ignores_case_and_separators(rate_database):
+    """Alphanumeric Kila references in a/b/c/d format match typed shortcuts.
+
+    Published rural schedules write Kila values like "3/B"; the calculator
+    search must find them from typed "3b" (and "3-B") without altering the
+    stored schedule text.
+    """
+    location_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Kila Chak", mauza="Kila Chak", land_type="rural",
+        district="District A", tehsil="Tehsil A",
+        square_no="3", kila_no="3/B",
+    ))
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+
+    location_row = {
+        "name": "Kila Chak", "square_no": "3", "kila_no": "3/B", "khasra_no": "",
+        "locality": None, "mauza": "Kila Chak",
+    }
+    # Direct matcher: stored "3/B" matches typed "3b" and "3 - B", stored
+    # "3/b" matches typed "3/B", and unrelated Kila values stay rejected.
+    assert dc_rate_service._location_matches_context(
+        location_row, {"kila_no": "3b"})
+    assert dc_rate_service._location_matches_context(
+        location_row, {"kila_no": "3 - B"})
+    assert dc_rate_service._location_matches_context(
+        dict(location_row, kila_no="3/b"), {"kila_no": "3/B"})
+    assert not dc_rate_service._location_matches_context(
+        location_row, {"kila_no": "4b"})
+
+    for typed_kila in ("3b", "3/B", "3/b"):
+        matches = dc_rate_service.find_schedule_location_matches(
+            land_type="rural",
+            context={"mauza": "Kila Chak", "kila_no": typed_kila},
+            limit=10,
+        )
+        assert [record["id"] for record in matches] == [location_id]
+
+
+def test_expand_references_breaks_lists_and_ranges_to_individual_values():
+    """The public display helper expands stored references like the importer.
+
+    Display code may call it to show one choice per individual value while
+    the stored record keeps the compact imported form.
+    """
+    assert dc_rate_service.expand_references("1-3, 5") == ["1", "2", "3", "5"]
+    assert dc_rate_service.expand_references("3/B") == ["3/B"]
+    assert dc_rate_service.expand_references("") == []
+    with pytest.raises(dc_rate_service.DCRateServiceError):
+        dc_rate_service.expand_references("1-9000")
+
+
+def test_rural_location_hints_follow_hierarchy_parents(rate_database):
+    """With hierarchy=True each level is filtered only by its parents.
+
+    A typed Square must not hide valid Mauza suggestions, and Kila
+    suggestions must not depend on a Mauza the user has not typed.
+    """
+    for values in (
+        dict(name="Chak 1", mauza="Chak 1", land_type="rural",
+             district="District A", tehsil="Tehsil A", qanoongoi="Q A",
+             square_no="2", kila_no="12"),
+        dict(name="Chak 2", mauza="Chak 2", land_type="rural",
+             district="District A", tehsil="Tehsil A", qanoongoi="Q B",
+             square_no="12", kila_no="2"),
+        dict(name="Chak 3", mauza="Chak 3", land_type="rural",
+             district="District A", tehsil="Tehsil A", qanoongoi="Q C",
+             square_no="5", kila_no="9"),
+        dict(name="Chak 9", mauza="Chak 9", land_type="rural",
+             district="District B", tehsil="Tehsil B", qanoongoi="Q D",
+             square_no="7", kila_no="7"),
+    ):
+        location_id, _created = dc_rate_service.create_location(
+            **_location_values(**values))
+        dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+
+    context = {
+        "district": "District A", "tehsil": "Tehsil A",
+        "mauza": "Chak 1", "square_no": "2",
+    }
+    hints = dc_rate_service.list_location_hint_values(
+        land_type="rural", context=context, limit=10, hierarchy=True)
+    # Tehsil suggestions come from the district only.
+    assert hints["tehsil"] == ["Tehsil A"]
+    # Qanoongoi suggestions cover the whole Tehsil, ignoring Mauza/Square.
+    assert hints["qanoongoi"] == ["Q A", "Q B", "Q C"]
+    # Mauza suggestions cover the whole Tehsil as candidates; the typed
+    # Square (not a parent of Mauza) must not filter them. The typed Mauza
+    # text itself still narrows its own type-ahead suggestions.
+    assert hints["mauza"] == ["Chak 1"]
+    # Square suggestions are scoped to the selected Mauza.
+    assert hints["square_no"] == ["2"]
+    # Kila suggestions are scoped to the selected Square.
+    assert hints["kila_no"] == ["12"]
+
+    # Without the hierarchy flag the legacy behaviour applies: a typed child
+    # value (the Square) also filters the levels above it, so only mauzas
+    # holding that square are suggested. The hierarchy flag keeps Mauza
+    # suggestions covering the whole Tehsil.
+    legacy_context = {
+        "district": "District A", "tehsil": "Tehsil A", "square_no": "2",
+    }
+    stale = dc_rate_service.list_location_hint_values(
+        land_type="rural", context=legacy_context,
+        fields=["mauza"], limit=10,
+    )
+    assert stale["mauza"] == ["Chak 1", "Chak 2"]
+    fresh = dc_rate_service.list_location_hint_values(
+        land_type="rural", context=legacy_context,
+        fields=["mauza"], limit=10, hierarchy=True,
+    )
+    assert fresh["mauza"] == ["Chak 1", "Chak 2", "Chak 3"]

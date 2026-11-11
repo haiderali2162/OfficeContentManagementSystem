@@ -11,6 +11,7 @@ import asyncio
 from datetime import date
 from decimal import Decimal, InvalidOperation
 import json
+import re
 from typing import Any, Callable
 
 import flet as ft
@@ -18,6 +19,8 @@ import flet as ft
 from core.area_engine import AreaSettings
 from core.models import DC_RATE_UNITS
 from services.dc_rate_service import (
+    DCRateServiceError,
+    expand_references,
     find_schedule_location_matches,
     list_dc_rates,
     list_location_hint_values,
@@ -31,16 +34,19 @@ from services.estimate_service import (
 from services.tax_service import (
     TaxRuleError,
     calculate_charges,
+    calculate_charges_for_parties,
     create_tax_fee_rule,
     delete_tax_fee_rule,
     list_tax_fee_rules,
     update_tax_fee_rule,
 )
 from services.valuation_report_service import (
+    build_current_export_record,
     export_estimate_history,
     export_estimate_csv,
     export_estimate_pdf,
     export_estimate_xlsx,
+    export_estimate_ods,
 )
 from services.registry_fee_service import (
     RegistryFeeFormulaError,
@@ -73,6 +79,18 @@ def _money(value: Any, currency: str = "PKR") -> str:
     if value is None:
         return "Not supplied"
     return f"{currency} {Decimal(str(value)):,.2f}"
+
+
+# Cached location draft (rural/urban choice and each typed field value).
+# Navigation rebuilds this page from scratch, so without this cache every
+# visit to another tab and back wiped the user's location inputs.
+_LOCATION_DRAFT: dict[str, Any] = {}
+
+_DRAFT_FIELDS = (
+    "district", "tehsil", "qanoongoi", "mauza", "town", "revenue_circle",
+    "property_area", "schedule_location", "square_no", "kila_no", "khasra_no",
+    "classification", "property_profile", "area_value", "location_search",
+)
 
 
 def build_valuation_page(
@@ -142,6 +160,7 @@ def build_valuation_page(
                     "csv": export_estimate_csv,
                     "xlsx": export_estimate_xlsx,
                     "pdf": export_estimate_pdf,
+                    "ods": export_estimate_ods,
                 }
                 payload = exporters[file_format](saved)
                 await save_report(
@@ -151,6 +170,40 @@ def build_valuation_page(
                 )
             except Exception as exc:
                 status.value = f"Could not export estimate: {exc}"
+                page.update()
+        return export
+
+    def current_export_handler(file_format: str):
+        async def export(_):
+            # Export reads only the in-memory result; nothing is written to
+            # the database just to produce a report.
+            if not last_calculation:
+                form_error.value = "Calculate an estimate before exporting it."
+                page.update()
+                return
+            try:
+                record = build_current_export_record(
+                    inputs=last_calculation["inputs"],
+                    valuation=last_calculation["valuation"],
+                    charges=last_calculation["charges"],
+                    location=last_calculation.get("location"),
+                    dc_rate=last_calculation.get("dc_rate"),
+                    fbr_rate=last_calculation.get("fbr_rate"),
+                )
+                exporters = {
+                    "csv": export_estimate_csv,
+                    "xlsx": export_estimate_xlsx,
+                    "pdf": export_estimate_pdf,
+                    "ods": export_estimate_ods,
+                }
+                payload = exporters[file_format](record)
+                await save_report(
+                    payload,
+                    f"valuation_estimate_current_{date.today().isoformat()}.{file_format}",
+                    file_format,
+                )
+            except Exception as exc:
+                form_error.value = f"Could not export the current result: {exc}"
                 page.update()
         return export
 
@@ -208,6 +261,45 @@ def build_valuation_page(
     dc_rate_choice = ft.Dropdown(label="Matched DC rate", hint_text="No matching rate yet", expand=True, options=[], visible=False)
     fbr_rate_choice = ft.Dropdown(label="Matched FBR rate (editable)", hint_text="No matching rate yet", expand=True, options=[], visible=False)
     location_match = ft.Dropdown(label="Choose matching schedule location", expand=True, options=[], visible=False)
+    # Display mode for the schedule location choices: the rows exactly as
+    # imported ("Square 1, 13, 40-41") or expanded into one choice per
+    # individual square/Kila pair using the importer's expansion rules.
+    # Display only; stored schedule records are never rewritten.
+    schedule_display = ft.RadioGroup(
+        value="imported",
+        content=ft.Row([
+            ft.Radio(value="imported", label="As imported"),
+            ft.Radio(value="individual", label="Individual values"),
+        ], spacing=14, wrap=True),
+        visible=False,
+    )
+    # Searchable square/Kila filter: typing "2/12" or "2 - 12" fills the two
+    # cadastral inputs at once and re-runs the schedule match, so rural DC
+    # rates are fetched from Mauza + square + Kila in one place. Alphanumeric
+    # Kila values (3/B, 12-a) are accepted; a dash is treated as the pair
+    # separator, never as a numeric range, in this one field.
+    location_search = ft.TextField(
+        label="Search by Square/Kila (examples: 2/12, 2 - 12, 3/3B)",
+        hint_text="Square and Kila separated by / or -",
+        expand=True, visible=False,
+    )
+    # Restore the cached draft so leaving and re-entering this tab keeps the
+    # user's location inputs. This runs before any handlers are wired, so no
+    # change event fires during restoration.
+    if _LOCATION_DRAFT:
+        property_profile.value = str(_LOCATION_DRAFT.get("property_profile") or property_profile.value)
+        for field_name in _DRAFT_FIELDS:
+            if field_name == "property_profile":
+                continue
+            control = {"district": district, "tehsil": tehsil, "qanoongoi": qanoongoi,
+                       "mauza": mauza, "town": town, "revenue_circle": revenue_circle,
+                       "property_area": property_area, "schedule_location": schedule_location,
+                       "square_no": square_no, "kila_no": kila_no, "khasra_no": khasra_no,
+                       "classification": classification, "area_value": area_value,
+                       "location_search": location_search}[field_name]
+            restored = _LOCATION_DRAFT.get(field_name)
+            if restored is not None:
+                control.value = restored
     rate_match_status = ft.Text("Enter schedule details to find matching DC and FBR rates.", size=12, color="#475569")
     marla_setting = ft.Dropdown(label="Square feet per marla", value="272", width=210, options=[
         ft.dropdown.Option("272", "272 sq ft"), ft.dropdown.Option("225", "225 sq ft")
@@ -218,16 +310,55 @@ def build_valuation_page(
     transaction_type = ft.Dropdown(label="Transaction type", value="sale", width=190, options=[
         ft.dropdown.Option(item, item.title()) for item in ("sale", "purchase", "gift", "transfer", "other")
     ])
-    buyer_filer = ft.Dropdown(label="Buyer tax status", value="unknown", width=200, options=[
-        ft.dropdown.Option(item, label) for item, label in (
-            ("unknown", "Unknown"), ("ATL", "ATL"), ("late_filer", "Late filer"), ("non_ATL", "Non-ATL")
-        )
-    ])
-    seller_filer = ft.Dropdown(label="Seller tax status", value="unknown", width=200, options=[
-        ft.dropdown.Option(item, label) for item, label in (
-            ("unknown", "Unknown"), ("ATL", "ATL"), ("late_filer", "Late filer"), ("non_ATL", "Non-ATL")
-        )
-    ])
+    # Multiple buyers/sellers per deed: each party owns a share of the deed
+    # area and has its own FBR tax status, so filer-dependent rules (for
+    # example the 236C/236K presets) can be assessed per party. Rows start
+    # with one buyer and one seller, matching the previous single fields.
+    party_rows: list[dict[str, Any]] = []
+    party_rows_column = ft.Column(spacing=6)
+
+    def _render_party_rows() -> None:
+        party_rows_column.controls = [row["container"] for row in party_rows]
+
+    def _make_party_remove(row_controls: dict[str, Any]):
+        def _remove(_=None):
+            party_rows.remove(row_controls)
+            _render_party_rows()
+            page.update()
+        return _remove
+
+    def _add_party(_=None) -> None:
+        _append_party_row(role_value="buyer")
+        _render_party_rows()
+        page.update()
+
+    def _append_party_row(role_value: str, name_value: str = "",
+                          area_text: str = "", status_value: str = "unknown") -> None:
+        row_controls: dict[str, Any] = {
+            "role": ft.Dropdown(label="Role", value=role_value, width=140, options=[
+                ft.dropdown.Option("buyer", "Buyer"), ft.dropdown.Option("seller", "Seller"),
+            ]),
+            "name": ft.TextField(label="Name (optional)", value=name_value, width=170),
+            "area": ft.TextField(label="Area share (marla)", value=area_text, width=160,
+                                 hint_text="Their share of the deed"),
+            "status": ft.Dropdown(label="Tax status", value=status_value, width=170, options=[
+                ft.dropdown.Option(item, label) for item, label in (
+                    ("unknown", "Unknown"), ("ATL", "ATL / active filer"),
+                    ("late_filer", "Late filer"), ("non_ATL", "Non-ATL / inactive"),
+                )
+            ]),
+        }
+        row_controls["container"] = ft.Row([
+            row_controls["role"], row_controls["name"], row_controls["area"],
+            row_controls["status"],
+            ft.OutlinedButton("Remove", on_click=_make_party_remove(row_controls)),
+        ], wrap=True, spacing=6)
+        party_rows.append(row_controls)
+
+    _append_party_row(role_value="buyer")
+    _append_party_row(role_value="seller")
+    _render_party_rows()
+
     custom_formula_fields: list[dict[str, Any]] = []
     custom_field_inputs: dict[str, ft.TextField] = {}
     custom_field_controls = ft.ResponsiveRow(run_spacing=5)
@@ -247,6 +378,9 @@ def build_valuation_page(
             )
 
     rate_records: dict[str, list[dict[str, Any]]] = {"dc": [], "fbr": []}
+    # Candidate count from the latest refresh_rate_matches run, so calculate()
+    # can tell "nothing matched" apart from "matched but no active rate".
+    match_state: dict[str, int] = {"candidates": 0}
 
     hint_generation = 0
 
@@ -284,6 +418,9 @@ def build_valuation_page(
                 context=_location_context(),
                 fields=[key for key, _control in active],
                 limit=100,
+                # Rural levels cascade: district filters Tehsil, Tehsil filters
+                # Qanoongoi and Mauza, and so on down to Kila.
+                hierarchy=property_profile.value == "rural",
             )
         except Exception as exc:
             status.value = f"Could not load location suggestions: {exc}"
@@ -310,6 +447,7 @@ def build_valuation_page(
                     context=_location_context(),
                     fields=[key for key, _control in active],
                     limit=100,
+                    hierarchy=property_profile.value == "rural",
                 )
             except Exception as exc:
                 if generation == hint_generation:
@@ -336,25 +474,194 @@ def build_valuation_page(
     def _rate_label(rate: dict[str, Any]) -> str:
         place = rate.get("mauza") or rate.get("property_area") or rate.get("committee_town") or rate.get("location_name") or "Location"
         unit = RATE_UNITS.get(rate.get("rate_unit"), rate.get("rate_unit") or "Unit")
-        return f"Rs. {rate.get('rate_value')} / {unit.removeprefix('Per ')} · {rate.get('classification') or rate.get('property_type')} · {place}"
+        # Numeric columns return long fixed-point values such as
+        # 2640100.00000000; show two decimals with thousand separators.
+        try:
+            amount = f"{Decimal(str(rate.get('rate_value'))):,.2f}"
+        except (InvalidOperation, ValueError, TypeError):
+            amount = str(rate.get("rate_value"))
+        return f"Rs. {amount} / {unit.removeprefix('Per ')} · {rate.get('classification') or rate.get('property_type')} · {place}"
+
+    def _location_option_label(row: dict[str, Any], include_cadastral: bool = True) -> str:
+        """Compact, non-repeating location label with square/Kila tokens.
+
+        The dropdown once read "village, district, tehsil, village"; the
+        Mauza and village names are usually identical, so list each distinct
+        name once and append Square/Kila so rows can be told apart.
+        Individual pair options pass ``include_cadastral=False`` because the
+        pair (Square X · Kila Y) is appended separately.
+        """
+        seen: set[str] = set()
+        parts: list[str] = []
+        for key in ("name", "mauza", "district", "tehsil", "committee_town", "property_area"):
+            value = str(row.get(key) or "").strip()
+            if value and value.casefold() not in seen:
+                seen.add(value.casefold())
+                parts.append(value)
+        if include_cadastral:
+            square = str(row.get("square_no") or "").strip()
+            kila = str(row.get("kila_no") or "").strip()
+            khasra = str(row.get("khasra_no") or "").strip()
+            if square:
+                parts.append(f"Square {square}")
+            if kila:
+                parts.append(f"Kila {kila}")
+            if khasra:
+                parts.append(f"Khasra {khasra}")
+        return " · ".join(parts) or "Schedule location"
 
     def refresh_rate_matches(_=None):
         """Fetch active schedule rows and preselect unique unit/rate matches."""
+        # Cache the current location inputs so page rebuilds (tab switches)
+        # can restore them.
+        draft_controls = {
+            "district": district, "tehsil": tehsil, "qanoongoi": qanoongoi,
+            "mauza": mauza, "town": town, "revenue_circle": revenue_circle,
+            "property_area": property_area, "schedule_location": schedule_location,
+            "square_no": square_no, "kila_no": kila_no, "khasra_no": khasra_no,
+            "classification": classification, "area_value": area_value,
+            "location_search": location_search,
+        }
+        _LOCATION_DRAFT.clear()
+        _LOCATION_DRAFT["property_profile"] = property_profile.value
+        for field_name, control in draft_controls.items():
+            if control.value not in (None, ""):
+                _LOCATION_DRAFT[field_name] = control.value
         lookup_value = _text_value(mauza) if property_profile.value == "rural" else (
             _text_value(property_area) or _text_value(town)
         )
         candidates = matching_locations() if lookup_value else []
-        if location_match.value and any(str(row["id"]) == location_match.value for row in candidates):
-            candidates = [row for row in candidates if str(row["id"]) == location_match.value]
-        location_match.options = [ft.dropdown.Option(
-            str(row["id"]), " · ".join(str(value) for value in (
-                row.get("name"), row.get("district"), row.get("tehsil"), row.get("mauza"),
-                row.get("committee_town"), row.get("property_area"),
-            ) if value)
-        ) for row in candidates]
-        location_match.visible = len(candidates) > 1
-        if len(candidates) == 1:
-            location_match.value = str(candidates[0]["id"])
+        candidate_ids = [int(item["id"]) for item in candidates]
+        all_rates = [row for schedule in ("dc", "fbr")
+                     for row in list_dc_rates(location_ids=candidate_ids,
+                                              schedule_type=schedule,
+                                              effective_on=transaction_date)]
+        typed_classification = (
+            classification.value if classification.value not in (None, "", "none") else None
+        )
+        if typed_classification:
+            # A typed Classification narrows the candidate locations too:
+            # only locations that still hold at least one matching DC rate
+            # row stay selectable, which helps spot the exact schedule.
+            matched_ids = {
+                int(row["location_id"]) for row in all_rates
+                if row.get("schedule_type") == "dc"
+                and str(row.get("classification") or "").casefold() == typed_classification.casefold()
+            }
+            if matched_ids:
+                candidates = [row for row in candidates if int(row["id"]) in matched_ids]
+                all_rates = [row for row in all_rates if int(row["location_id"]) in matched_ids]
+        # How many schedule rows actually matched the typed details right now.
+        match_state["candidates"] = len(candidates)
+
+        # A previously chosen option keeps its row selected. Individual-mode
+        # option keys look like "id:square:kila", so compare the id part only.
+        selected_key = str(location_match.value) if location_match.value else ""
+        selected_id = selected_key.split(":")[0] if selected_key else ""
+        if selected_id and any(str(row["id"]) == selected_id for row in candidates):
+            candidates = [row for row in candidates if str(row["id"]) == selected_id]
+
+        # With both Square and Kila typed, rows holding exactly that one pair
+        # (a single square and a single Kila value) are the strongest matches;
+        # a single such row is selected automatically.
+        typed_square = _text_value(square_no)
+        typed_kila = _text_value(kila_no)
+        exact_keys: set[str] = set()
+        typed_square_tokens: set[str] = set()
+        typed_kila_tokens: set[str] = set()
+        if typed_square and typed_kila:
+            try:
+                typed_square_tokens = {token.casefold() for token in expand_references(typed_square)}
+                typed_kila_tokens = {token.casefold() for token in expand_references(typed_kila)}
+            except DCRateServiceError:
+                typed_square_tokens = typed_kila_tokens = set()
+            if typed_square_tokens and typed_kila_tokens:
+                for row in candidates:
+                    try:
+                        row_squares = [token.casefold() for token in expand_references(row.get("square_no"))]
+                        row_kilas = [token.casefold() for token in expand_references(row.get("kila_no"))]
+                    except DCRateServiceError:
+                        continue
+                    if (len(row_squares) == 1 and row_squares[0] in typed_square_tokens
+                            and len(row_kilas) == 1 and row_kilas[0] in typed_kila_tokens):
+                        exact_keys.add(str(row["id"]))
+
+        entries: list[tuple[str, str, str, str]] = [
+            (str(row["id"]), _location_option_label(row), "", "") for row in candidates
+        ]
+        if (property_profile.value == "rural"
+                and schedule_display.value == "individual" and candidates):
+            expanded: list[tuple[str, str, str, str]] = []
+            overflow = False
+            for row in candidates:
+                try:
+                    squares = expand_references(row.get("square_no")) or [""]
+                    kilas = expand_references(row.get("kila_no")) or [""]
+                except DCRateServiceError:
+                    # A stored range wider than the expansion cap cannot be
+                    # shown as individual values; fall back to imported rows.
+                    overflow = True
+                    break
+                pairs = [(square, kila) for square in squares for kila in kilas]
+                if len(pairs) > 40 or len(expanded) + len(pairs) > 500:
+                    overflow = True
+                    break
+                base_label = _location_option_label(row, include_cadastral=False)
+                for square, kila in pairs:
+                    key = f"{row['id']}:{square}:{kila}"
+                    detail = " · ".join(part for part in (
+                        f"Square {square}" if square else "",
+                        f"Kila {kila}" if kila else "",
+                    ) if part)
+                    expanded.append((
+                        key,
+                        f"{base_label} · {detail}" if detail else base_label,
+                        square, kila,
+                    ))
+            if not overflow:
+                entries = expanded
+                if typed_square_tokens and typed_kila_tokens:
+                    # In individual mode the exact keys are the pair entries
+                    # matching the typed Square and Kila.
+                    exact_keys = {
+                        key for key, _label, square, kila in entries
+                        if square.casefold() in typed_square_tokens
+                        and kila.casefold() in typed_kila_tokens
+                    }
+                # Keep only expanded choices covering the typed Square/Kila so
+                # a typed pair points straight at the relevant schedules.
+                if len(entries) > 1 and (typed_square or typed_kila):
+                    narrowed = [
+                        entry for entry in entries
+                        if (not typed_square_tokens or entry[2].casefold() in typed_square_tokens)
+                        and (not typed_kila_tokens or entry[3].casefold() in typed_kila_tokens)
+                    ]
+                    if narrowed:
+                        entries = narrowed
+
+        if exact_keys:
+            # Show the most exact schedules first in the dropdown.
+            entries.sort(key=lambda entry: 0 if entry[0] in exact_keys else 1)
+        location_match.options = [ft.dropdown.Option(key, label) for key, label, _sq, _kl in entries]
+        location_match.visible = len(entries) > 1
+        # Keep the search filter available while any candidate exists so a
+        # filtered single match can be refined again.
+        location_search.visible = bool(candidates)
+        # Individual expansion follows the rural import rules only. The radio
+        # stays visible for rural so the user always finds it; without
+        # candidates it is disabled because there is nothing to display yet.
+        schedule_display.visible = property_profile.value == "rural"
+        schedule_display.disabled = not candidates
+        valid_keys = {entry[0] for entry in entries}
+        current_value = str(location_match.value) if location_match.value else ""
+        if len(entries) == 1:
+            location_match.value = entries[0][0]
+        elif len(exact_keys) == 1 and next(iter(exact_keys)) in valid_keys:
+            location_match.value = next(iter(exact_keys))
+        elif current_value not in valid_keys:
+            # The selected option (for example a row id kept while switching
+            # to individual pair keys) no longer exists; clear the stale pick.
+            location_match.value = None
         if not candidates:
             rate_records["dc"], rate_records["fbr"] = [], []
             dc_rate_choice.options, fbr_rate_choice.options = [], []
@@ -364,14 +671,13 @@ def build_valuation_page(
             dc_rate_unit.visible = dc_rate_choice.visible = False
             fbr_rate_unit.visible = fbr_rate_choice.visible = False
             rate_match_status.value = "No schedule location matches these details. Check the selected Mauza, square and Kila."
+            # Rural keeps the display radio visible but inactive (no rows to
+            # show either way).
+            schedule_display.visible = property_profile.value == "rural"
+            schedule_display.disabled = True
             page.update()
             return
 
-        candidate_ids = [int(item["id"]) for item in candidates]
-        all_rates = [row for schedule in ("dc", "fbr")
-                     for row in list_dc_rates(location_ids=candidate_ids,
-                                              schedule_type=schedule,
-                                              effective_on=transaction_date)]
         if classification.value not in (None, "", "none"):
             all_rates = [row for row in all_rates if str(row.get("classification") or "").casefold()
                          == classification.value.casefold()]
@@ -414,26 +720,116 @@ def build_valuation_page(
     for control in (district, tehsil, qanoongoi, mauza, town, revenue_circle, property_area,
                     schedule_location, square_no, kila_no, khasra_no, classification,
                     dc_rate_unit, fbr_rate_unit, location_match):
-        control.on_change = refresh_location_state
-        if isinstance(control, ft.AutoComplete):
+        # Flet 1.0.4 Dropdown fires on_select when an option is picked; it has
+        # no on_change event (AutoComplete fires on_select on pick and
+        # on_change per keystroke, so both stay wired).
+        if isinstance(control, (ft.Dropdown, ft.AutoComplete)):
             control.on_select = refresh_location_state
+        control.on_change = refresh_location_state
 
     def on_mauza_change(_=None):
         # A new Mauza invalidates cadastral choices from the prior record.
         square_no.value = ""
         kila_no.value = ""
+        # Drop the previously loaded suggestion lists right away: until the
+        # async hint reload finishes they would still show Square/Kila values
+        # from the old Mauza.
+        square_no.suggestions = []
+        kila_no.suggestions = []
+        # The typed Square/Kila pair belonged to the previous Mauza search.
+        location_search.value = ""
         refresh_location_state()
 
     def on_square_change(_=None):
         # Kila suggestions are scoped to the selected square.
         kila_no.value = ""
+        kila_no.suggestions = []
         refresh_location_state()
+
+    def on_district_change(_=None):
+        # Selecting a District invalidates every level below it in the rural
+        # hierarchy (Tehsil, Qanoongoi, Mauza, Square, Kila), otherwise stale
+        # child values filter the next level's schedule lookups.
+        tehsil.value = ""
+        qanoongoi.value = ""
+        mauza.value = ""
+        square_no.value = ""
+        kila_no.value = ""
+        # The old suggestion lists were loaded for the previous District;
+        # clearing them immediately keeps the async hint reload (which takes
+        # a moment on a large database) from showing other tehsils' values.
+        tehsil.suggestions = []
+        qanoongoi.suggestions = []
+        mauza.suggestions = []
+        square_no.suggestions = []
+        kila_no.suggestions = []
+        location_search.value = ""
+        refresh_location_state()
+
+    def on_tehsil_change(_=None):
+        qanoongoi.value = ""
+        mauza.value = ""
+        square_no.value = ""
+        kila_no.value = ""
+        qanoongoi.suggestions = []
+        mauza.suggestions = []
+        square_no.suggestions = []
+        kila_no.suggestions = []
+        location_search.value = ""
+        refresh_location_state()
+
+    def on_qanoongoi_change(_=None):
+        mauza.value = ""
+        square_no.value = ""
+        kila_no.value = ""
+        mauza.suggestions = []
+        square_no.suggestions = []
+        kila_no.suggestions = []
+        location_search.value = ""
+        refresh_location_state()
+
+    # District → Tehsil → Qanoongoi cascade: both keystrokes (on_change) and
+    # picking a suggestion (on_select) must reset the levels below.
+    district.on_change = on_district_change
+    district.on_select = on_district_change
+    tehsil.on_change = on_tehsil_change
+    tehsil.on_select = on_tehsil_change
+    qanoongoi.on_change = on_qanoongoi_change
+    qanoongoi.on_select = on_qanoongoi_change
+
+    def on_location_search(_=None):
+        """Turn a typed "square/kila" pair into the two cadastral inputs.
+
+        The same schedule match then applies, so rates come from Mauza +
+        Square + Kila (rural) exactly as the request describes. Clearing the
+        field restores the unfiltered candidate list.
+        """
+        raw = (location_search.value or "").strip()
+        if not raw:
+            # Clearing the search gives back the unfiltered candidate list by
+            # resetting the two parsed inputs as well.
+            square_no.value = ""
+            kila_no.value = ""
+            refresh_rate_matches()
+            return
+        parts = [part.strip() for part in re.split(r"\s*[/\-]\s*", raw) if part.strip()]
+        if not parts:
+            return
+        # Programmatic assignment deliberately skips the square handler that
+        # clears Kila, so the parsed pair survives into the match query.
+        square_no.value = parts[0]
+        kila_no.value = parts[1] if len(parts) > 1 else ""
+        refresh_rate_matches()
+
+    location_search.on_change = on_location_search
 
     mauza.on_change = on_mauza_change
     mauza.on_select = on_mauza_change
     square_no.on_change = on_square_change
     square_no.on_select = on_square_change
     property_profile.on_change = refresh_location_state
+    # Switching between imported and individual display rebuilds the choices.
+    schedule_display.on_change = refresh_rate_matches
     dc_rate_choice.on_select = refresh_rate_matches
     fbr_rate_choice.on_select = refresh_rate_matches
 
@@ -468,6 +864,7 @@ def build_valuation_page(
                 ft.OutlinedButton("Export CSV", on_click=estimate_export_handler(estimate_id, "csv")),
                 ft.OutlinedButton("Export Excel", on_click=estimate_export_handler(estimate_id, "xlsx")),
                 ft.OutlinedButton("Export PDF", on_click=estimate_export_handler(estimate_id, "pdf")),
+                ft.OutlinedButton("Export ODS", on_click=estimate_export_handler(estimate_id, "ods")),
                 ft.TextButton("Close", on_click=lambda _: page.pop_dialog()),
             ],
         ))
@@ -500,11 +897,32 @@ def build_valuation_page(
             ft.Text(f"Registry written value: {_money(valuation['registry_written_value'])}", size=13),
             ft.Divider(),
         ])
+        # Optional under-valuation check: when the written amount was entered,
+        # state the deficient amount explicitly instead of hiding it in the
+        # explanation text.
+        comparison = valuation.get("comparison") or {}
+        if comparison:
+            difference = comparison["difference_declared_minus_valuation"]
+            if comparison["declared_is_below_valuation"]:
+                result_panel.controls.append(ft.Text(
+                    f"Deficient amount (calculated valuation above written value): "
+                    f"{_money(abs(difference))}",
+                    size=14, weight=ft.FontWeight.BOLD, color="#B45309",
+                ))
+            elif difference == 0:
+                result_panel.controls.append(ft.Text(
+                    "Written value equals the calculated valuation.", size=12, color="#15803D"))
+            else:
+                result_panel.controls.append(ft.Text(
+                    f"Written value exceeds the calculated valuation by {_money(difference)}.",
+                    size=12, color="#15803D"))
         result_panel.controls.extend(ft.Text(line, size=12) for line in valuation["explanation"])
         if charges["charges"]:
             result_panel.controls.append(ft.Text("Taxes and fees", weight=ft.FontWeight.BOLD))
             result_panel.controls.extend(ft.Text(
-                f"{line['name']} · {line.get('payer') or 'payer unspecified'}: {_money(line['amount'], line['currency_code'])}"
+                f"{line['name']} · {line.get('payer') or 'payer unspecified'}"
+                + (f" — {line['party']['label']} ({line['party']['role']})" if line.get("party") else "")
+                + f": {_money(line['amount'], line['currency_code'])}"
             ) for line in charges["charges"])
         else:
             result_panel.controls.append(ft.Text("No configured charge rules applied.", color="#64748B"))
@@ -528,7 +946,36 @@ def build_valuation_page(
             dc_rate = next((row for row in rate_records["dc"]
                             if str(row["id"]) == dc_rate_choice.value), None)
             if dc_rate is None:
-                raise ValuationError("Complete the location fields and choose a matching DC schedule rate.")
+                location_typed = (
+                    _text_value(mauza) if property_profile.value == "rural"
+                    else (_text_value(property_area) or _text_value(town))
+                )
+                if not location_typed:
+                    raise ValuationError(
+                        "Choose a location first: enter the Mauza (rural) or Town/Property area "
+                        "(urban) in the 'Property Profile & Location' section above."
+                    )
+                if not rate_records["dc"]:
+                    if match_state["candidates"] == 0:
+                        raise ValuationError(
+                            "No schedule location matched the details you typed. "
+                            "Check the District, Tehsil, Qanoongoi and Mauza spellings "
+                            "in the 'Property Profile & Location' section above; the "
+                            "suggestions only list values from the selected levels."
+                        )
+                    raise ValuationError(
+                        "The location matched, but no active DC rate was found for today's date. "
+                        "Check the Square/Kila fields and the classification filter."
+                    )
+                if len(location_match.options) > 1 and not location_match.value:
+                    raise ValuationError(
+                        "Several schedule locations match. Pick the exact one in the "
+                        "'Choose matching schedule location' dropdown, then choose a DC rate."
+                    )
+                raise ValuationError(
+                    "Several DC rates match this location. Choose one in the "
+                    "'Matched DC rate' dropdown, then calculate again."
+                )
             selected_location = dc_rate
             selected_mauza = (_text_value(mauza) if property_profile.value == "rural"
                               else selected_location.get("mauza") or selected_location.get("name") or "").strip()
@@ -569,8 +1016,6 @@ def build_valuation_page(
                 "property_type": effective_classification,
                 "classification": effective_classification,
                 "land_type": selected_location.get("land_type"),
-                "buyer_filer_status": buyer_filer.value,
-                "seller_filer_status": seller_filer.value,
                 "property_value": valuation["property_value"],
                 "transferred_value": valuation["transferred_value"],
                 "declared_consideration": valuation["registry_written_value"],
@@ -602,6 +1047,35 @@ def build_valuation_page(
                 "property_count": 1,
                 "property_unit": "property",
             }
+            # Deed parties replace the previous single buyer/seller status
+            # dropdowns. A role with exactly one party keeps its status in the
+            # global context; with several parties the filer-dependent rules
+            # are evaluated per party instead.
+            parties = []
+            for row in party_rows:
+                area_text = (row["area"].value or "").strip()
+                if area_text:
+                    try:
+                        Decimal(area_text)
+                    except (InvalidOperation, ValueError):
+                        party_name = (row["name"].value or "").strip() or row["role"].value or "party"
+                        raise ValueError(
+                            f"Party '{party_name}': the area share must be a number (marla)."
+                        ) from None
+                parties.append({
+                    "role": row["role"].value or "buyer",
+                    "name": (row["name"].value or "").strip() or None,
+                    "area_marla": area_text or None,
+                    "filer_status": row["status"].value or "unknown",
+                })
+            buyer_parties = [party for party in parties if party["role"] == "buyer"]
+            seller_parties = [party for party in parties if party["role"] == "seller"]
+            context["buyer_filer_status"] = (
+                buyer_parties[0]["filer_status"] if len(buyer_parties) == 1 else "unknown"
+            )
+            context["seller_filer_status"] = (
+                seller_parties[0]["filer_status"] if len(seller_parties) == 1 else "unknown"
+            )
             custom_values = {}
             for key, field in custom_field_inputs.items():
                 value = (field.value or "").strip()
@@ -615,8 +1089,14 @@ def build_valuation_page(
             # Both values are available to rules; each rule explicitly picks
             # DC or FBR as its calculation base. Registry formulas use the same
             # separated context and save their expression/source snapshots.
-            charges = calculate_charges(rules=rules, transaction_date=transaction_date,
-                                        context=context, jurisdiction=["Punjab", "Punjab, Pakistan"])
+            if parties:
+                charges = calculate_charges_for_parties(
+                    rules=rules, transaction_date=transaction_date, context=context,
+                    parties=parties, jurisdiction=["Punjab", "Punjab, Pakistan"],
+                )
+            else:
+                charges = calculate_charges(rules=rules, transaction_date=transaction_date,
+                                            context=context, jurisdiction=["Punjab", "Punjab, Pakistan"])
             formulas_result = calculate_registry_fee_formulas(
                 formulas=list_registry_fee_formulas(), effective_on=transaction_date,
                 context=context, jurisdictions=["Punjab", "Punjab, Pakistan"],
@@ -659,12 +1139,24 @@ def build_valuation_page(
                 "share_numerator": 1,
                 "share_denominator": 1,
                 "declared_consideration": valuation["registry_written_value"],
-                "buyer_filer_status": buyer_filer.value,
-                "seller_filer_status": seller_filer.value,
+                "parties": [
+                    {key: party[key] for key in ("role", "name", "area_marla", "filer_status")}
+                    for party in parties
+                ],
+                "buyer_filer_status": context["buyer_filer_status"],
+                "seller_filer_status": context["seller_filer_status"],
                 "custom_formula_fields": custom_values,
                 "fbr_rate_id": int(fbr_rate["id"]) if fbr_rate else None,
             }
-            last_calculation.update({"inputs": inputs, "valuation": valuation, "charges": charges})
+            last_calculation.update({
+                "inputs": inputs, "valuation": valuation, "charges": charges,
+                # Needed by the current-result exporters: the schedule row and
+                # rates behind this particular calculation.
+                "location": {key: value for key, value in dc_rate.items()
+                             if not str(key).startswith("_")},
+                "dc_rate": dc_rate,
+                "fbr_rate": fbr_rate,
+            })
             draw_result(valuation, charges)
             status.value = "Estimate calculated. Review warnings before relying on any charge." 
         except (ValuationError, TaxRuleError, RegistryFeeFormulaError, ValueError, TypeError, StopIteration) as exc:
@@ -936,12 +1428,9 @@ def build_valuation_page(
     advanced_inputs = ft.Container(
         ft.ResponsiveRow([
             ft.Container(client, col={"xs": 12, "md": 6}),
-            ft.Container(registry_written_value, col={"xs": 12, "md": 6}),
             ft.Container(constructed, col={"xs": 12, "md": 4}),
             ft.Container(building_material_value, col={"xs": 12, "md": 4}),
             ft.Container(transaction_type, col={"xs": 12, "md": 4}),
-            ft.Container(buyer_filer, col={"xs": 12, "md": 4}),
-            ft.Container(seller_filer, col={"xs": 12, "md": 4}),
             ft.Container(floor, col={"xs": 12, "md": 4}),
             ft.Container(marla_setting, col={"xs": 12, "md": 4}),
         ], run_spacing=8),
@@ -1004,7 +1493,9 @@ def build_valuation_page(
                 ft.Text("Property Profile & Location", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
                 property_profile,
                 location_fields_row,
+                schedule_display,
                 location_match,
+                location_search,
                 rate_match_status,
             ], spacing=10),
             padding=14,
@@ -1021,8 +1512,27 @@ def build_valuation_page(
                     ft.Container(fbr_rate_unit, col={"xs": 12, "md": 4}),
                     ft.Container(fbr_rate_choice, col={"xs": 12, "md": 8}),
                     ft.Container(area_value, col={"xs": 12, "md": 4}),
+                    # Optional written amount drives the under-valuation check
+                    # (deficient amount) in the result.
+                    ft.Container(registry_written_value, col={"xs": 12, "md": 4}),
                 ], run_spacing=8),
             ], spacing=10),
+            padding=14,
+            bgcolor="#FFFFFF",
+            border=ft.Border.all(1, "#E2E8F0"),
+            border_radius=10,
+        ),
+        ft.Container(
+            ft.Column([
+                ft.Text("Buyers & sellers (deed parties)", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
+                ft.Text(
+                    "Add each buyer and seller with their own area share (marla) and tax status. "
+                    "Taxes that depend on filer status are calculated per party on that party's share.",
+                    size=12, color="#64748B",
+                ),
+                party_rows_column,
+                ft.Row([ft.OutlinedButton("+ Add party", on_click=_add_party)], wrap=True, spacing=8),
+            ], spacing=8),
             padding=14,
             bgcolor="#FFFFFF",
             border=ft.Border.all(1, "#E2E8F0"),
@@ -1035,6 +1545,13 @@ def build_valuation_page(
             ft.Button("Calculate estimate", on_click=calculate),
             ft.OutlinedButton("Save estimate", on_click=save_current),
         ], wrap=True, spacing=8),
+        ft.Row([
+            ft.Text("Export current result:", size=12, color="#475569"),
+            ft.OutlinedButton("CSV", on_click=current_export_handler("csv")),
+            ft.OutlinedButton("Excel", on_click=current_export_handler("xlsx")),
+            ft.OutlinedButton("PDF", on_click=current_export_handler("pdf")),
+            ft.OutlinedButton("ODS", on_click=current_export_handler("ods")),
+        ], wrap=True, spacing=6),
         form_error,
         status,
         ft.ResponsiveRow([

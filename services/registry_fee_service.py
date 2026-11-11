@@ -22,8 +22,12 @@ class RegistryFeeFormulaError(ValueError):
 CENT = Decimal("0.01")
 FORMULA_VARIABLES = {
     "area", "area_marla", "area_kanal", "area_acre", "area_square_feet",
-    "dc_value", "fbr_value", "registry_written_value", "building_material_value",
+    "dc_value", "fbr_value", "property_value", "transferred_value",
+    "registry_written_value", "building_material_value",
 }
+# Capping helpers allowed inside formulas. They keep the safe grammar: every
+# argument must itself be an allowed numeric expression.
+FORMULA_FUNCTIONS = {"min", "max"}
 FORMULA_MATCH_FIELDS = {
     "land_type", "mauza", "square_no", "kila_no", "khasra_no",
     "property_type", "classification", "transaction_type", "has_fbr_schedule",
@@ -93,6 +97,18 @@ def _parse_expression(expression: Any, allowed_variables: Iterable[str] = ()) ->
             inspect_node(node.comparators[0])
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             inspect_node(node.operand)
+        elif isinstance(node, ast.Call):
+            # Only the documented min()/max() capping helpers are allowed, so
+            # the setting-page guide's "Capping" examples genuinely work while
+            # arbitrary function calls stay rejected.
+            if not isinstance(node.func, ast.Name) or node.func.id.casefold() not in FORMULA_FUNCTIONS:
+                raise RegistryFeeFormulaError(
+                    "Function calls other than min(value, cap) and max(value, floor) are not allowed."
+                )
+            if not node.args or node.keywords:
+                raise RegistryFeeFormulaError("min() and max() need plain numeric arguments.")
+            for argument in node.args:
+                inspect_node(argument)
         else:
             raise RegistryFeeFormulaError(
                 "Formula functions, attributes, and unsupported Python expressions are not allowed."
@@ -134,6 +150,14 @@ def evaluate_formula(
         if isinstance(node, ast.UnaryOp):
             value = evaluate(node.operand)
             return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise RegistryFeeFormulaError("Formula functions, attributes, and unsupported Python expressions are not allowed.")
+            arguments = [evaluate(argument) for argument in node.args]
+            function_name = node.func.id.casefold()
+            if function_name == "min":
+                return min(arguments)
+            return max(arguments)
         if isinstance(node, ast.IfExp):
             return evaluate(node.body) if evaluate_condition(node.test) else evaluate(node.orelse)
         if isinstance(node, ast.Compare):

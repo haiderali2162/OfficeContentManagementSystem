@@ -4,6 +4,7 @@ import asyncio
 import flet as ft
 import json
 import pytest
+from decimal import Decimal
 from types import SimpleNamespace
 
 from ui.pages import dc_rates
@@ -40,11 +41,29 @@ def walk_controls(control):
         yield from walk_controls(content)
 
 
+def _stub_control_updates(root):
+    """Neutralize per-control update calls in the fake (unmounted) tree.
+
+    Flet's ``Control.update()`` requires a mounted page; the fake page in these
+    tests never mounts controls, so result panels and other containers that
+    refresh themselves via ``control.update()`` would raise. Page-level
+    ``page.update()`` calls already go through the FakePage no-op.
+    """
+    for control in walk_controls(root):
+        if isinstance(control, ft.Control):
+            control.update = lambda: None
+
+
 @pytest.fixture(autouse=True)
 def isolate_valuation_schedule_queries(monkeypatch):
     """Keep page tests independent from the live schedule database."""
     monkeypatch.setattr(valuation, "list_location_hint_values", lambda **_kwargs: {})
     monkeypatch.setattr(valuation, "find_schedule_location_matches", lambda **_kwargs: [])
+    # The location draft is module-level cache shared by page rebuilds; clear
+    # it around every test so restored values never leak between tests.
+    valuation._LOCATION_DRAFT.clear()
+    yield
+    valuation._LOCATION_DRAFT.clear()
 
 
 def test_valuation_page_builds_with_tabs_and_existing_rate_management(monkeypatch):
@@ -637,3 +656,606 @@ def test_remove_formula_asks_first_then_deletes(monkeypatch):
     assert deleted == [99]
 
 
+def test_location_option_labels_show_square_kila_and_dedupe_village(monkeypatch):
+    """Dropdown labels list the village once and append Square/Kila tokens."""
+    def fake_matches(**_kwargs):
+        return [
+            {"id": 1, "name": "Chak 1", "mauza": "Chak 1", "district": "District A",
+             "tehsil": "Tehsil A", "land_type": "rural", "locality": "",
+             "square_no": "2", "kila_no": "12", "khasra_no": "",
+             "committee_town": "", "revenue_circle": "", "property_area": ""},
+            {"id": 2, "name": "Chak 1", "mauza": "Chak 1", "district": "District A",
+             "tehsil": "Tehsil A", "land_type": "rural", "locality": "",
+             "square_no": "2", "kila_no": "13", "khasra_no": "",
+             "committee_town": "", "revenue_circle": "", "property_area": ""},
+        ]
+
+    monkeypatch.setattr(valuation, "find_schedule_location_matches", fake_matches)
+    monkeypatch.setattr(valuation, "list_dc_rates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = next(control for control in controls
+                 if isinstance(control, ft.AutoComplete) and control.data == "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    dropdown = next(control for control in walk_controls(root)
+                    if isinstance(control, ft.Dropdown)
+                    and control.label == "Choose matching schedule location")
+    labels = [option.text for option in dropdown.options]
+    assert len(labels) == 2
+    assert all(label.count("Chak 1") == 1 for label in labels)
+    assert labels[0] == "Chak 1 · District A · Tehsil A · Square 2 · Kila 12"
+    assert labels[1] == "Chak 1 · District A · Tehsil A · Square 2 · Kila 13"
+
+
+def test_location_search_parses_square_kila_pair_and_kila_letters(monkeypatch):
+    """A typed "2/12" fills Square and Kila and re-runs the schedule match."""
+    matcher_calls = []
+
+    def fake_matches(**kwargs):
+        matcher_calls.append(kwargs)
+        return [{
+            "id": 5, "name": "Chak 2", "mauza": "Chak 2", "district": "District A",
+            "tehsil": "Tehsil A", "land_type": "rural", "locality": "",
+            "square_no": "2", "kila_no": "12", "khasra_no": "",
+            "committee_town": "", "revenue_circle": "", "property_area": "",
+        }]
+
+    monkeypatch.setattr(valuation, "find_schedule_location_matches", fake_matches)
+    monkeypatch.setattr(valuation, "list_dc_rates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = next(control for control in controls
+                 if isinstance(control, ft.AutoComplete) and control.data == "mauza")
+    square = next(control for control in controls
+                  if isinstance(control, ft.AutoComplete) and control.data == "square_no")
+    kila = next(control for control in controls
+                if isinstance(control, ft.AutoComplete) and control.data == "kila_no")
+    search = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.TextField)
+                  and control.label and "Square/Kila" in control.label)
+    assert search is not None
+
+    mauza.value = "Chak 2"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    search.value = "2/12"
+    search.on_change(SimpleNamespace(control=search))
+    # Both cadastral inputs are filled from the typed pair, and the matcher
+    # ran with Square and Kila set (Mauza + square + kila rural fetch).
+    assert square.value == "2"
+    assert kila.value == "12"
+    assert matcher_calls[-1]["context"]["square_no"] == "2"
+    assert matcher_calls[-1]["context"]["kila_no"] == "12"
+
+    # Dash form and alphanumeric Kila values parse the same way.
+    search.value = "3 - 3B"
+    search.on_change(SimpleNamespace(control=search))
+    assert square.value == "3"
+    assert kila.value == "3B"
+
+    # Clearing the search restores the unfiltered candidates.
+    search.value = ""
+    search.on_change(SimpleNamespace(control=search))
+    assert square.value == ""
+    assert kila.value == ""
+
+def test_export_current_result_row_has_all_formats_and_guards_empty(monkeypatch):
+    """CSV/Excel/PDF/ODS buttons exist; exporting before calculating shows a hint."""
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    buttons = {control.content: control for control in walk_controls(root)
+               if isinstance(control, ft.OutlinedButton)}
+    for label in ("CSV", "Excel", "PDF", "ODS"):
+        assert label in buttons, f"Missing current-result export button: {label}"
+
+    # No calculation yet: the CSV button must show the guidance message and
+    # never touch the report service.
+    asyncio.run(buttons["CSV"].on_click(None))
+    messages = [control.value for control in walk_controls(root)
+                if isinstance(control, ft.Text)
+                and control.value == "Calculate an estimate before exporting it."]
+    assert messages, "Empty-calculation export guard message was not shown."
+
+
+
+
+def _patch_estimate_services(monkeypatch, *, matches=None, rates=None):
+    """Patch the schedule services the calculator tab queries during tests."""
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(dc_rates, "list_location_picker",
+                        lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    if matches is not None:
+        monkeypatch.setattr(valuation, "find_schedule_location_matches",
+                            lambda **_kwargs: matches)
+    if rates is not None:
+        monkeypatch.setattr(valuation, "list_dc_rates",
+                            lambda *, schedule_type, **_kwargs: list(rates.get(schedule_type, [])))
+
+
+def _location_row(row_id, **overrides):
+    row = {
+        "id": row_id, "name": "Chak 1", "district": "District A", "tehsil": "Tehsil A",
+        "land_type": "rural", "mauza": "Chak 1", "locality": "", "square_no": "",
+        "kila_no": "", "committee_town": "", "revenue_circle": "",
+        "property_area": "", "khasra_no": "", "qanoongoi": "",
+    }
+    row.update(overrides)
+    return row
+
+
+def _dc_rate(rate_id, location_id, classification="Residential"):
+    return {
+        "id": rate_id, "location_id": location_id, "schedule_type": "dc",
+        "rate_unit": "per_kanal", "rate_value": "100",
+        "classification": classification, "property_type": classification,
+        "mauza": "Chak 1", "effective_from": valuation.date(2020, 1, 1),
+        "effective_to": None,
+    }
+
+
+def _auto(controls, data):
+    return next(control for control in controls
+                if isinstance(control, ft.AutoComplete) and control.data == data)
+
+
+def _dropdown(controls, label):
+    return next(control for control in controls
+                if isinstance(control, ft.Dropdown) and control.label == label)
+
+
+def _schedule_display_radio(controls):
+    return next(control for control in controls
+                if isinstance(control, ft.RadioGroup)
+                and any(isinstance(radio, ft.Radio) and radio.value == "individual"
+                        for radio in walk_controls(control)))
+
+
+def _form_error(root):
+    return next(control for control in walk_controls(root)
+                if isinstance(control, ft.Text) and getattr(control, "color", "") == "#B91C1C")
+
+
+class LoadingPage(FakePage):
+    def run_task(self, handler):
+        asyncio.run(handler())
+
+
+def test_district_tehsil_qanoongoi_changes_clear_children_and_hints_use_hierarchy(monkeypatch):
+    hint_calls = []
+
+    def record_hints(**kwargs):
+        hint_calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(valuation, "list_location_hint_values", record_hints)
+    _patch_estimate_services(monkeypatch)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    district = _auto(controls, "district")
+    tehsil = _auto(controls, "tehsil")
+    qanoongoi = _auto(controls, "qanoongoi")
+    mauza = _auto(controls, "mauza")
+    square = _auto(controls, "square_no")
+    kila = _auto(controls, "kila_no")
+    location_search = next(control for control in controls
+                           if isinstance(control, ft.TextField)
+                           and (control.label or "").startswith("Search by Square/Kila"))
+
+    tehsil.value = "Tehsil A"
+    qanoongoi.value = "Q A"
+    mauza.value = "Chak 1"
+    square.value = "15"
+    kila.value = "2"
+    location_search.value = "15/2"
+
+    # Selecting a District resets every level below it, so stale child values
+    # cannot filter the next level's schedule lookups.
+    district.value = "District A"
+    district.on_select(SimpleNamespace(control=district))
+    assert tehsil.value == ""
+    assert qanoongoi.value == ""
+    assert mauza.value == ""
+    assert square.value == ""
+    assert kila.value == ""
+    assert location_search.value == ""
+    assert hint_calls and hint_calls[-1]["hierarchy"] is True
+    context = hint_calls[-1]["context"]
+    assert context["district"] == "District A"
+    assert context["mauza"] == ""
+    assert context["square_no"] == ""
+
+    # Tehsil and Qanoongoi selections also reset the levels below them.
+    mauza.value = "Chak 1"
+    square.value = "15"
+    tehsil.on_select(SimpleNamespace(control=tehsil))
+    assert mauza.value == "" and square.value == "" and kila.value == ""
+    mauza.value = "Chak 1"
+    qanoongoi.on_select(SimpleNamespace(control=qanoongoi))
+    assert mauza.value == "" and square.value == "" and kila.value == ""
+
+
+def test_location_draft_is_restored_after_page_rebuild(monkeypatch):
+    _patch_estimate_services(monkeypatch)
+
+    first = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(first))
+    district = _auto(controls, "district")
+    mauza = _auto(controls, "mauza")
+    square = _auto(controls, "square_no")
+    district.value = "District A"
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    square.value = "15"
+    square.on_change(SimpleNamespace(control=square))
+
+    # Navigating away and back rebuilds the page from scratch; the draft must
+    # bring the typed location values back.
+    second = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(second))
+    assert _auto(controls, "district").value == "District A"
+    assert _auto(controls, "mauza").value == "Chak 1"
+    assert _auto(controls, "square_no").value == "15"
+
+
+def test_schedule_display_radio_expands_pairs_into_individual_choices(monkeypatch):
+    matches = [_location_row(7, square_no="1, 2-3", kila_no="1, 2")]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    location_match = _dropdown(controls, "Choose matching schedule location")
+    radio = _schedule_display_radio(controls)
+    assert radio.visible is True
+    # Default mode keeps the rows exactly as imported.
+    assert [option.key for option in location_match.options] == ["7"]
+    assert location_match.value == "7"
+
+    radio.value = "individual"
+    radio.on_change(SimpleNamespace(control=radio))
+    keys = [option.key for option in location_match.options]
+    # Stored "1, 2-3" squares and "1, 2" kilas expand into one choice per
+    # pair, following the import expansion rules. Stored records are not
+    # rewritten; this is a display-only view.
+    assert keys == ["7:1:1", "7:1:2", "7:2:1", "7:2:2", "7:3:1", "7:3:2"]
+    texts = [getattr(option, "text", "") for option in location_match.options]
+    assert any("Square 2" in text and "Kila 1" in text for text in texts)
+    # The pair detail must not repeat the imported Square/Kila summary; each
+    # option shows its own pair only ("Square 2 · Kila 1").
+    pair_option = next(text for text in texts if "Square 2 · Kila 1" in text)
+    assert "Square 1, 2-3" not in pair_option
+    assert "Kila 1, 2" not in pair_option
+    # The previously selected row id is no longer a valid pair key.
+    assert location_match.value is None
+
+    radio.value = "imported"
+    radio.on_change(SimpleNamespace(control=radio))
+    assert [option.key for option in location_match.options] == ["7"]
+
+
+def test_individual_mode_narrows_to_typed_pair_and_autoselects_exact(monkeypatch):
+    matches = [_location_row(7, square_no="1, 2-3", kila_no="1, 2")]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    radio = _schedule_display_radio(controls)
+    radio.value = "individual"
+    radio.on_change(SimpleNamespace(control=radio))
+
+    location_match = _dropdown(controls, "Choose matching schedule location")
+    square = _auto(controls, "square_no")
+    kila = _auto(controls, "kila_no")
+    square.value = "2"
+    kila.value = "1"
+    location_match.on_change(SimpleNamespace(control=location_match))
+    # Only the expanded pair covering the typed Square and Kila remains, and
+    # the single exact schedule is selected automatically.
+    assert [option.key for option in location_match.options] == ["7:2:1"]
+    assert location_match.value == "7:2:1"
+
+
+def test_imported_mode_ranks_exact_pair_first_and_autoselects_single_exact(monkeypatch):
+    matches = [
+        _location_row(7, square_no="2, 5", kila_no="1, 2"),
+        _location_row(8, name="Chak 2", mauza="Chak 2", square_no="2", kila_no="1"),
+    ]
+    rates = {"dc": [_dc_rate(11, 7), _dc_rate(12, 8)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    location_match = _dropdown(controls, "Choose matching schedule location")
+    assert [option.key for option in location_match.options] == ["7", "8"]
+
+    square = _auto(controls, "square_no")
+    kila = _auto(controls, "kila_no")
+    square.value = "2"
+    kila.value = "1"
+    location_match.on_change(SimpleNamespace(control=location_match))
+    keys = [option.key for option in location_match.options]
+    # Row 8 holds exactly the typed pair (one Square, one Kila) and is ranked
+    # first; with a single exact match it is selected automatically.
+    assert keys == ["8", "7"]
+    assert location_match.value == "8"
+
+
+def test_calculate_errors_name_the_visible_controls(monkeypatch):
+    class NS(SimpleNamespace):
+        pass
+
+    def build():
+        root = valuation.build_valuation_page(LoadingPage())
+        controls = list(walk_controls(root))
+        button = next(control for control in controls
+                      if isinstance(control, ft.Button)
+                      and getattr(control, "content", None) == "Calculate estimate")
+        return root, controls, button
+
+    # No location typed at all: the message points at the location section.
+    _patch_estimate_services(monkeypatch)
+    root, controls, button = build()
+    button.on_click(SimpleNamespace(control=button))
+    message = _form_error(root).value
+    assert "Choose a location first" in message
+    assert "Property Profile & Location" in message
+
+    # Location matched but no active DC rate: the message says so instead of
+    # asking for hidden fields.
+    matches = [_location_row(7)]
+    _patch_estimate_services(monkeypatch, matches=matches, rates={"dc": []})
+    root, controls, button = build()
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    button.on_click(SimpleNamespace(control=button))
+    message = _form_error(root).value
+    assert "no active DC rate" in message
+
+    # One location, several DC rates: the message names the rate dropdown.
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7), _dc_rate(12, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+    root, controls, button = build()
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    button.on_click(SimpleNamespace(control=button))
+    message = _form_error(root).value
+    assert "Matched DC rate" in message
+
+    # Several locations, nothing chosen: the message names the location
+    # dropdown.
+    matches = [_location_row(7), _location_row(8, name="Chak 2", mauza="Chak 2")]
+    rates = {"dc": [_dc_rate(11, 7), _dc_rate(12, 8)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+    root, controls, button = build()
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    button.on_click(SimpleNamespace(control=button))
+    message = _form_error(root).value
+    assert "Choose matching schedule location" in message
+
+
+def test_dropdown_selections_wired_to_on_select_handler(monkeypatch):
+    """Flet 1.0.4 Dropdown fires on_select when an option is picked.
+
+    Dropdown has no on_change event in this installed version, so the
+    classification, rate-unit and schedule-location dropdowns must have
+    on_select wired, otherwise picking an option silently does nothing in
+    the running app (regression from the live verification).
+    """
+    _patch_estimate_services(monkeypatch)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    for label in ("Classification (optional)", "DC rate unit",
+                  "FBR rate unit (if available)",
+                  "Choose matching schedule location"):
+        dropdown = _dropdown(controls, label)
+        assert dropdown.on_select is not None, label
+        assert dropdown.on_change is not None, label
+        # Both events point at the same refresh handler.
+        assert dropdown.on_select == dropdown.on_change, label
+
+    # The rate-choice dropdowns outside the wiring loop keep their own
+    # on_select handlers too.
+    dc_rate_choice = _dropdown(controls, "Matched DC rate")
+    assert dc_rate_choice.on_select is not None
+
+
+def _party_role_dropdowns(controls):
+    return [control for control in controls
+            if isinstance(control, ft.Dropdown) and control.label == "Role"]
+
+
+def test_deed_parties_start_with_buyer_and_seller_and_support_add_remove(monkeypatch):
+    _patch_estimate_services(monkeypatch)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    assert len(_party_role_dropdowns(controls)) == 2
+
+    # Add a third party (extra buyer) via the + Add party button.
+    add_button = next(control for control in controls
+                      if isinstance(control, ft.OutlinedButton)
+                      and getattr(control, "content", None) == "+ Add party")
+    add_button.on_click(SimpleNamespace(control=add_button))
+    controls = list(walk_controls(root))
+    assert len(_party_role_dropdowns(controls)) == 3
+
+    # Removing the first row leaves the remaining two.
+    remove_button = next(control for control in controls
+                         if isinstance(control, ft.OutlinedButton)
+                         and getattr(control, "content", None) == "Remove")
+    remove_button.on_click(SimpleNamespace(control=remove_button))
+    controls = list(walk_controls(root))
+    assert len(_party_role_dropdowns(controls)) == 2
+
+
+def test_calculate_splits_filer_taxes_per_party(monkeypatch):
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    captured: dict[str, object] = {}
+
+    def fake_party_charges(*, rules, transaction_date, context, parties, jurisdiction):
+        captured["parties"] = parties
+        captured["context"] = context
+        return {"charges": [], "totals_by_currency": {}, "total_charges": Decimal("0"),
+                "total_currency": "PKR", "warnings": [], "skipped_rules": []}
+
+    monkeypatch.setattr(valuation, "calculate_charges_for_parties", fake_party_charges)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    area = next(control for control in walk_controls(root)
+                if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+    area.value = "0-20-0"
+    roles = _party_role_dropdowns(walk_controls(root))
+    buyer = roles[0]
+    buyer.value = "buyer"
+    areas = [control for control in walk_controls(root)
+             if isinstance(control, ft.TextField) and control.label == "Area share (marla)"]
+    areas[0].value = "12"
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    parties = captured["parties"]
+    assert parties[0] == {"role": "buyer", "name": None, "area_marla": "12",
+                          "filer_status": "unknown"}
+    assert len(parties) == 2
+    # A single buyer keeps his status in the global context too.
+    assert captured["context"]["buyer_filer_status"] == "unknown"
+    assert _form_error(root).value == ""
+
+
+def test_calculate_error_is_truthful_when_no_location_matched(monkeypatch):
+    _patch_estimate_services(monkeypatch, matches=[], rates={"dc": []})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Wrong Mauza"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    button = next(control for control in controls
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+    message = _form_error(root).value
+    assert "No schedule location matched the details you typed" in message
+
+
+def test_deficient_amount_is_shown_when_written_value_is_below_valuation(monkeypatch):
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    written = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.TextField)
+                   and control.label == "Registry written value (PKR)")
+    # 20 marla (1 kanal) at PKR 100 per kanal values the deed at PKR 100.00;
+    # a written value of 50 is below it, so 50.00 is deficient.
+    written.value = "50"
+    area = next(control for control in walk_controls(root)
+                if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+    area.value = "0-20-0"
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    texts = [control.value for control in walk_controls(root)
+             if isinstance(control, ft.Text) and control.value]
+    deficient_lines = [text for text in texts if "Deficient amount" in text]
+    assert deficient_lines, "The deficient amount line was not shown."
+    assert any("50.00" in text for text in deficient_lines)
+
+
+def test_display_radio_stays_visible_but_disabled_without_candidates(monkeypatch):
+    _patch_estimate_services(monkeypatch, matches=[], rates={"dc": []})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    radio = _schedule_display_radio(controls)
+    # The radio is part of the rural layout even before any Mauza matches, so
+    # the user can always find it; without candidates it is inactive.
+    assert radio.visible is True
+    assert radio.disabled is True
+
+
+def test_tehsil_change_clears_stale_child_suggestions(monkeypatch):
+    _patch_estimate_services(monkeypatch, matches=[], rates={"dc": []})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    tehsil = _auto(controls, "tehsil")
+    qanoongoi = _auto(controls, "qanoongoi")
+    # A previously loaded list must vanish the moment the parent changes;
+    # otherwise the async hint reload shows other tehsils' values.
+    qanoongoi.suggestions = [ft.AutoCompleteSuggestion(key="X", value="X")]
+    tehsil.value = "Tehsil A"
+    tehsil.on_change(SimpleNamespace(control=tehsil))
+    assert qanoongoi.suggestions == []

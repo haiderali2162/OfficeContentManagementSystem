@@ -479,3 +479,260 @@ def calculate_charges(
         "warnings": warnings,
         "skipped_rules": skipped,
     }
+
+
+# A registry deed can carry several buyers and sellers, each owning their own
+# share of the deed area and each with their own FBR filer status. Rules whose
+# eligibility depends on buyer_filer_status or seller_filer_status (for
+# example the 236C/236K presets) are therefore evaluated per party on that
+# party's share — a rule naming one role runs on that role's parties only, and
+# a rule naming both roles runs once per buyer x seller pair — while all other
+# rules keep applying once to the whole transaction.
+FILER_CONDITION_FIELDS = {"buyer_filer_status", "seller_filer_status"}
+
+# Context keys scaled down to a party's share when charges are split per
+# party. Only monetary and area keys are scaled; qualitative context
+# (transaction type, land type, ...) is copied unchanged.
+PARTY_SCALED_CONTEXT_KEYS = (
+    "property_value", "transferred_value", "declared_consideration",
+    "registry_written_value", "building_material_value", "dc_value", "fbr_value",
+    "area", "area_marla", "area_kanal", "area_acre", "area_square_feet",
+)
+
+PARTY_ROLES = ("buyer", "seller")
+PARTY_FILER_STATUSES = {"unknown", "ATL", "late_filer", "non_ATL"}
+
+
+def calculate_charges_for_parties(
+    *,
+    rules: Iterable[dict[str, Any]],
+    transaction_date: date,
+    context: dict[str, Any],
+    parties: list[dict[str, Any]],
+    jurisdiction: str | Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Calculate charges for a deed with any number of buyers and sellers.
+
+    Rules whose ``when``/``exempt_when`` reference only buyer_filer_status run
+    once per buyer party on that party's share; rules referencing only
+    seller_filer_status run once per seller party. A rule referencing both
+    runs once per buyer x seller pair on the full deed bases (with a warning
+    when several pairs exist). All other rules run once on the whole
+    transaction.
+    """
+    if not isinstance(parties, list):
+        raise TaxRuleError("Parties must be a list of buyer/seller entries.")
+    for party in parties:
+        if str(party.get("role")) not in PARTY_ROLES:
+            raise TaxRuleError("Each party needs a role of buyer or seller.")
+        if str(party.get("filer_status") or "unknown") not in PARTY_FILER_STATUSES:
+            raise TaxRuleError("Party tax status must be unknown, ATL, late_filer, or non_ATL.")
+        _decimal(party.get("area_marla"), "Party area", optional=True)
+    if not parties:
+        return calculate_charges(rules=rules, transaction_date=transaction_date,
+                                 context=context, jurisdiction=jurisdiction)
+
+    total_area = _decimal(context.get("area_marla"), "area_marla", optional=True)
+    if total_area is not None and total_area <= 0:
+        total_area = None
+
+    role_counts: dict[str, int] = {}
+    for party in parties:
+        role_counts[party["role"]] = role_counts.get(party["role"], 0) + 1
+
+    warnings: list[str] = []
+    fractions: list[Decimal | None] = []
+    for party in parties:
+        area = _decimal(party.get("area_marla"), "Party area", optional=True)
+        if area is not None and area < 0:
+            raise TaxRuleError("A party area cannot be negative.")
+        if area is not None:
+            if total_area is None:
+                fraction = None
+            else:
+                fraction = area / total_area
+        elif role_counts[party["role"]] == 1:
+            # A role represented by a single party without an area covers that
+            # whole side, which keeps the previous single buyer/seller
+            # behaviour.
+            fraction = Decimal("1")
+        else:
+            # Guessing an even split would invent a legal share, so a
+            # multi-party role without areas is skipped with a warning.
+            fraction = None
+        fractions.append(fraction)
+        if fraction is None:
+            label = str(party.get("name") or "").strip() or party["role"].title()
+            warnings.append(
+                f"{label}: enter the party's individual area (marla) so filer taxes "
+                "can be split per party; this party's filer-dependent charges were skipped."
+            )
+    entered_total = sum(
+        (_decimal(party.get("area_marla"), "Party area") for party in parties
+         if party.get("area_marla") not in (None, "")),
+        Decimal("0"),
+    ) if total_area is not None else None
+    if entered_total is not None and abs(entered_total - total_area) > Decimal("0.01"):
+        warnings.append(
+            f"Party areas total {entered_total} marla but the deed area is {total_area} marla; "
+            "filer taxes use the entered shares as given."
+        )
+
+    def rule_filer_fields(rule: dict[str, Any]) -> set[str]:
+        """Which role's filer status this rule consults (possibly both)."""
+        try:
+            conditions = _conditions(rule.get("eligibility_conditions_json"))
+        except TaxRuleError:
+            # calculate_charges re-raises a labelled error for the bad rule;
+            # treat it as consulting both roles so the per-party path reports
+            # it with a party label attached.
+            return set(FILER_CONDITION_FIELDS)
+        fields = set(conditions.get("when", {})) & FILER_CONDITION_FIELDS
+        fields |= {
+            item["field"] for item in conditions.get("exempt_when", [])
+        } & FILER_CONDITION_FIELDS
+        return fields
+
+    filer_rules: list[dict[str, Any]] = []
+    plain_rules: list[dict[str, Any]] = []
+    for rule in rules:
+        (filer_rules if rule_filer_fields(rule) else plain_rules).append(rule)
+
+    merged: dict[str, Any] = {
+        "charges": [],
+        "totals_by_currency": {},
+        "total_charges": Decimal("0.00"),
+        "total_currency": "PKR",
+        "warnings": list(warnings),
+        "skipped_rules": [],
+    }
+    if plain_rules:
+        plain_result = calculate_charges(rules=plain_rules, transaction_date=transaction_date,
+                                         context=context, jurisdiction=jurisdiction)
+        _merge_charge_results(merged, plain_result)
+
+    # Filer rules are grouped by which role's status they consult. A rule
+    # naming one role runs on that role's parties only, so a seller tax such
+    # as 236C is never charged a second time on a buyer's share (and a buyer
+    # tax never on a seller's share). A rule naming both roles is evaluated
+    # once per buyer x seller pair on the full deed bases; several pairs are
+    # warned about instead of guessing a split.
+    role_rules: dict[str, list[dict[str, Any]]] = {"buyer": [], "seller": []}
+    pair_rules: list[dict[str, Any]] = []
+    for rule in filer_rules:
+        fields = rule_filer_fields(rule)
+        if fields == {"buyer_filer_status"}:
+            role_rules["buyer"].append(rule)
+        elif fields == {"seller_filer_status"}:
+            role_rules["seller"].append(rule)
+        else:
+            pair_rules.append(rule)
+
+    other_role = {"buyer": "seller", "seller": "buyer"}
+    parties_by_role: dict[str, list[tuple[str, Decimal | None, dict[str, Any]]]] = {
+        "buyer": [], "seller": [],
+    }
+    counters: dict[str, int] = {"buyer": 0, "seller": 0}
+    for party, fraction in zip(parties, fractions):
+        role = party["role"]
+        counters[role] += 1
+        label = str(party.get("name") or "").strip() or f"{role.title()} {counters[role]}"
+        parties_by_role[role].append((label, fraction, party))
+    for role in ("buyer", "seller"):
+        if (role_rules[role] or pair_rules) and not parties_by_role[role]:
+            warnings.append(
+                f"No {role} was entered for this deed, so filer-status rules that "
+                f"apply to the {role} were skipped."
+            )
+
+    def scaled_context(base_context: dict[str, Any], factor: Decimal | None) -> dict[str, Any]:
+        scoped = dict(base_context)
+        if factor is not None:
+            for key in PARTY_SCALED_CONTEXT_KEYS:
+                value = scoped.get(key)
+                if isinstance(value, Decimal):
+                    scoped[key] = (value * factor).quantize(CENT, rounding=ROUND_HALF_UP)
+        return scoped
+
+    def run_party_rules(rule_group: list[dict[str, Any]], scoped_context: dict[str, Any],
+                        tag: dict[str, Any], label: str) -> None:
+        if not rule_group:
+            return
+        result = calculate_charges(rules=rule_group, transaction_date=transaction_date,
+                                   context=scoped_context, jurisdiction=jurisdiction)
+        for charge in result["charges"]:
+            charge["party"] = dict(tag)
+        for skip in result["skipped_rules"]:
+            skip["party"] = label
+        _merge_charge_results(merged, result)
+
+    for role in ("buyer", "seller"):
+        for label, fraction, party in parties_by_role[role]:
+            if fraction is None:
+                # Already reported with the fraction warnings above.
+                continue
+            scoped_context = scaled_context(context, fraction)
+            scoped_context[f"{role}_filer_status"] = party.get("filer_status") or "unknown"
+            # The other role's status is deliberately hidden: rules naming
+            # only this role cannot consult the other side, and rules naming
+            # both roles run as pairs further below.
+            scoped_context[f"{other_role[role]}_filer_status"] = None
+            tag = {
+                "label": label, "role": role,
+                "area_marla": party.get("area_marla"),
+                "filer_status": party.get("filer_status") or "unknown",
+            }
+            run_party_rules(role_rules[role], scoped_context, tag, label)
+
+    for buyer_label, buyer_fraction, buyer_party in parties_by_role["buyer"]:
+        for seller_label, seller_fraction, seller_party in parties_by_role["seller"]:
+            if buyer_fraction is None or seller_fraction is None:
+                # Missing shares were already reported as warnings above.
+                continue
+            # Rules naming both roles concern the deed as a whole, so each
+            # pair is evaluated on the full (unscaled) bases. With several
+            # pairs this can charge the rule more than once; the warning
+            # below tells the user to review that split manually instead of
+            # inventing how the base should be divided.
+            scoped_context = dict(context)
+            scoped_context["buyer_filer_status"] = (
+                buyer_party.get("filer_status") or "unknown"
+            )
+            scoped_context["seller_filer_status"] = (
+                seller_party.get("filer_status") or "unknown"
+            )
+            pair_label = f"{buyer_label} × {seller_label}"
+            tag = {
+                "label": pair_label, "role": "pair",
+                "area_marla": buyer_party.get("area_marla"),
+                "filer_status": buyer_party.get("filer_status") or "unknown",
+            }
+            run_party_rules(pair_rules, scoped_context, tag, pair_label)
+    if pair_rules and (len(parties_by_role["buyer"]) * len(parties_by_role["seller"])) > 1:
+        warnings.append(
+            "Rules naming both a buyer and a seller status were charged once per "
+            "buyer x seller pair on the full deed bases; review that split manually."
+        )
+    if filer_rules:
+        merged["explanation"] = merged.get("explanation", []) + [
+            "Filer-dependent rules were evaluated per buyer/seller on each party's "
+            "entered share of the deed area; rules naming both roles were evaluated "
+            "per buyer x seller pair on the full deed bases."
+        ]
+    totals = {currency: amount.quantize(CENT, rounding=ROUND_HALF_UP)
+              for currency, amount in merged["totals_by_currency"].items()}
+    merged["totals_by_currency"] = totals
+    merged["total_charges"] = next(iter(totals.values())) if len(totals) == 1 else Decimal("0.00")
+    merged["total_currency"] = next(iter(totals)) if len(totals) == 1 else "PKR"
+    return merged
+
+
+def _merge_charge_results(target: dict[str, Any], result: dict[str, Any]) -> None:
+    target["charges"].extend(result["charges"])
+    for currency, amount in result["totals_by_currency"].items():
+        target["totals_by_currency"][currency] = (
+            target["totals_by_currency"].get(currency, Decimal("0")) + amount
+        )
+    target["warnings"].extend(result["warnings"])
+    target["skipped_rules"].extend(result["skipped_rules"])
+    target["explanation"] = target.get("explanation", []) + list(result.get("explanation", []))

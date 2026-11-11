@@ -28,6 +28,77 @@ class ValuationReportError(ValueError):
     """Raised when an unsupported or malformed valuation report is requested."""
 
 
+CHARGE_EXPORT_KEYS = (
+    "rate_value", "rate_unit", "published_year", "effective_from", "effective_to",
+    "source_reference", "verification_status", "property_type", "classification",
+    "floor",
+)
+
+
+def _rate_export_row(rate: dict[str, Any] | None) -> dict[str, Any]:
+    """Slim a schedule rate row to the snapshot fields reports need."""
+    if not rate:
+        return {}
+    return {key: rate.get(key) for key in CHARGE_EXPORT_KEYS if rate.get(key) is not None}
+
+
+def build_current_export_record(
+    *,
+    inputs: dict[str, Any],
+    valuation: dict[str, Any],
+    charges: dict[str, Any],
+    location: dict[str, Any] | None = None,
+    dc_rate: dict[str, Any] | None = None,
+    fbr_rate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shape an unsaved calculation like a stored estimate for the exporters.
+
+    The report exporters read the same keys as :func:`estimate_service.get_estimate`
+    output. Building the record keeps "export the current result" working
+    without writing anything to the database first.
+    """
+    totals = charges.get("totals_by_currency", {})
+    return {
+        "id": None,
+        "transaction_date": inputs.get("transaction_date"),
+        "client_name": None,
+        "property_type": inputs.get("property_type"),
+        "classification": inputs.get("classification"),
+        "area_value": inputs.get("area_value"),
+        "area_unit": inputs.get("area_unit"),
+        "share_numerator": inputs.get("share_numerator", 1),
+        "share_denominator": inputs.get("share_denominator", 1),
+        "declared_consideration": inputs.get("declared_consideration"),
+        "property_value": valuation.get("property_value"),
+        "transferred_value": valuation.get("transferred_value"),
+        "total_charges": totals.get("PKR", charges.get("total_charges")),
+        "currency_code": charges.get("total_currency", "PKR"),
+        "input_snapshot": dict(inputs),
+        "location_snapshot": ({key: value for key, value in location.items()
+                               if not str(key).startswith("_")} if location else None),
+        "rate_snapshot": {
+            "dc": _rate_export_row(dc_rate),
+            "fbr": _rate_export_row(fbr_rate),
+        } if (dc_rate or fbr_rate) else None,
+        "result_snapshot": {"valuation": dict(valuation), "charges": charges},
+        "warnings": list(charges.get("warnings", [])),
+        "charges": [
+            {
+                "name": charge.get("name"),
+                "category": charge.get("category"),
+                "payer": charge.get("payer"),
+                "calculation_method": charge.get("calculation_method"),
+                "calculation_base": charge.get("calculation_base"),
+                "applied_rate": charge.get("applied_rate"),
+                "amount": charge.get("amount"),
+                "currency_code": charge.get("currency_code", "PKR"),
+                "rule_snapshot": charge.get("rule_snapshot") or {},
+            }
+            for charge in charges.get("charges", [])
+        ],
+    }
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
@@ -58,7 +129,7 @@ def _estimate_rows(estimate: dict[str, Any]) -> list[list[str]]:
     result = estimate.get("result_snapshot") or {}
     valuation = result.get("valuation") or {}
     details = [
-        ("Estimate ID", estimate.get("id")),
+        ("Estimate ID", estimate.get("id") or "Unsaved"),
         ("Transaction date", estimate.get("transaction_date")),
         ("Client", estimate.get("client_name") or "Unlinked"),
         ("Transaction type", inputs.get("transaction_type")),
@@ -176,6 +247,61 @@ def export_estimate_xlsx(estimate: dict[str, Any]) -> bytes:
     return output.getvalue()
 
 
+def export_estimate_ods(estimate: dict[str, Any]) -> bytes:
+    """Return an OpenDocument spreadsheet (ODS) with details, charges, trace.
+
+    The first sheet mirrors the CSV layout: estimate key/value rows, the
+    itemized charge table, totals, the calculation explanation, and warnings.
+    """
+    try:
+        from odf.opendocument import OpenDocumentSpreadsheet
+        from odf.table import Table, TableCell, TableRow
+        from odf.text import P
+    except ImportError as exc:  # pragma: no cover - odfpy ships in requirements
+        raise ValuationReportError(
+            "ODS export needs the optional odfpy package."
+        ) from exc
+
+    document = OpenDocumentSpreadsheet()
+    sheet = Table(name="Estimate")
+
+    def add_row(values: list[Any]) -> None:
+        row = TableRow()
+        for value in values:
+            cell = TableCell(valuetype="string")
+            cell.addElement(P(text=str(value) if value is not None else ""))
+            row.addElement(cell)
+        sheet.addElement(row)
+
+    charge_rows = _charge_rows(estimate)
+    add_row(["Valuation estimate", "Value"])
+    for key, value in _estimate_rows(estimate):
+        add_row([key, value])
+    add_row([])
+    add_row(charge_rows[0])
+    for row in charge_rows[1:]:
+        add_row(row)
+
+    totals = ((estimate.get("result_snapshot") or {}).get("charges") or {}).get(
+        "totals_by_currency", {}
+    )
+    if totals:
+        add_row([])
+        for currency, amount in totals.items():
+            add_row([f"Total charges ({currency})", str(amount)])
+    result = estimate.get("result_snapshot") or {}
+    add_row([])
+    add_row(["Calculation explanation", ""])
+    for line in (result.get("valuation") or {}).get("explanation", []):
+        add_row([line])
+    add_row(["Warnings", "; ".join(estimate.get("warnings", [])) or "None"])
+
+    document.spreadsheet.addElement(sheet)
+    output = BytesIO()
+    document.write(output)
+    return output.getvalue()
+
+
 def _pdf_font_name() -> str:
     """Use a local Unicode font where available; retain a portable fallback."""
     candidates = [
@@ -200,7 +326,7 @@ def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
     document = SimpleDocTemplate(
         output, pagesize=A4, rightMargin=16 * mm, leftMargin=16 * mm,
         topMargin=16 * mm, bottomMargin=16 * mm,
-        title=f"Property valuation estimate #{estimate.get('id', '')}",
+        title=f"Property valuation estimate #{estimate.get('id') or 'Unsaved'}",
         author="Land Office Manager",
     )
     font = _pdf_font_name()
@@ -239,13 +365,50 @@ def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
     story.append(table)
 
     story.append(Paragraph("Itemized taxes and fees", heading))
-    for row in _charge_rows(estimate)[1:]:
-        line = " · ".join(part for part in (row[0], row[1], row[2], f"{row[6]} {row[7]}") if part)
-        story.append(Paragraph(escape(_shape_pdf_text(line)), body))
-        story.append(Paragraph(
-            escape(_shape_pdf_text(f"Source: {row[8]} | Effective: {row[9]} | Status: {row[10]}")), body
-        ))
-    if not estimate.get("charges"):
+    charge_rows = _charge_rows(estimate)
+    if charge_rows[1:]:
+        charge_style = ParagraphStyle("ValuationChargeCell", parent=body, fontSize=7, leading=9)
+        header_style = ParagraphStyle("ValuationChargeHead", parent=charge_style,
+                                      textColor=colors.white)
+        header_labels = ["Charge", "Category", "Payer", "Method", "Base", "Rate",
+                         "Amount", "Currency", "Source", "Effective dates", "Verification"]
+        chart_data = [[Paragraph(f"<b>{escape(label)}</b>", header_style)
+                       for label in header_labels]]
+        for row in charge_rows[1:]:
+            chart_data.append([
+                Paragraph(escape(_shape_pdf_text(value)), charge_style)
+                for value in row
+            ])
+        charge_table = Table(
+            chart_data,
+            colWidths=[26 * mm, 22 * mm, 16 * mm, 16 * mm, 24 * mm, 14 * mm,
+                       24 * mm, 14 * mm, 30 * mm, 22 * mm, 18 * mm],
+            repeatRows=1,
+        )
+        charge_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#CBD5E1")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.white, colors.HexColor("#F8FAFC")]),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(charge_table)
+        totals = ((estimate.get("result_snapshot") or {}).get("charges") or {}).get(
+            "totals_by_currency", {}
+        )
+        for currency, amount in totals.items():
+            story.append(Spacer(1, 1.5 * mm))
+            story.append(Paragraph(
+                escape(_shape_pdf_text(f"Total {currency}: {amount}")),
+                ParagraphStyle("ValuationTotal", parent=body,
+                               textColor=colors.HexColor("#1F4E78"),
+                               spaceAfter=2 * mm),
+            ))
+    else:
         story.append(Paragraph("No charge rule was applied to this estimate.", body))
 
     snapshot = estimate.get("result_snapshot") or {}

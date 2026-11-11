@@ -363,3 +363,174 @@ def test_deleted_rule_id_survives_as_estimate_snapshot(tax_database):
             "AND name='valuation_estimate_charges'"
         ).scalar()
     assert "ON DELETE SET NULL" in str(create_sql).upper()
+
+
+def _buyer(name, area=None, status="ATL"):
+    return {"role": "buyer", "name": name, "area_marla": area, "filer_status": status}
+
+
+def _seller(name, area=None, status="ATL"):
+    return {"role": "seller", "name": name, "area_marla": area, "filer_status": status}
+
+
+def test_filer_rules_split_per_party_by_area_and_status():
+    rule = _record()
+    rule["eligibility_conditions_json"] = {
+        "base": "transferred_value", "payer": "buyer",
+        "when": {"buyer_filer_status": "ATL"},
+    }
+    context = {
+        "transferred_value": Decimal("200000"), "area_marla": Decimal("20"),
+        "transaction_type": "sale", "buyer_filer_status": "unknown",
+    }
+    parties = [_buyer("Ali", area="10", status="ATL"),
+               _buyer("Usman", area="10", status="non_ATL"),
+               _seller("Khalid", status="ATL")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    # 2.5% applies only to the ATL buyer's half of the transferred value.
+    amounts = [(charge["party"]["label"], charge["amount"]) for charge in result["charges"]]
+    assert amounts == [("Ali", Decimal("2500.00"))]
+    # The non-ATL buyer did not match the rule; nothing invented for him.
+    assert result["totals_by_currency"] == {"PKR": Decimal("2500.00")}
+
+
+def test_fixed_rules_apply_once_per_deed_not_per_party():
+    rule = _record(calculation_method="fixed_amount", rate_value=None, fixed_amount="5000",
+                   eligibility_conditions_json={"when": {"transaction_type": "sale"}})
+    context = {"area_marla": Decimal("20"), "transaction_type": "sale"}
+    parties = [_buyer("Ali", area="5"), _buyer("Usman", area="15"), _seller("Khalid")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    assert len(result["charges"]) == 1
+    assert result["charges"][0]["amount"] == Decimal("5000.00")
+    assert "party" not in result["charges"][0]
+
+
+def test_multi_party_role_without_areas_is_skipped_with_warning():
+    rule = _record()
+    rule["eligibility_conditions_json"] = {
+        "base": "transferred_value", "when": {"buyer_filer_status": "ATL"}}
+    context = {"transferred_value": Decimal("200000"), "area_marla": Decimal("20")}
+    parties = [_buyer("Ali"), _buyer("Usman")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    assert result["charges"] == []
+    assert any("individual area (marla)" in warning for warning in result["warnings"])
+
+
+def test_solo_party_without_area_covers_whole_side():
+    rule = _record()
+    rule["eligibility_conditions_json"] = {
+        "base": "transferred_value", "when": {"seller_filer_status": "ATL"}}
+    context = {"transferred_value": Decimal("100000"), "area_marla": Decimal("20")}
+    parties = [_buyer("Ali", area="20"), _seller("Khalid")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    amounts = [(charge["party"]["label"], charge["amount"]) for charge in result["charges"]]
+    assert amounts == [("Khalid", Decimal("2500.00"))]
+
+
+def test_party_area_totals_are_checked_against_the_deed():
+    rule = _record()
+    rule["eligibility_conditions_json"] = {
+        "base": "transferred_value", "when": {"buyer_filer_status": "ATL"}}
+    context = {"transferred_value": Decimal("200000"), "area_marla": Decimal("20")}
+    parties = [_buyer("Ali", area="10", status="ATL"), _seller("Khalid", area="5")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    assert any("total 15 marla but the deed area is 20 marla" in warning
+               for warning in result["warnings"])
+
+
+def test_exempt_when_filer_status_is_evaluated_per_party():
+    rule = _record()
+    rule["eligibility_conditions_json"] = {
+        "base": "transferred_value", "when": {"transaction_type": "sale"},
+        "exempt_when": [{"field": "buyer_filer_status", "equals": "non_ATL"}],
+    }
+    context = {"transferred_value": Decimal("200000"), "area_marla": Decimal("20"),
+               "transaction_type": "sale"}
+    parties = [_buyer("Ali", area="10", status="ATL"),
+               _buyer("Usman", area="10", status="non_ATL")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    # Only the ATL buyer is charged; the non-ATL buyer's exemption is applied
+    # on his own share.
+    labels = [charge["party"]["label"] for charge in result["charges"]]
+    assert labels == ["Ali"]
+    skips = [skip for skip in result["skipped_rules"] if skip.get("party") == "Usman"]
+    assert skips, "Usman's exemption should be reported as a party-tagged skip"
+
+
+def test_seller_rule_never_charges_a_buyer_party():
+    # 236C-style: a seller tax keyed on the seller's status. It must apply to
+    # the seller's share only, never a second time on a buyer's share.
+    seller_rule = _record()
+    seller_rule["eligibility_conditions_json"] = {
+        "base": "transferred_value", "when": {"seller_filer_status": "non_ATL"}}
+    buyer_rule = _record(name="Buyer preset", category="hypothetical_tax")
+    buyer_rule["eligibility_conditions_json"] = {
+        "base": "transferred_value", "when": {"buyer_filer_status": "ATL"}}
+    context = {"transferred_value": Decimal("100000"), "area_marla": Decimal("20")}
+    parties = [_buyer("Ali", area="10", status="ATL"),
+               _seller("Khalid", area="10", status="non_ATL")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[seller_rule, buyer_rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    charges = [(charge["name"], charge["party"]["label"], charge["amount"])
+               for charge in result["charges"]]
+    # Buyer rule on Ali's half (2.5% of 50,000) and seller rule on Khalid's
+    # half only -- the seller rule must not repeat on the buyer's share.
+    assert charges == [
+        ("Buyer preset", "Ali", Decimal("1250.00")),
+        ("Hypothetical transfer charge", "Khalid", Decimal("1250.00")),
+    ]
+
+
+def test_rule_naming_both_roles_runs_per_pair():
+    rule = _record()
+    rule["eligibility_conditions_json"] = {
+        "base": "transferred_value",
+        "when": {"buyer_filer_status": "ATL", "seller_filer_status": "ATL"},
+    }
+    context = {"transferred_value": Decimal("100000"), "area_marla": Decimal("20")}
+    parties = [_buyer("Ali", area="10", status="ATL"),
+               _seller("Khalid", area="10", status="ATL")]
+
+    result = tax_service.calculate_charges_for_parties(
+        rules=[rule], transaction_date=date(2025, 7, 2),
+        context=context, parties=parties,
+    )
+
+    charges = [(charge["party"]["label"], charge["amount"]) for charge in result["charges"]]
+    # One buyer x one seller: the pair covers the whole deed (1 x 1), so the
+    # charge applies once on the full transferred value.
+    assert charges == [("Ali × Khalid", Decimal("2500.00"))]

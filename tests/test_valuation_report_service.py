@@ -120,3 +120,92 @@ def test_pdf_arabic_text_gets_contextual_forms_when_optional_helpers_are_install
         assert shaped == "لاہور"
     else:
         assert shaped != "لاہور"
+
+
+def test_build_current_export_record_shapes_unsaved_result_for_exporters():
+    from services.valuation_report_service import build_current_export_record
+
+    inputs = {
+        "transaction_date": "2026-11-10", "transaction_type": "sale",
+        "area_value": "2-0-0", "area_unit": "kmf", "square_no": "2", "kila_no": "12",
+        "property_type": "Rural", "classification": "Rural", "registry_written_value": "50000",
+        "share_numerator": 1, "share_denominator": 1,
+        "declared_consideration": "50000", "buyer_filer_status": "ATL",
+    }
+    valuation = {
+        "property_value": "100000.00", "transferred_value": "100000.00",
+        "explanation": ["Area: 2-0-0 K-M-F."],
+    }
+    charges = {
+        "totals_by_currency": {"PKR": "150.00"},
+        "total_currency": "PKR",
+        "warnings": ["Test warning."],
+        "charges": [{
+            "name": "Unverified test rule", "category": "test", "payer": "buyer",
+            "calculation_method": "fixed_amount", "calculation_base": None,
+            "applied_rate": None, "amount": "150.00", "currency_code": "PKR",
+            "rule_snapshot": {"source_reference": "Test source",
+                              "verification_status": "unverified"},
+        }],
+    }
+    dc_rate = {"mauza": "Chak 1", "square_no": "2", "kila_no": "12",
+               "rate_value": "100000", "rate_unit": "per_acre",
+               "verification_status": "unverified", "_hidden": "skip me"}
+    record = build_current_export_record(
+        inputs=inputs, valuation=valuation, charges=charges,
+        location=dc_rate, dc_rate=dc_rate, fbr_rate=None,
+    )
+
+    assert record["id"] is None
+    assert record["client_name"] is None
+    assert record["total_charges"] == "150.00"
+    assert record["currency_code"] == "PKR"
+    assert record["warnings"] == ["Test warning."]
+    assert record["location_snapshot"]["mauza"] == "Chak 1"
+    # Underscore-prefixed internal keys never reach the snapshot.
+    assert "_hidden" not in record["location_snapshot"]
+    assert record["rate_snapshot"]["dc"]["rate_value"] == "100000"
+    assert record["rate_snapshot"]["fbr"] == {}
+    assert record["charges"][0]["rule_snapshot"]["verification_status"] == "unverified"
+
+    # The record must export without touching any database: id None prints
+    # as "Unsaved" in every format.
+    csv_content = export_estimate_csv(record).decode("utf-8-sig")
+    assert "Unsaved" in csv_content
+    assert "Unverified test rule" in csv_content
+    workbook = load_workbook(BytesIO(export_estimate_xlsx(record)), read_only=True)
+    assert "Chak 1" in [cell for row in workbook["Estimate"].iter_rows(values_only=True) for cell in row]
+    workbook.close()
+    assert export_estimate_pdf(record).startswith(b"%PDF-")
+
+
+def test_export_estimate_ods_creates_valid_opendocument_spreadsheet():
+    import zipfile
+
+    from services.valuation_report_service import export_estimate_ods
+    from odf.opendocument import load
+
+    ods_bytes = export_estimate_ods(_estimate())
+    archive = zipfile.ZipFile(BytesIO(ods_bytes))
+    mimetype = archive.read("mimetype").decode("ascii")
+    assert mimetype == "application/vnd.oasis.opendocument.spreadsheet"
+    content = archive.read("content.xml").decode("utf-8")
+    assert "Hypothetical fee" in content
+    assert "احمد خان" in content
+    assert "Unverified hypothetical" in content
+    archive.close()
+    # odfpy can also round-trip the document structure.
+    document = load(BytesIO(ods_bytes))
+    assert document is not None
+
+
+def test_export_estimate_ods_uses_unsaved_label_for_current_results():
+    from services.valuation_report_service import build_current_export_record, export_estimate_ods
+    import zipfile
+
+    record = build_current_export_record(
+        inputs={"transaction_date": "2026-11-10", "area_unit": "kmf"},
+        valuation={"property_value": "1"}, charges={"totals_by_currency": {}, "charges": [], "warnings": []},
+    )
+    content = zipfile.ZipFile(BytesIO(export_estimate_ods(record))).read("content.xml").decode("utf-8")
+    assert "Unsaved" in content
