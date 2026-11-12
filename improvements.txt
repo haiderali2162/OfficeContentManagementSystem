@@ -1,11 +1,13 @@
-on calculate tab.
-1. allow wild cards in the search. not on just the calculate page but wherever an input field is available in the whole app now and in the future. traditional wild cards like *,? etc.
-2. tehsil field suggestion is not showing or working or slow. app should auto fetch the districts, tehsils, qanoongoi and mauzas to prepare a cache and keep that cache for faster search options. fix it.
-3. square no suggestion or list of a selected muaza is not showing fix it.
-4. in the "choose matching schedule location" it shows mauza . tehsil . square xx . kila xx. it is missing the unit or unit of measurement next to it. this field is also not searchable it only shows a list to choose from which is inconvinient.
-5. also the new area writing method like 10k or 10k2m or 10f etc or the old one like k-m-f. allow both methods wherever we are required to enter area.
-6. fbr fees are not calculated on rural schedule on calculate tab.
+on the calculate page fix the followings:
+1. even though trying about so many times a very little error is not resolving about suggestions and caching for fields district, tehsil, qanoongoi, mauza related to only that specific qanoongoi, square no related to that mauza and killa no related to that square no.
+2. on rural, only required things are mauza, square no and killa no to fetch the schedules then it should show relevent fetched records in "choose matching schedule location" box. if user need to enter square/kila no in other format then only it should show "search by square/kila (example)" field. ask user via a checkbox if he wants to show/hide that field. while quering info from db use that field for square & kila no if checked. otherwise use the above fields.
+3. if suggestions are being fetched from db in the backend, it should somehow let user know records are being fetched.
+4. in the "valuation rates & area" section of calculate tab, there are too many matching dc rates not belong to the entered square and kila no. also it's showed list covers the too much area leaving no space behind for search or type anything in the field and same goes to the "choose matching schedule location". fix it also.
+5. it showed a square no and kila no then i selected a matched location but below it in the "valuation rates & area" dc rate unit shows nothing and matched dc rate also say "no matched rate yet" how is that possible.
+6. i think you messed up with something about searching matched schedule, remember we can easily find the matched dc rate by just selecting our mauza in tehsil level excel file and then providing the square no and killa no. then we choose from the remaining list based on the land classification and unit. if something wrong you have developed, please fix it. we are just talking about right now rural schedule only as i tested it only because how can i go further since this is causing the issue.
+7. in case of we look for town which is optional, important one is revenue circle then sequare no and kila no which may be empty in urban case then we look for khasra if square and kila are empty. even if all three of these empty we look for property area and location. if more then one units apear we select any one of them. please fix the search criteria or rules accordingly.
+8. only search via individual value. show a warning message with as imported option.
 
-
-on the DC/FBR rate tab
-1. importing fbr schedule gives error for a square no being blank, which is normal because in case of square no blank we usaully search property fbr valuation by selecting the "revenue circle" and "property area". these two are important if square no is not present but if square no present then revenue circle and square no is important. so fix the fbr schedule import accordingly.
+on the "DC / FBR rates" tab.
+    1. provide a delete all schedule or fbr schedule, rural and urban option to delete all or single one only.
+    2. i think there is also an issue with the import from excel/csv/odf file. i suggest you to improve the importing mechanism by first cleaning the any "/",new lines or any other irrelevent entries. then break the rows to their individual values and deprecate the collective values and show a waring this could leade to wrong results.

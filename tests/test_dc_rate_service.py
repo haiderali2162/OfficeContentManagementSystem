@@ -2018,3 +2018,152 @@ def test_location_hint_cache_serves_repeats_until_cleared(rate_database):
         hierarchy=True,
     )
     assert refreshed["mauza"] == ["Chak 1", "Chak 2"]
+
+
+def test_fbr_schedule_imports_without_any_square_column(rate_database):
+    """FBR sheets find properties by revenue circle + property area.
+
+    Published FBR schedules often carry no Square column at all; requiring
+    one made the whole import fail before any row was read.
+    """
+    headers = [
+        "District", "Tehsil", "Revenue Circle", "Property Area",
+        "Classification", "Location", "Value of property per Square Ft (in Rs.)",
+    ]
+    row = ["District C", "Tehsil C", "Circle C", "Sector C",
+           "Commercial", "Market Road", "123.50"]
+    mapping = dc_rate_service.suggested_column_mapping(headers)
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "fbr", duplicate_rule="default:fbr_overlap",
+    )
+    assert preview["issues"] == []
+    assert len(preview["valid_records"]) == 1
+    record = preview["valid_records"][0]
+    assert record["location"]["square_no"] is None
+    assert record["location"]["revenue_circle"] == "Circle C"
+    assert record["location"]["property_area"] == "Sector C"
+    assert dc_rate_service.import_dc_rate_records(
+        preview["valid_records"], duplicate_rule="default:fbr_overlap"
+    )["imported_count"] == 1
+
+
+def test_fbr_blank_square_is_valid_but_blank_revenue_circle_is_not(rate_database):
+    """A mapped-but-blank Square is normal for FBR; Revenue Circle is not."""
+    headers = [
+        "District", "Tehsil", "Revenue Circle", "Property Area",
+        "Classification", "Location", "Square No",
+        "Value of property per Square Ft (in Rs.)",
+    ]
+    mapping = dc_rate_service.suggested_column_mapping(headers)
+
+    blank_square = ["District C", "Tehsil C", "Circle C", "Sector C",
+                    "Commercial", "Market Road", "", "123.50"]
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [blank_square], mapping, "fbr",
+        duplicate_rule="default:fbr_overlap",
+    )
+    assert preview["issues"] == []
+    assert preview["valid_records"][0]["location"]["square_no"] is None
+
+    blank_circle = ["District C", "Tehsil C", "", "Sector C",
+                    "Commercial", "Market Road", "22", "123.50"]
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [blank_circle], mapping, "fbr",
+        duplicate_rule="default:fbr_overlap",
+    )
+    assert preview["valid_records"] == []
+    assert "revenue_circle" in preview["issues"][0]["message"]
+
+
+def test_preloaded_dimensions_serve_rural_hints_in_memory(rate_database):
+    """preload_location_dimensions feeds district/tehsil/qanoongoi/mauza hints.
+
+    The rural hierarchy holds only a few hundred distinct values against
+    hundreds of thousands of rows, so it is loaded once and filtered in
+    memory: suggestions are instant and no longer depend on a DISTINCT scan
+    per keystroke.
+    """
+    dc_rate_service.create_location(**_location_values(
+        name="Chak 1", mauza="Chak 1", land_type="rural",
+        district="District A", tehsil="Tehsil A", qanoongoi="Qan A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=1, **_rate_values())
+    dc_rate_service.create_location(**_location_values(
+        name="Chak 2", mauza="Chak 2", land_type="rural",
+        district="District A", tehsil="Tehsil B", qanoongoi="Qan B",
+    ))
+    dc_rate_service.create_dc_rate(location_id=2, **_rate_values())
+    dc_rate_service.preload_location_dimensions()
+
+    hints = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A"},
+        fields=["tehsil", "qanoongoi", "mauza"],
+        limit=10, hierarchy=True,
+    )
+    assert hints["tehsil"] == ["Tehsil A", "Tehsil B"]
+    # Tehsil empty: strict scoping still keeps Qanoongoi/Mauza empty.
+    assert hints["qanoongoi"] == []
+    assert hints["mauza"] == []
+
+    hints = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A", "tehsil": "Tehsil A"},
+        fields=["qanoongoi", "mauza"],
+        limit=10, hierarchy=True,
+    )
+    assert hints["qanoongoi"] == ["Qan A"]
+    assert hints["mauza"] == ["Chak 1"]
+
+    # Adding a mauza is invisible until the cache is refreshed.
+    dc_rate_service.create_location(**_location_values(
+        name="Chak 3", mauza="Chak 3", land_type="rural",
+        district="District A", tehsil="Tehsil A", qanoongoi="Qan A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=3, **_rate_values())
+    cached = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A", "tehsil": "Tehsil A"},
+        fields=["mauza"], limit=10, hierarchy=True,
+    )
+    assert cached["mauza"] == ["Chak 1"]
+    dc_rate_service.clear_location_hint_cache()
+    dc_rate_service.preload_location_dimensions()
+    refreshed = dc_rate_service.list_location_hint_values(
+        land_type="rural",
+        context={"district": "District A", "tehsil": "Tehsil A"},
+        fields=["mauza"], limit=10, hierarchy=True,
+    )
+    assert refreshed["mauza"] == ["Chak 1", "Chak 3"]
+
+
+def test_search_terms_support_wildcards_in_mauza_filters(rate_database):
+    """`*` and `?` work in the location searches like traditional wildcards."""
+    first_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Farm One", mauza="Chak 1", land_type="rural",
+        district="District A", tehsil="Tehsil A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=first_id, **_rate_values())
+    second_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Farm Two", mauza="Chak 12", land_type="rural",
+        district="District A", tehsil="Tehsil A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=second_id, **_rate_values())
+
+    # "Chak ?" matches exactly one character after the prefix: only Chak 1.
+    matches = dc_rate_service.find_schedule_location_matches(
+        land_type="rural", context={"mauza": "Chak ?"}, limit=10,
+    )
+    assert [record["id"] for record in matches] == [first_id]
+
+    # Plain text keeps the contains behaviour.
+    matches = dc_rate_service.find_schedule_location_matches(
+        land_type="rural", context={"mauza": "Chak"}, limit=10,
+    )
+    assert [record["id"] for record in matches] == [first_id, second_id]
+
+    # The rates-page free-text search supports the same wildcards.
+    rates = dc_rate_service.list_dc_rates(search="Chak ?")
+    assert [rate["location_id"] for rate in rates] == [first_id]
+    rates = dc_rate_service.list_dc_rates(search="Chak*")
+    assert {rate["location_id"] for rate in rates} == {first_id, second_id}

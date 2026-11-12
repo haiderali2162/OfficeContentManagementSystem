@@ -596,3 +596,26 @@ def parse_area_expression(
     if "f" in amounts:
         marla_value += amounts["f"] / Decimal(settings.square_feet_per_marla)
     return marla_value
+
+
+def normalize_area_expression(
+    value: str,
+    settings: AreaSettings | None = None,
+) -> str:
+    """Parse any accepted written area form and return canonical K-M-F.
+
+    "10k5m" becomes "10-5-0"; "100f" becomes "0-0-100"; dash formats pass
+    through unchanged (already canonical). Square feet are rounded to whole
+    feet with halves rounded upward, matching the engine's display rule.
+    """
+    settings = settings or AreaSettings()
+    marla_value = parse_area_expression(value, settings=settings)
+    total_feet = _round_whole(
+        marla_value * Decimal(settings.square_feet_per_marla)
+    )
+    square_feet_per_kanal = (
+        settings.marla_per_kanal * settings.square_feet_per_marla
+    )
+    kanal, remaining = divmod(total_feet, square_feet_per_kanal)
+    marla, feet = divmod(remaining, settings.square_feet_per_marla)
+    return f"{kanal}-{marla}-{feet}"

@@ -7,6 +7,7 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from core.database import SessionLocal
+from core.search import like_pattern
 from core.models import (
     Client,
     ClientAsset,
@@ -126,20 +127,20 @@ def list_clients(
         )
 
         if search.strip():
-            term = f"%{search.strip()}%"
+            term = like_pattern(search)
             statement = statement.where(
                 # what the search term matches
                 or_(
-                    Client.name.ilike(term),
-                    Client.father_name.ilike(term),
-                    Client.cnic.ilike(term),
-                    Client.ntn_number.ilike(term),
-                    Client.referred_by.ilike(term),
-                    Client.address.ilike(term),
-                    Client.tehsil.ilike(term),
-                    Client.district.ilike(term),
-                    Client.city.ilike(term),
-                    Client.province.ilike(term),
+                    Client.name.ilike(term, escape="\\"),
+                    Client.father_name.ilike(term, escape="\\"),
+                    Client.cnic.ilike(term, escape="\\"),
+                    Client.ntn_number.ilike(term, escape="\\"),
+                    Client.referred_by.ilike(term, escape="\\"),
+                    Client.address.ilike(term, escape="\\"),
+                    Client.tehsil.ilike(term, escape="\\"),
+                    Client.district.ilike(term, escape="\\"),
+                    Client.city.ilike(term, escape="\\"),
+                    Client.province.ilike(term, escape="\\"),
                 )
             )
 

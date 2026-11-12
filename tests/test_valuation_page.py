@@ -797,6 +797,9 @@ def _patch_estimate_services(monkeypatch, *, matches=None, rates=None):
     monkeypatch.setattr(valuation, "list_estimates", lambda **_kwargs: [])
     monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
     monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    # The dimension preload reads the real schedule database; tests patch it
+    # out so page builds stay instant and never touch live data.
+    monkeypatch.setattr(valuation, "preload_location_dimensions", lambda: None)
     monkeypatch.setattr(dc_rates, "list_location_picker",
                         lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
@@ -1164,7 +1167,7 @@ def test_calculate_splits_filer_taxes_per_party(monkeypatch):
     mauza.value = "Chak 1"
     mauza.on_change(SimpleNamespace(control=mauza))
     area = next(control for control in walk_controls(root)
-                if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+                if isinstance(control, ft.TextField) and control.label == "Area (K-M-F or 10k5m)")
     area.value = "0-20-0"
     roles = _party_role_dropdowns(walk_controls(root))
     buyer = roles[0]
@@ -1221,7 +1224,7 @@ def test_deficient_amount_is_shown_when_written_value_is_below_valuation(monkeyp
     # a written value of 50 is below it, so 50.00 is deficient.
     written.value = "50"
     area = next(control for control in walk_controls(root)
-                if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+                if isinstance(control, ft.TextField) and control.label == "Area (K-M-F or 10k5m)")
     area.value = "0-20-0"
     button = next(control for control in walk_controls(root)
                   if isinstance(control, ft.Button)
@@ -1289,7 +1292,7 @@ def test_deed_party_areas_accept_kmf_and_compact_formats(monkeypatch):
     areas[0].value = "1k2m"
     areas[1].value = "3-0-0"
     deed_area = next(control for control in walk_controls(root)
-                     if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+                     if isinstance(control, ft.TextField) and control.label == "Area (K-M-F or 10k5m)")
     deed_area.value = "0-20-0"
     button = next(control for control in walk_controls(root)
                   if isinstance(control, ft.Button)
@@ -1324,7 +1327,7 @@ def test_deed_party_area_rejects_ambiguous_text_with_party_name(monkeypatch):
     buyer_name.value = "Ali"
     areas[0].value = "5m10"
     deed_area = next(control for control in walk_controls(root)
-                     if isinstance(control, ft.TextField) and control.label == "Area (K-M-F)")
+                     if isinstance(control, ft.TextField) and control.label == "Area (K-M-F or 10k5m)")
     deed_area.value = "0-20-0"
     button = next(control for control in walk_controls(root)
                   if isinstance(control, ft.Button)
@@ -1435,3 +1438,105 @@ def test_schedule_display_radio_sits_beside_the_profile_selector(monkeypatch):
     assert schedule_radio in holder.controls
     assert any(isinstance(item, ft.VerticalDivider) for item in holder.controls)
     assert schedule_radio.visible is True
+
+
+def test_rural_locations_show_fbr_rate_menus_when_rows_exist(monkeypatch):
+    """Rural FBR schedules drive FBR taxes, so their menus appear for rural."""
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)],
+             "fbr": [{"id": 21, "location_id": 7, "schedule_type": "fbr",
+                      "rate_unit": "per_square_foot", "rate_value": "300",
+                      "classification": "Residential", "property_type": "Residential",
+                      "mauza": "Chak 1", "effective_from": valuation.date(2020, 1, 1),
+                      "effective_to": None}]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    fbr_unit = _dropdown(controls, "FBR rate unit (if available)")
+    fbr_rate = _dropdown(controls, "Matched FBR rate (editable)")
+    assert fbr_unit.visible is True
+    assert fbr_rate.visible is True
+    assert fbr_unit.value == "per_square_foot"
+    assert fbr_rate.value == "21"
+
+
+def test_rural_locations_without_fbr_rows_keep_fbr_menus_hidden(monkeypatch):
+    _patch_estimate_services(monkeypatch, matches=[_location_row(7)],
+                             rates={"dc": [_dc_rate(11, 7)], "fbr": []})
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    fbr_rate = _dropdown(controls, "Matched FBR rate (editable)")
+    assert fbr_rate.visible is False
+
+
+def test_main_area_field_accepts_compact_notation(monkeypatch):
+    """The deed area accepts 10k5m / plain kanal alongside 2-5-0."""
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    captured: dict[str, object] = {}
+
+    def fake_dual_valuation(**kwargs):
+        captured["area_value"] = kwargs["area_value"]
+        return {
+            "area_square_feet": Decimal("12240"),
+            "property_value": Decimal("100"),
+            "transferred_value": Decimal("100"),
+            "dc_value": Decimal("100"),
+            "fbr_value": None,
+            "registry_written_value": None,
+            "declared_consideration": None,
+            "comparison": None,
+            "explanation": ["Area: 1-2-0."],
+            "warnings": [],
+            "rate_quantity": Decimal("45"),
+            "rate_unit": "per_marla",
+            "dc_rate": {}, "fbr_rate": None, "rate_id": 11, "rate": {},
+            "fbr_valuation": None, "rate_snapshot": {"dc": {}, "fbr": None},
+            "fbr_warning": None,
+        }
+
+    monkeypatch.setattr(valuation, "calculate_dual_valuation", fake_dual_valuation)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    area = next(control for control in walk_controls(root)
+                if isinstance(control, ft.TextField)
+                and control.label == "Area (K-M-F or 10k5m)")
+    area.value = "1k2m"   # 1 kanal 2 marla = 1-2-0
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    assert captured["area_value"] == "1-2-0"
+    assert _form_error(root).value == ""
+
+
+def test_location_choices_show_the_measurement_unit(monkeypatch):
+    matches = [_location_row(7)]
+    rates = {"dc": [dict(_dc_rate(11, 7), rate_unit="per_marla", rate_value="66650")]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    location_match = _dropdown(controls, "Choose matching schedule location")
+    labels = [option.text for option in location_match.options]
+    assert labels and all("Per marla" in label for label in labels)

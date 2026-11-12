@@ -20,6 +20,7 @@ from sqlalchemy.orm import joinedload
 
 from core.area_engine import AreaError, LandArea
 from core.database import SessionLocal
+from core.search import like_pattern, matches_pattern
 from core.models import (
     DC_RATE_UNITS,
     DCValuationRate,
@@ -1049,17 +1050,19 @@ def _apply_location_context(statement, context: dict[str, Any] | None):
         value = _text(raw_value)
         if not value or field_name not in _LOCATION_HINT_COLUMNS:
             continue
+        pattern = like_pattern(value)
+        if pattern is None:
+            continue
         if field_name == "locality":
-            pattern = f"%{value}%"
             statement = statement.where(or_(
-                PropertyLocation.locality.ilike(pattern),
-                PropertyLocation.name.ilike(pattern),
+                PropertyLocation.locality.ilike(pattern, escape="\\"),
+                PropertyLocation.name.ilike(pattern, escape="\\"),
             ))
         elif field_name in _LOCATION_REFERENCE_FIELDS:
             statement = statement.where(_reference_search_condition(field_name, value))
         else:
             statement = statement.where(
-                _LOCATION_HINT_COLUMNS[field_name].ilike(f"%{value}%")
+                _LOCATION_HINT_COLUMNS[field_name].ilike(pattern, escape="\\")
             )
     return statement
 
@@ -1103,15 +1106,19 @@ def _apply_location_hint_search(statement, field_name: str, raw_value: Any):
     value = _text(raw_value)
     if not value:
         return statement
-    pattern = f"%{value}%"
+    pattern = like_pattern(value)
+    if pattern is None:
+        return statement
     if field_name == "locality":
         return statement.where(or_(
-            PropertyLocation.locality.ilike(pattern),
-            PropertyLocation.name.ilike(pattern),
+            PropertyLocation.locality.ilike(pattern, escape="\\"),
+            PropertyLocation.name.ilike(pattern, escape="\\"),
         ))
     if field_name in _LOCATION_REFERENCE_FIELDS:
         return statement.where(_reference_search_condition(field_name, value))
-    return statement.where(_LOCATION_HINT_COLUMNS[field_name].ilike(pattern))
+    return statement.where(
+        _LOCATION_HINT_COLUMNS[field_name].ilike(pattern, escape="\\")
+    )
 
 
 def _location_matches_context(location: dict[str, Any], context: dict[str, Any]) -> bool:
@@ -1122,7 +1129,7 @@ def _location_matches_context(location: dict[str, Any], context: dict[str, Any])
             continue
         if field_name == "locality":
             if not any(
-                value.casefold() in str(location.get(field) or "").casefold()
+                matches_pattern(location.get(field), value)
                 for field in ("locality", "name")
             ):
                 return False
@@ -1136,7 +1143,7 @@ def _location_matches_context(location: dict[str, Any], context: dict[str, Any])
             if not requested.intersection(stored):
                 return False
             continue
-        if value.casefold() not in str(location.get(field_name) or "").casefold():
+        if not matches_pattern(location.get(field_name), value):
             return False
     return True
 
@@ -1196,6 +1203,96 @@ def clear_location_hint_cache() -> None:
     import that should be visible in the suggestions immediately.
     """
     _LOCATION_HINT_CACHE.clear()
+    _LOCATION_DIMENSION_CACHE.clear()
+
+
+# Rural administrative levels are tiny compared to the row count — a whole
+# dataset is a handful of districts/tehsils and a few hundred mauzas — so
+# they are preloaded once and filtered in memory for instant suggestions.
+# Without this, every keystroke ran a DISTINCT query over the whole schedule
+# table joined to the rate rows, which made tehsil suggestions slow enough
+# that they appeared to be missing.
+_LOCATION_DIMENSION_CACHE: dict[str, Any] = {}
+
+
+def preload_location_dimensions() -> None:
+    """Fetch the rural hierarchy's distinct values once into memory."""
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(
+                PropertyLocation.district, PropertyLocation.tehsil,
+                PropertyLocation.qanoongoi, PropertyLocation.mauza,
+            ).distinct()
+        ).all()
+    entries: list[tuple[str, str, str, str]] = []
+    districts: set[str] = set()
+    tehsils: dict[str, set[str]] = {}
+    qanoongois: dict[tuple[str, str], set[str]] = {}
+    for district, tehsil, qanoongoi, mauza in rows:
+        d_value, t_value, q_value, m_value = (
+            _text(value) for value in (district, tehsil, qanoongoi, mauza)
+        )
+        if not any((d_value, t_value, q_value, m_value)):
+            continue
+        entries.append((d_value, t_value, q_value, m_value))
+        if d_value:
+            districts.add(d_value)
+        if d_value and t_value:
+            tehsils.setdefault(d_value, set()).add(t_value)
+        if d_value and t_value and q_value:
+            qanoongois.setdefault((d_value, t_value), set()).add(q_value)
+    _LOCATION_DIMENSION_CACHE.clear()
+    _LOCATION_DIMENSION_CACHE.update({
+        "rows": entries,
+        "districts": sorted(districts, key=str.casefold),
+        "tehsils": {key: sorted(value, key=str.casefold)
+                    for key, value in tehsils.items()},
+        "qanoongois": {key: sorted(value, key=str.casefold)
+                       for key, value in qanoongois.items()},
+    })
+
+
+def _dimension_hint_values(
+    field_name: str, search_value: str, context: dict[str, Any]
+) -> list[str]:
+    """Filter the preloaded rural hierarchy in memory for one hint field.
+
+    Mirrors the SQL semantics: a typed parent keeps rows whose stored value
+    contains the typed text (case-insensitive, wildcards supported through
+    the same helper the queries use for the non-cached path).
+    """
+    cache = _LOCATION_DIMENSION_CACHE
+
+    def contains(typed: str, stored: str) -> bool:
+        # Same wildcard-aware semantics as the SQL LIKE path.
+        return matches_pattern(stored, typed)
+
+    if field_name == "district":
+        return [value for value in cache["districts"]
+                if contains(search_value, value)]
+
+    typed_district = _text(context.get("district"))
+    typed_tehsil = _text(context.get("tehsil"))
+    typed_qanoongoi = _text(context.get("qanoongoi"))
+    values: set[str] = set()
+    for district, tehsil, qanoongoi, mauza in cache["rows"]:
+        if not contains(typed_district, district):
+            continue
+        if not contains(typed_tehsil, tehsil):
+            continue
+        if field_name == "qanoongoi":
+            if not qanoongoi:
+                continue
+            if not contains(search_value, qanoongoi):
+                continue
+            values.add(qanoongoi)
+            continue
+        if not contains(typed_qanoongoi, qanoongoi):
+            continue
+        value = mauza if field_name == "mauza" else tehsil
+        if value and contains(search_value, value):
+            values.add(value)
+    return sorted(values, key=str.casefold)
 
 
 def list_location_hint_values(
@@ -1244,6 +1341,15 @@ def list_location_hint_values(
                 if missing:
                     result[field_name] = []
                     continue
+            if (hierarchy
+                    and field_name in ("district", "tehsil", "qanoongoi", "mauza")
+                    and _LOCATION_DIMENSION_CACHE.get("rows")):
+                # Preloaded hierarchy: filter in memory instead of running a
+                # DISTINCT query over the whole schedule table per keystroke.
+                result[field_name] = _dimension_hint_values(
+                    field_name, _text(context.get(field_name)), context
+                )
+                continue
             if hierarchy and field_name in LOCATION_HIERARCHY_PARENTS:
                 # Keep only the parents of this level; unrelated typed values
                 # (children, sibling urban fields) must not filter it.
@@ -1363,7 +1469,9 @@ def list_mauza_names(
         .order_by(PropertyLocation.mauza)
     )
     if search.strip():
-        statement = statement.where(PropertyLocation.mauza.ilike(f"%{search.strip()}%"))
+        statement = statement.where(PropertyLocation.mauza.ilike(
+                like_pattern(search), escape="\\"
+            ))
     statement = _apply_qanoongoi_filter(statement, qanoongoi)
     statement = statement.limit(max(1, limit))
     with SessionLocal() as session:
@@ -1470,7 +1578,9 @@ def list_mauza_contexts(*, search: str = "", limit: int = 500) -> list[dict[str,
     )
     query = search.strip()
     if query:
-        statement = statement.where(PropertyLocation.mauza.ilike(f"%{query}%"))
+        statement = statement.where(PropertyLocation.mauza.ilike(
+                like_pattern(query), escape="\\"
+            ))
     statement = statement.order_by(PropertyLocation.mauza, PropertyLocation.district,
                                   PropertyLocation.tehsil).limit(max(1, limit))
     with SessionLocal() as session:
@@ -1480,7 +1590,7 @@ def list_mauza_contexts(*, search: str = "", limit: int = 500) -> list[dict[str,
         ).where(PropertyKhewat.mauza_name.is_not(None), PropertyKhewat.mauza_name != "")
         if query:
             khewat_statement = khewat_statement.where(
-                PropertyKhewat.mauza_name.ilike(f"%{query}%")
+                PropertyKhewat.mauza_name.ilike(like_pattern(query), escape="\\")
             )
         khewat_rows = session.execute(khewat_statement).all()
     contexts = {
@@ -1497,7 +1607,9 @@ def list_saved_khewat_mauzas(*, search: str = "", limit: int = 200) -> list[str]
         PropertyKhewat.mauza_name.is_not(None), PropertyKhewat.mauza_name != ""
     ).distinct()
     if search.strip():
-        statement = statement.where(PropertyKhewat.mauza_name.ilike(f"%{search.strip()}%"))
+        statement = statement.where(PropertyKhewat.mauza_name.ilike(
+                like_pattern(search), escape="\\"
+            ))
     statement = statement.order_by(PropertyKhewat.mauza_name).limit(max(1, limit))
     with SessionLocal() as session:
         return list(session.scalars(statement).all())
@@ -1507,9 +1619,13 @@ def list_saved_khewat_numbers(*, mauza: str = "", search: str = "", limit: int =
     """Return searchable Khewat numbers, optionally scoped to a Mauza."""
     statement = select(PropertyKhewat.khewat_number).distinct()
     if mauza.strip():
-        statement = statement.where(PropertyKhewat.mauza_name.ilike(f"%{mauza.strip()}%"))
+        statement = statement.where(PropertyKhewat.mauza_name.ilike(
+                like_pattern(mauza), escape="\\"
+            ))
     if search.strip():
-        statement = statement.where(PropertyKhewat.khewat_number.ilike(f"%{search.strip()}%"))
+        statement = statement.where(PropertyKhewat.khewat_number.ilike(
+                like_pattern(search), escape="\\"
+            ))
     statement = statement.order_by(PropertyKhewat.khewat_number).limit(max(1, limit))
     with SessionLocal() as session:
         return list(session.scalars(statement).all())
@@ -1687,7 +1803,9 @@ def search_khewats(
     for field, value in (("mauza_name", mauza), ("district", district), ("tehsil", tehsil),
                          ("khewat_number", khewat_number)):
         if value.strip():
-            statement = statement.where(getattr(PropertyKhewat, field).ilike(f"%{value.strip()}%"))
+            statement = statement.where(getattr(PropertyKhewat, field).ilike(
+                like_pattern(value), escape="\\"
+            ))
     if rhz_year:
         statement = statement.where(PropertyKhewat.rhz_year == normalize_rhz_year(rhz_year))
     statement = statement.order_by(
@@ -2281,7 +2399,7 @@ def _mauza_location_match(
         A SQLAlchemy select of ``PropertyLocation.id`` rows.
     """
     statement = select(PropertyLocation.id).where(
-        PropertyLocation.mauza.ilike(f"%{mauza.strip()}%")
+        PropertyLocation.mauza.ilike(like_pattern(mauza), escape="\\")
     )
     statement = _apply_qanoongoi_filter(statement, qanoongoi)
     if land_type in {"rural", "urban"}:
@@ -2588,7 +2706,7 @@ def list_dc_rates(
     )
     if use_location_subquery:
         location_match = select(PropertyLocation.id).where(
-            PropertyLocation.mauza.ilike(f"%{mauza_term}%")
+            PropertyLocation.mauza.ilike(like_pattern(mauza_term), escape="\\")
         )
         location_match = _apply_qanoongoi_filter(location_match, qanoongoi)
         if land_type in {"rural", "urban"}:
@@ -2625,7 +2743,7 @@ def list_dc_rates(
     if not use_location_subquery:
         if mauza_term:
             statement = statement.where(
-                PropertyLocation.mauza.ilike(f"%{mauza_term}%")
+                PropertyLocation.mauza.ilike(like_pattern(mauza_term), escape="\\")
             )
         statement = _apply_qanoongoi_filter(statement, qanoongoi)
     # Cadastral fields are stored as token lists or compact ranges; query a
@@ -2664,9 +2782,12 @@ def list_dc_rates(
         reference_conditions = []
         for column in reference_columns:
             reference_conditions.extend(_reference_sql_conditions(column, search))
+        search_pattern = like_pattern(search)
         statement = statement.where(or_(
-            *(field.ilike(f"%{search}%") for field in searchable_rate_fields),
-            *(field.ilike(f"%{search}%") for field in searchable_location_fields),
+            *(field.ilike(search_pattern, escape="\\")
+              for field in searchable_rate_fields),
+            *(field.ilike(search_pattern, escape="\\")
+              for field in searchable_location_fields),
             *reference_conditions,
         ))
     statement = statement.order_by(
@@ -2689,7 +2810,6 @@ def list_dc_rates(
                 for row in session.scalars(statement).yield_per(256)
             ]
 
-        search_key = search.casefold()
         reference_fields = ("square_no", "kila_no", "khasra_no")
         start = max(0, offset)
         stop = None if limit is None else start + max(1, limit)
@@ -2711,8 +2831,9 @@ def list_dc_rates(
             if not square_match or not kila_match or not khasra_match:
                 continue
             # Ordinary fields retain the existing case-insensitive substring
-            # search. Cadastral identifiers match complete expanded tokens,
-            # including values represented as ranges in older database rows.
+            # search, now with the app-wide *, ? wildcard support. Cadastral
+            # identifiers match complete expanded tokens, including values
+            # represented as ranges in older database rows.
             text_values = [
                 record.get(field) for field in (
                     "property_type", "classification", "floor", "schedule_type",
@@ -2722,7 +2843,8 @@ def list_dc_rates(
                     "locality",
                 )
             ]
-            if search_key and any(search_key in str(value).casefold() for value in text_values if value):
+            if search and any(matches_pattern(value, search)
+                              for value in text_values if value):
                 matches.append(record)
             else:
                 try:
@@ -2733,7 +2855,7 @@ def list_dc_rates(
                     )
                 except DCRateServiceError:
                     found = False
-                if not search_key or found:
+                if not search or found:
                     matches.append(record)
             if stop is not None and len(matches) >= stop:
                 break
@@ -3286,7 +3408,11 @@ def preview_mapped_schedule(
         "fbr": {"revenue_circle", "property_area", "classification", "locality", "rate_value"},
     }
     missing = required_by_profile[schedule_type] - mapping.keys()
-    if schedule_type in {"rural_dc", "fbr"} and not {"square_no", "kila_no", "khasra_no"}.intersection(mapping):
+    # Rural DC rows identify a record by its cadastral pair, so at least one
+    # reference column must be mapped. FBR schedules legitimately have no
+    # Square column at all: properties are found by revenue circle and
+    # property area (with the square used when a sheet supplies one).
+    if schedule_type == "rural_dc" and not {"square_no", "kila_no", "khasra_no"}.intersection(mapping):
         missing.add("at least one of square_no, kila_no, or khasra_no")
     if missing:
         raise DCRateServiceError("Map required columns for this schedule: " + ", ".join(sorted(missing)))
@@ -3365,7 +3491,10 @@ def preview_mapped_schedule(
                 )
 
             # A Khasra-based record may legitimately omit square and Kila.
-            # Rural rows otherwise need both; FBR rows need a square number.
+            # Rural rows otherwise need both. FBR rows have no square
+            # requirement: the schedule is found through revenue circle and
+            # property area (both stay required), and the square is used
+            # whenever a sheet supplies one.
             if has_value("khasra_no"):
                 empty = [field for field in empty if field not in {"square_no", "kila_no"}]
             elif schedule_type == "rural_dc" and (not has_value("square_no") or not has_value("kila_no")):
@@ -3373,8 +3502,6 @@ def preview_mapped_schedule(
                     field for field in ("square_no", "kila_no")
                     if not has_value(field) and field not in empty
                 )
-            elif schedule_type == "fbr" and not has_value("square_no"):
-                empty.append("square_no")
         source_values = [
             "" if value is None else str(value) for value in row
         ]

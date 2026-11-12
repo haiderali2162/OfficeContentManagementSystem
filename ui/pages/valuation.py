@@ -17,7 +17,12 @@ from typing import Any, Callable
 
 import flet as ft
 
-from core.area_engine import AreaError, AreaSettings, parse_area_expression
+from core.area_engine import (
+    AreaError,
+    AreaSettings,
+    normalize_area_expression,
+    parse_area_expression,
+)
 from core.models import DC_RATE_UNITS
 from services.dc_rate_service import (
     DCRateServiceError,
@@ -26,6 +31,7 @@ from services.dc_rate_service import (
     find_schedule_location_matches,
     list_dc_rates,
     list_location_hint_values,
+    preload_location_dimensions,
 )
 from services.estimate_service import (
     get_estimate,
@@ -269,7 +275,8 @@ def build_valuation_page(
     fbr_rate_unit = ft.Dropdown(label="FBR rate unit (if available)", width=220, options=[
         ft.dropdown.Option(unit, RATE_UNITS[unit]) for unit in DC_RATE_UNITS
     ])
-    area_value = ft.TextField(label="Area (K-M-F)", width=190, hint_text="For example: 2-5-0")
+    area_value = ft.TextField(label="Area (K-M-F or 10k5m)", width=210,
+                              hint_text="e.g. 2-5-0, 10k5m, 5m, 100f; plain number = kanal")
     area_unit = ft.Dropdown(label="Area input unit", value="kmf", visible=False, options=[
         ft.dropdown.Option("kmf", "K-M-F")
     ])
@@ -619,8 +626,22 @@ def build_valuation_page(
                             and len(row_kilas) == 1 and row_kilas[0] in typed_kila_tokens):
                         exact_keys.add(str(row["id"]))
 
+        # The location choices also show each location's measurement unit or
+        # units so the user can tell schedules apart before picking one.
+        dc_units_by_location: dict[str, set[str]] = {}
+        for rate_row in all_rates:
+            if rate_row.get("schedule_type") == "dc" and rate_row.get("rate_unit"):
+                dc_units_by_location.setdefault(
+                    str(rate_row["location_id"]), set()
+                ).add(RATE_UNITS.get(rate_row["rate_unit"], rate_row["rate_unit"]))
+
+        def _label_with_units(row: dict[str, Any], base_label: str) -> str:
+            units = sorted(dc_units_by_location.get(str(row["id"]), ()))
+            return f"{base_label} · {' / '.join(units)}" if units else base_label
+
         entries: list[tuple[str, str, str, str]] = [
-            (str(row["id"]), _location_option_label(row), "", "") for row in candidates
+            (str(row["id"]), _label_with_units(row, _location_option_label(row)), "", "")
+            for row in candidates
         ]
         if (property_profile.value == "rural"
                 and schedule_display.value == "individual" and candidates):
@@ -646,9 +667,10 @@ def build_valuation_page(
                         f"Square {square}" if square else "",
                         f"Kila {kila}" if kila else "",
                     ) if part)
+                    pair_label = f"{base_label} · {detail}" if detail else base_label
                     expanded.append((
                         key,
-                        f"{base_label} · {detail}" if detail else base_label,
+                        _label_with_units(row, pair_label),
                         square, kila,
                     ))
             if not overflow:
@@ -755,9 +777,11 @@ def build_valuation_page(
             units = sorted({row["rate_unit"] for row in rows})
             unit_control.options = [ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units]
             # The DC unit and rate menus stay permanently visible (developer
-            # request); the FBR pair follows the urban-only display rule.
+            # request). FBR menus appear whenever the matched locations carry
+            # FBR schedule rows — including rural deeds, so rural FBR taxes
+            # can actually calculate.
             unit_control.visible = (
-                schedule == "dc" or bool(units) and property_profile.value == "urban"
+                schedule == "dc" or bool(units)
             )
             if unit_control.value not in units:
                 unit_control.value = units[0] if len(units) == 1 else None
@@ -765,7 +789,7 @@ def build_valuation_page(
             rate_records[schedule] = rows
             rate_control.options = [ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows]
             rate_control.visible = (
-                schedule == "dc" or bool(rows) and property_profile.value == "urban"
+                schedule == "dc" or bool(rows)
             )
             if rate_control.value not in {str(row["id"]) for row in rows}:
                 rate_control.value = str(rows[0]["id"]) if len(rows) == 1 else None
@@ -1083,6 +1107,17 @@ def build_valuation_page(
             if material_value < 0:
                 raise ValuationError("Building material value cannot be negative.")
             written_value = (registry_written_value.value or "").strip() or None
+            # Both area notations are accepted everywhere (developer
+            # request): the canonical K-M-F dash form and the compact
+            # "10k5m" / "5m" / "100f" / plain-kanal forms. The value is
+            # normalized to K-M-F before it reaches the valuation engine.
+            area_input = _text_value(area_value)
+            normalized_area = area_input
+            if area_input:
+                try:
+                    normalized_area = normalize_area_expression(area_input, settings=settings)
+                except AreaError as exc:
+                    raise ValuationError(str(exc)) from None
             fbr_rate = next((row for row in rate_records["fbr"]
                              if str(row["id"]) == fbr_rate_choice.value), None)
             valuation = calculate_dual_valuation(
@@ -1092,7 +1127,7 @@ def build_valuation_page(
                 classification=effective_classification,
                 floor=dc_rate.get("floor"),
                 transaction_date=transaction_date,
-                area_value=area_value.value,
+                area_value=normalized_area,
                 area_unit="kmf",
                 dc_rate_unit=dc_rate_unit.value or None,
                 fbr_rate_unit=fbr_rate_unit.value or None,
@@ -1562,8 +1597,9 @@ def build_valuation_page(
             square_col.col = {"xs": 4, "sm": 2, "md": 2}
             kila_col.col = {"xs": 4, "sm": 2, "md": 2}
             khasra_col.col = {"xs": 4, "sm": 2, "md": 2}
-        fbr_rate_choice.visible = not is_rural
-        fbr_rate_unit.visible = not is_rural
+        # FBR dropdowns are no longer hidden for rural deeds here; the rate
+        # refresh shows them whenever the matched locations carry FBR rows,
+        # so rural FBR fees can calculate.
         refresh_rate_matches()
 
     advanced_button.on_click = toggle_advanced_inputs
@@ -2114,8 +2150,13 @@ def build_valuation_page(
             refresh_rules(rules)
             refresh_formulas_with_records(formulas)
             render_custom_field_inputs(custom_fields)
-            # Populate schedule-backed suggestions immediately on page open.
-            # Rate matching remains empty until the user provides enough detail.
+            # Preload the tiny rural hierarchy (districts/tehsils/qanoongois/
+            # mauzas) so type-ahead suggestions are instant and always
+            # available, then populate the schedule-backed square/kila hints.
+            try:
+                await asyncio.to_thread(preload_location_dimensions)
+            except Exception as exc:
+                status.value = f"Could not preload location lists: {exc}"
             refresh_location_hints()
             refresh_rate_matches()
             page.update()
