@@ -373,6 +373,12 @@ def build_valuation_page(
         ft.dropdown.Option("272", "272 sq ft"), ft.dropdown.Option("225", "225 sq ft")
     ])
     registry_written_value = ft.TextField(label="Registry written value (PKR)", width=230)
+    # Optional developer-entered valuation: when filled, the fees are also
+    # computed against this valuation and shown as a comparison table.
+    entered_valuation_field = ft.TextField(
+        label="Entered valuation (PKR, optional)", width=230,
+        hint_text="Compare fees against your own valuation",
+    )
     constructed = ft.Checkbox(label="Property is constructed", value=False)
     building_material_value = ft.TextField(label="Building material value (PKR)", width=230, value="0")
     transaction_type = ft.Dropdown(label="Transaction type", value="sale", width=190, options=[
@@ -1136,6 +1142,60 @@ def build_valuation_page(
         result_panel.controls.extend(ft.Text(
             f"Total {currency}: {_money(amount, currency)}", weight=ft.FontWeight.BOLD
         ) for currency, amount in charges["totals_by_currency"].items())
+        # Optional comparison: when the developer entered a valuation, the
+        # same fees were computed against it too — show them side by side
+        # (developer request).
+        charges_entered = charges.get("charges_on_entered_valuation")
+        if charges_entered is not None:
+            def _charge_key(line: dict[str, Any]) -> tuple[str, str]:
+                party = line.get("party") or {}
+                return (str(line.get("name")), str(party.get("label") or ""))
+
+            entered_by_key = {_charge_key(line): line for line in charges_entered["charges"]}
+            entered_totals = charges_entered.get("totals_by_currency", {})
+            rows = [
+                ft.DataRow(cells=[
+                    ft.DataCell(ft.Text("Charge", weight=ft.FontWeight.BOLD)),
+                    ft.DataCell(ft.Text("On calculated valuation", weight=ft.FontWeight.BOLD)),
+                    ft.DataCell(ft.Text("On entered valuation", weight=ft.FontWeight.BOLD)),
+                ]),
+            ]
+            for line in charges["charges"]:
+                key = _charge_key(line)
+                other = entered_by_key.get(key)
+                rows.append(ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(
+                        f"{line['name']}"
+                        + (f" — {line['party']['label']}" if line.get("party") else ""),
+                        size=12,
+                    )),
+                    ft.DataCell(ft.Text(_money(line["amount"], line["currency_code"]), size=12)),
+                    ft.DataCell(ft.Text(
+                        _money(other["amount"], other.get("currency_code", "PKR"))
+                        if other else "—", size=12,
+                    )),
+                ]))
+            rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text("Total", weight=ft.FontWeight.BOLD)),
+                ft.DataCell(ft.Text(
+                    " · ".join(f"{currency}: {_money(amount, currency)}" for currency, amount
+                               in charges["totals_by_currency"].items()) or "—",
+                    weight=ft.FontWeight.BOLD, size=12,
+                )),
+                ft.DataCell(ft.Text(
+                    " · ".join(f"{currency}: {_money(amount, currency)}" for currency, amount
+                               in entered_totals.items()) or "—",
+                    weight=ft.FontWeight.BOLD, size=12,
+                )),
+            ]))
+            result_panel.controls.append(ft.Text(
+                "Fee comparison (calculated valuation vs entered valuation)",
+                weight=ft.FontWeight.BOLD,
+            ))
+            result_panel.controls.append(ft.DataTable(
+                columns=[], rows=rows, heading_row_height=0, data_row_min_height=34,
+                column_spacing=18,
+            ))
         warnings = valuation["warnings"] + charges["warnings"] + [
             f"{item['rule']}: {item['reason']}" for item in charges["skipped_rules"]
         ]
@@ -1310,28 +1370,53 @@ def build_valuation_page(
             # Both values are available to rules; each rule explicitly picks
             # DC or FBR as its calculation base. Registry formulas use the same
             # separated context and save their expression/source snapshots.
-            if parties:
-                charges = calculate_charges_for_parties(
-                    rules=rules, transaction_date=transaction_date, context=context,
-                    parties=parties, jurisdiction=["Punjab", "Punjab, Pakistan"],
+            def compute_charges(ctx: dict[str, Any]) -> dict[str, Any]:
+                """Compute rule charges plus registry formulas for one context."""
+                if parties:
+                    result = calculate_charges_for_parties(
+                        rules=rules, transaction_date=transaction_date, context=ctx,
+                        parties=parties, jurisdiction=["Punjab", "Punjab, Pakistan"],
+                    )
+                else:
+                    result = calculate_charges(
+                        rules=rules, transaction_date=transaction_date,
+                        context=ctx, jurisdiction=["Punjab", "Punjab, Pakistan"])
+                formulas_result = calculate_registry_fee_formulas(
+                    formulas=list_registry_fee_formulas(), effective_on=transaction_date,
+                    context=ctx, jurisdictions=["Punjab", "Punjab, Pakistan"],
+                    custom_variables=[field["field_key"] for field in custom_formula_fields],
                 )
-            else:
-                charges = calculate_charges(rules=rules, transaction_date=transaction_date,
-                                            context=context, jurisdiction=["Punjab", "Punjab, Pakistan"])
-            formulas_result = calculate_registry_fee_formulas(
-                formulas=list_registry_fee_formulas(), effective_on=transaction_date,
-                context=context, jurisdictions=["Punjab", "Punjab, Pakistan"],
-                custom_variables=[field["field_key"] for field in custom_formula_fields],
-            )
-            charges["charges"].extend(formulas_result["charges"])
-            for currency, amount in formulas_result["totals_by_currency"].items():
-                charges["totals_by_currency"][currency] = charges["totals_by_currency"].get(currency, Decimal("0")) + amount
-            charges["warnings"].extend(formulas_result["warnings"])
-            charges["warnings"].extend(f"{item['rule']}: {item['reason']}" for item in formulas_result["skipped_rules"])
-            if charges["skipped_rules"]:
-                charges["warnings"].extend(
-                    f"{item['rule']}: {item['reason']}" for item in charges["skipped_rules"]
-                )
+                result["charges"].extend(formulas_result["charges"])
+                for currency, amount in formulas_result["totals_by_currency"].items():
+                    result["totals_by_currency"][currency] = result["totals_by_currency"].get(currency, Decimal("0")) + amount
+                result["warnings"].extend(formulas_result["warnings"])
+                result["warnings"].extend(f"{item['rule']}: {item['reason']}" for item in formulas_result["skipped_rules"])
+                if result["skipped_rules"]:
+                    result["warnings"].extend(
+                        f"{item['rule']}: {item['reason']}" for item in result["skipped_rules"]
+                    )
+                return result
+
+            charges = compute_charges(context)
+            # Optional developer-entered valuation: compute the same fees
+            # against it so the result can show a side-by-side comparison
+            # (developer request).
+            entered_valuation_text = (entered_valuation_field.value or "").strip()
+            entered_value: Decimal | None = None
+            if entered_valuation_text:
+                try:
+                    entered_value = Decimal(entered_valuation_text)
+                except (InvalidOperation, ValueError):
+                    raise ValueError(
+                        "Entered valuation must be a valid number."
+                    ) from None
+                if entered_value < 0:
+                    raise ValueError("Entered valuation cannot be negative.")
+                entered_context = dict(context)
+                entered_context["dc_value"] = entered_value
+                entered_context["property_value"] = entered_value
+                entered_context["transferred_value"] = entered_value
+                charges["charges_on_entered_valuation"] = compute_charges(entered_context)
             inputs = {
                 "location_id": int(dc_rate["location_id"]),
                 "client_id": int(client.value) if client.value not in (None, "none") else None,
@@ -1360,6 +1445,7 @@ def build_valuation_page(
                 "share_numerator": 1,
                 "share_denominator": 1,
                 "declared_consideration": valuation["registry_written_value"],
+                "entered_valuation": entered_value,
                 "parties": [
                     {key: party[key] for key in ("role", "name", "area_marla", "filer_status")}
                     for party in parties
@@ -1745,6 +1831,8 @@ def build_valuation_page(
                     # Optional written amount drives the under-valuation check
                     # (deficient amount) in the result.
                     ft.Container(registry_written_value, col={"xs": 12, "md": 4}),
+                    # Optional entered valuation drives the fee comparison table.
+                    ft.Container(entered_valuation_field, col={"xs": 12, "md": 4}),
                 ], run_spacing=8),
             ], spacing=10),
             padding=14,

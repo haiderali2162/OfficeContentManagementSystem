@@ -1,2 +1,6 @@
-on the calcualte tab of "valuation & taxes":
-1. currently system calcualtes fees only against the calculated valuation only but i also need the user entered valuation fees also. provide these in a comparison kind view like a table view or provide some options so that user can choose from.
+1. got the following error "The application encountered an error: columns must contain at minimum one visible DataColumn".
+2. also why have you removed the district and tehsil fields from "dc / fbr rates" tab of "valuation & taxes" page. please add them in the extended filter section.
+3. also the expanded rows of schedule is not exporting. upon export click it asks for the location but the file only have header row nothing else so please fix it also.
+4. also the search for the schedule is very slow. i asked you to prepare a caching system to retreive records fast. like user has typed qanoongoi name, it should popup with all the qanoongoies available if tehsil & district is not available if tehsil or district is provided, it should only show the qanoongoies of that tehsil. same goes for mauza as there are mauzas under qanoongoi. and for mauza show hints for square no and kila no.
+5. in the urban schedule, there is one more field "town" and "property area" these are missing in schedule search on "dc/fbr rates" tab.
+6. also add python installer package in requirements.txt file or any other missing ones which we need in this project.

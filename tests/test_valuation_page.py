@@ -39,6 +39,10 @@ def walk_controls(control):
     content = getattr(control, "content", None)
     if isinstance(content, ft.Control):
         yield from walk_controls(content)
+    # DataTables keep their content in rows/cells rather than `controls`.
+    for row in getattr(control, "rows", ()) or ():
+        for cell in getattr(row, "cells", ()) or ():
+            yield from walk_controls(cell)
 
 
 def _stub_control_updates(root):
@@ -1557,3 +1561,62 @@ def test_location_choices_show_the_measurement_unit(monkeypatch):
     location_match = _dropdown(controls, "Choose matching schedule location")
     labels = [option.text for option in location_match.options]
     assert labels and all("Per marla" in label for label in labels)
+
+
+def test_entered_valuation_produces_fee_comparison(monkeypatch):
+    """An entered valuation computes the same fees against it side by side."""
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    captured_contexts = []
+
+    def fake_party_charges(*, rules, transaction_date, context, parties, jurisdiction):
+        captured_contexts.append(context)
+        base = context["dc_value"]
+        return {
+            "charges": [{
+                "name": "Stamp fee", "category": "stamp_fee", "payer": "buyer",
+                "amount": base / Decimal("100"), "currency_code": "PKR",
+            }],
+            "totals_by_currency": {"PKR": base / Decimal("100")},
+            "total_currency": "PKR", "warnings": [], "skipped_rules": [],
+        }
+
+    monkeypatch.setattr(valuation, "calculate_charges_for_parties", fake_party_charges)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    area = next(control for control in walk_controls(root)
+                if isinstance(control, ft.TextField)
+                and control.label == "Area (K-M-F or 10k5m)")
+    area.value = "0-20-0"   # 1 kanal at PKR 100/kanal -> DC valuation 100.00
+    written = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.TextField)
+                   and control.label == "Registry written value (PKR)")
+    written.value = "50"
+    entered = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.TextField)
+                   and control.label == "Entered valuation (PKR, optional)")
+    entered.value = "100000"
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    # The charges ran twice: once on the calculated valuation, once on the
+    # entered one (same rules, same parties, only the valuation base moved).
+    assert len(captured_contexts) == 2
+    assert captured_contexts[1]["dc_value"] == Decimal("100000")
+    assert captured_contexts[1]["transferred_value"] == Decimal("100000")
+
+    texts = [control.value for control in walk_controls(root)
+             if isinstance(control, ft.Text) and control.value]
+    assert any("Fee comparison" in text for text in texts)
+    assert any("On entered valuation" in text for text in texts)
+    # PKR 1.00 on the calculated base vs PKR 1,000.00 on the entered base.
+    assert any("1,000.00" in text for text in texts)
