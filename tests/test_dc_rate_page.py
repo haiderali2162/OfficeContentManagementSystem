@@ -376,7 +376,7 @@ def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch)
     assert {"Qanoongoi", "Mauza", "Square no.", "Kila no.", "Khasra no."} <= text_labels
     assert {"Rate unit", "Schedule"} <= labels
     autocompletes = [control for control in controls if isinstance(control, ft.AutoComplete)]
-    assert len(autocompletes) == 5
+    assert len(autocompletes) == 9
     schedule = next(control for control in controls if isinstance(control, ft.Dropdown) and control.label == "Schedule")
     assert [option.key for option in schedule.options] == ["dc_rural", "dc_urban", "fbr", "all"]
     search = next(control for control in controls if isinstance(control, ft.TextField)
@@ -622,6 +622,8 @@ def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch)
         "lowest_unit": "per_marla", "lowest_schedule": "dc",
         "highest_unit": "per_square_foot", "highest_schedule": "fbr",
     })
+    monkeypatch.setattr(dc_rates, "preload_location_dimensions", lambda: None)
+    monkeypatch.setattr(dc_rates, "list_location_hint_values", lambda **_: {})
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page, defer_initial_load=True)
     qanoongoi = next(
@@ -637,13 +639,15 @@ def test_deferred_rate_load_populates_mauza_suggestions_and_summary(monkeypatch)
     asyncio.run(page.background_task)
 
     assert [item.value for item in mauza.suggestions] == ["Test Mauza", "Other Mauza"]
-    square, kila, khasra = [
-        control for control in _walk(root)
-        if isinstance(control, ft.AutoComplete) and control not in (qanoongoi, mauza)
-    ]
-    assert [option.value for option in square.suggestions] == ["12", "123"]
-    assert [option.value for option in kila.suggestions] == ["4"]
-    assert [option.value for option in khasra.suggestions] == ["4"]
+    square = next(control for control in _walk(root)
+                  if isinstance(control, ft.AutoComplete) and control.data == "square_no")
+    kila = next(control for control in _walk(root)
+                if isinstance(control, ft.AutoComplete) and control.data == "kila_no")
+    khasra = next(control for control in _walk(root)
+                  if isinstance(control, ft.AutoComplete) and control.data == "khasra_no")
+    assert [option.value for option in square.suggestions] == []
+    assert [option.value for option in kila.suggestions] == []
+    assert [option.value for option in khasra.suggestions] == []
     summary = next(control for control in _walk(root)
                    if isinstance(control, ft.Text) and "Lowest:" in (control.value or ""))
     assert "Lowest: 10 Per marla" in summary.value
@@ -673,13 +677,20 @@ def test_square_change_clears_kila_and_narrows_its_suggestions(monkeypatch):
         return []
 
     monkeypatch.setattr(dc_rates, "list_cadastral_values", list_cadastral)
+    monkeypatch.setattr(dc_rates, "preload_location_dimensions", lambda: None)
+    monkeypatch.setattr(dc_rates, "list_location_hint_values", lambda **_: {})
     page = FakePage()
     root = dc_rates.build_dc_rates_page(page, defer_initial_load=True)
     asyncio.run(page.background_task)
-    qanoongoi, mauza, square, kila, _ = [
-        control for control in _walk(root)
-        if isinstance(control, ft.AutoComplete)
-    ]
+    mauza = next(control for control in _walk(root)
+                 if isinstance(control, ft.AutoComplete) and control.data == "mauza")
+    square = next(control for control in _walk(root)
+                  if isinstance(control, ft.AutoComplete) and control.data == "square_no")
+    kila = next(control for control in _walk(root)
+                if isinstance(control, ft.AutoComplete) and control.data == "kila_no")
+
+    qanoongoi = next(control for control in _walk(root)
+                     if isinstance(control, ft.AutoComplete) and control.data == "qanoongoi")
 
     qanoongoi.value = "Jandiala"
     mauza.value = "Madar"
@@ -1166,9 +1177,14 @@ def test_rate_card_formula_without_a_number_shows_a_visible_gap(monkeypatch):
     assert "Per 1 kanal: —" in body_values
 
 
-def _stub_empty_rate_page(monkeypatch):
+def _stub_empty_rate_page(monkeypatch, with_records: bool = False):
     monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
-    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: [])
+    # Exports abort on zero matching records (the header-only-file fix), so
+    # tests that exercise the export location flow need at least one record.
+    monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_: ([] if not with_records else [{
+        "id": 1, "schedule_type": "dc", "land_type": "rural", "mauza": "Test Mauza",
+        "classification": "Residential", "rate_value": "1000", "rate_unit": "per_marla",
+    }]))
     monkeypatch.setattr(dc_rates, "summarize_dc_rates", lambda **_: {
         "count": 0, "lowest": None, "highest": None,
     })
@@ -1182,7 +1198,7 @@ def _export_button(root, label="Export CSV"):
 
 
 def test_schedule_export_writes_to_the_default_folder(monkeypatch, tmp_path):
-    _stub_empty_rate_page(monkeypatch)
+    _stub_empty_rate_page(monkeypatch, with_records=True)
     monkeypatch.setattr(dc_rates, "get_default_file_location", lambda: str(tmp_path))
     prompts = []
 
@@ -1218,14 +1234,14 @@ def test_schedule_export_writes_to_the_default_folder(monkeypatch, tmp_path):
     assert prompts[-1]["default_location"] == str(tmp_path)
     assert any(
         isinstance(control, ft.Text)
-        and f"Exported 0 record(s)" in (control.value or "")
+        and f"Exported 1 record(s)" in (control.value or "")
         and str(target) in (control.value or "")
         for control in _walk(root)
     )
 
 
 def test_schedule_export_can_choose_another_location(monkeypatch):
-    _stub_empty_rate_page(monkeypatch)
+    _stub_empty_rate_page(monkeypatch, with_records=True)
     monkeypatch.setattr(dc_rates, "get_default_file_location", lambda: "D:\\default")
     prompts = []
 

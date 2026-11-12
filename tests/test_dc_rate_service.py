@@ -2332,3 +2332,26 @@ def test_import_total_cap_is_developer_defined_or_absent(rate_database):
     )
     assert preview["issues"] == []
     assert preview["expanded_rows"] == 5650
+
+
+def test_list_dc_rates_filters_by_extended_location_fields(rate_database):
+    """District/Tehsil/Town/Property-area filters narrow the rates query."""
+    rural_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Chak 1", mauza="Chak 1", land_type="rural",
+        district="District A", tehsil="Tehsil A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=rural_id, **_rate_values())
+    urban_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Market Block", mauza="Market Block", land_type="urban",
+        district="District U", tehsil="Tehsil U2",
+        committee_town="Town U", property_area="Sector U",
+    ))
+    dc_rate_service.create_dc_rate(location_id=urban_id, **_rate_values())
+
+    assert [r["id"] for r in dc_rate_service.list_dc_rates(district="District A")] == [rural_id]
+    assert [r["id"] for r in dc_rate_service.list_dc_rates(tehsil="Tehsil U2")] == [urban_id]
+    assert [r["id"] for r in dc_rate_service.list_dc_rates(
+        committee_town="Town U", property_area="Sector U")] == [urban_id]
+    # Wildcards work like everywhere else.
+    assert [r["id"] for r in dc_rate_service.list_dc_rates(tehsil="Tehsil ?")] == [rural_id]
+    assert dc_rate_service.list_dc_rates(district="Nothing") == []

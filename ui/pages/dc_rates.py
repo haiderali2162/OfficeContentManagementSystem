@@ -40,6 +40,7 @@ from services.dc_rate_service import (
     list_cadastral_values,
     list_dc_rates,
     list_duplicate_rule_profiles,
+    list_location_hint_values,
     list_location_picker,
     list_mauza_cadastral_values,
     list_rhz_years,
@@ -47,6 +48,7 @@ from services.dc_rate_service import (
     DELETION_SCOPES,
     delete_dc_rate_schedules,
     MAX_EXPANDED_ROWS_PER_SOURCE,
+    preload_location_dimensions,
     find_duplicate_dc_rates,
     find_khewat_year_conflicts,
     latest_rhz_year,
@@ -243,9 +245,15 @@ def build_dc_rates_page(
     mauza_filter = ft.AutoComplete(
         width=220, suggestions_max_height=240, data="mauza"
     )
-    square_filter = ft.AutoComplete(width=140, suggestions_max_height=220)
-    kila_filter = ft.AutoComplete(width=140, suggestions_max_height=220)
-    khasra_filter = ft.AutoComplete(width=150, suggestions_max_height=220)
+    square_filter = ft.AutoComplete(width=140, suggestions_max_height=220, data="square_no")
+    kila_filter = ft.AutoComplete(width=140, suggestions_max_height=220, data="kila_no")
+    khasra_filter = ft.AutoComplete(width=150, suggestions_max_height=220, data="khasra_no")
+    # Developer request: district/tehsil filters back in the extended panel,
+    # plus the urban schedule's Town and Property area fields.
+    district_filter = ft.AutoComplete(width=160, suggestions_max_height=220, data="district")
+    tehsil_filter = ft.AutoComplete(width=160, suggestions_max_height=220, data="tehsil")
+    town_filter = ft.AutoComplete(width=160, suggestions_max_height=220, data="committee_town")
+    property_area_filter = ft.AutoComplete(width=160, suggestions_max_height=220, data="property_area")
     search_field = ft.TextField(
         label="Search location, property, classification, or source",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
@@ -535,6 +543,9 @@ def build_dc_rates_page(
                         list_dc_rates,
                         search=search_field.value or "", mauza=mauza_filter.value or "",
                         qanoongoi=qanoongoi_filter.value or "",
+                        district=district_filter.value or "", tehsil=tehsil_filter.value or "",
+                        committee_town=town_filter.value or "",
+                        property_area=property_area_filter.value or "",
                         square_no=square_filter.value or "", kila_no=kila_filter.value or "",
                         khasra_no=khasra_filter.value or "",
                         schedule_type=schedule_type, land_type=land_type,
@@ -1053,6 +1064,10 @@ def build_dc_rates_page(
                 search_field.value = ""
                 qanoongoi_filter.value = ""
                 mauza_filter.value = ""
+                district_filter.value = ""
+                tehsil_filter.value = ""
+                town_filter.value = ""
+                property_area_filter.value = ""
                 square_filter.value = ""
                 kila_filter.value = ""
                 khasra_filter.value = ""
@@ -1729,6 +1744,10 @@ def build_dc_rates_page(
             published_year=year,
             mauza=mauza_filter.value or "",
             qanoongoi=qanoongoi_filter.value or "",
+            district=district_filter.value or "",
+            tehsil=tehsil_filter.value or "",
+            committee_town=town_filter.value or "",
+            property_area=property_area_filter.value or "",
             square_no=square_filter.value or "",
             kila_no=kila_filter.value or "",
             khasra_no=khasra_filter.value or "",
@@ -2132,6 +2151,25 @@ def build_dc_rates_page(
                 ], spacing=2, tight=True),
             )
             export_error = ft.Text("", size=12, color="#B91C1C")
+            export_count = ft.Text("Counting matching records…", size=12, color="#475569")
+
+            async def load_export_count():
+                try:
+                    count = await asyncio.to_thread(records_matching_current_filters)
+                    if count:
+                        export_count.value = (
+                            f"{len(count):,} record(s) match the current filters "
+                            "and will be exported."
+                        )
+                    else:
+                        export_count.value = (
+                            "No schedule rows match the current filters. "
+                            "Adjust the filters before exporting."
+                        )
+                    page.update()
+                except Exception as exc:
+                    export_count.value = f"Could not count matching records: {exc}"
+                    page.update()
 
             def confirm_export(_):
                 chosen_mode = reference_mode.value or "ranges"
@@ -2143,6 +2181,13 @@ def build_dc_rates_page(
                 async def run_export():
                     try:
                         records = await asyncio.to_thread(records_matching_current_filters)
+                        if not records:
+                            status_text.value = (
+                                "No schedule rows match the current filters — "
+                                "nothing was exported. Adjust the filters (or clear "
+                                "them) and try again."
+                            )
+                            return
                         payload = await asyncio.to_thread(
                             export_schedule_records,
                             records,
@@ -2191,6 +2236,7 @@ def build_dc_rates_page(
                         color="#475569",
                     ),
                     reference_mode,
+                    export_count,
                     export_error,
                 ], width=460, tight=True),
                 actions=[
@@ -2199,6 +2245,8 @@ def build_dc_rates_page(
                 ],
             ))
             page.update()
+            if hasattr(page, "run_task"):
+                page.run_task(load_export_count)
         return export_schedule
 
     def open_cadastral_selection_dialog(_=None, *, khewat_record=None):
@@ -2937,6 +2985,88 @@ def build_dc_rates_page(
         khasra_filter.value = ""
         schedule_rates_refresh(event, refresh_cadastral=True)
 
+    # Hierarchy-aware type-ahead for the filter fields (developer request):
+    # Qanoongoi offers every value without a Tehsil, but only the selected
+    # tehsil's values once one is typed; Mauza follows the Qanoongoi; and
+    # Square/Kila hints come from the selected Mauza. Backed by the same
+    # preloaded hierarchy and per-context cache the Calculate tab uses, so
+    # the lookups are instant.
+    hint_generation = 0
+
+    def filter_hint_refresh() -> None:
+        """Apply hierarchy-scoped suggestions to the location filter fields."""
+        nonlocal hint_generation
+        hint_generation += 1
+        generation = hint_generation
+
+        def land_type_for_hints() -> str | None:
+            value = schedule_filter.value or "all"
+            if value == "dc_rural":
+                return "rural"
+            if value == "dc_urban":
+                return "urban"
+            return None
+
+        def apply_hints() -> None:
+            try:
+                values_by_field = list_location_hint_values(
+                    land_type=land_type_for_hints(),
+                    context={
+                        "district": district_filter.value or "",
+                        "tehsil": tehsil_filter.value or "",
+                        "qanoongoi": qanoongoi_filter.value or "",
+                        "mauza": mauza_filter.value or "",
+                    },
+                    fields=[
+                        "district", "tehsil", "qanoongoi", "mauza",
+                    ],
+                    limit=100,
+                    hierarchy=True,
+                )
+            except Exception as exc:
+                status_text.value = f"Could not load filter suggestions: {exc}"
+                page.update()
+                return
+            for field_name, control in (
+                ("district", district_filter), ("tehsil", tehsil_filter),
+                ("qanoongoi", qanoongoi_filter), ("mauza", mauza_filter),
+            ):
+                control.suggestions = [
+                    ft.AutoCompleteSuggestion(key=value, value=value)
+                    for value in values_by_field.get(field_name, [])
+                ]
+            page.update()
+
+        async def load_hints():
+            await asyncio.sleep(0.12)
+            if generation != hint_generation:
+                return
+            await asyncio.to_thread(apply_hints)
+
+        if hasattr(page, "run_task"):
+            page.run_task(load_hints)
+        else:
+            apply_hints()
+
+    def district_changed(event):
+        """Reset every rural level below the District."""
+        tehsil_filter.value = ""
+        qanoongoi_filter.value = ""
+        mauza_filter.value = ""
+        square_filter.value = ""
+        kila_filter.value = ""
+        khasra_filter.value = ""
+        schedule_rates_refresh(event, refresh_cadastral=True)
+
+    def tehsil_changed(event):
+        """Reset Qanoongoi and everything below it for the new Tehsil."""
+        qanoongoi_filter.value = ""
+        mauza_filter.value = ""
+        square_filter.value = ""
+        kila_filter.value = ""
+        khasra_filter.value = ""
+        schedule_rates_refresh(event, refresh_cadastral=True)
+
     def mauza_changed(event):
         """Reset cadastral choices that belonged to the previous Mauza."""
         square_filter.value = ""
@@ -2956,6 +3086,10 @@ def build_dc_rates_page(
         schedule_rates_refresh(event, suggestion_field="kila_no")
 
     search_field.on_change = schedule_rates_refresh
+    district_filter.on_change = district_changed
+    district_filter.on_select = district_changed
+    tehsil_filter.on_change = tehsil_changed
+    tehsil_filter.on_select = tehsil_changed
     qanoongoi_filter.on_change = qanoongoi_changed
     qanoongoi_filter.on_select = qanoongoi_changed
     mauza_filter.on_change = mauza_changed
@@ -3346,7 +3480,11 @@ def build_dc_rates_page(
         ft.Container(search_field, col={"xs": 12, "md": 6}),
     ], run_spacing=4)
     extended_filters = ft.ResponsiveRow([
-        ft.Container(location_filter, col={"xs": 12, "md": 4}),
+        ft.Container(ft.Column([ft.Text("District"), district_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(ft.Column([ft.Text("Tehsil"), tehsil_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(location_filter, col={"xs": 12, "sm": 6, "md": 4}),
+        ft.Container(ft.Column([ft.Text("Town"), town_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(ft.Column([ft.Text("Property area"), property_area_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(published_year_filter, col={"xs": 12, "md": 4}),
     ], visible=False, run_spacing=4)
 
@@ -3410,7 +3548,7 @@ def build_dc_rates_page(
         async def load_initial_data():
             """Populate the first bounded view without blocking page navigation."""
             try:
-                location_picker_data, records, mauza_names, summary, squares, kilas, khasras = await asyncio.gather(
+                location_picker_data, records, mauza_names, summary = await asyncio.gather(
                     asyncio.to_thread(list_location_picker, limit=visible_location_limit),
                     asyncio.to_thread(list_dc_rates, limit=visible_rate_limit + 1),
                     asyncio.to_thread(
@@ -3423,10 +3561,12 @@ def build_dc_rates_page(
                         summarize_dc_rates,
                         qanoongoi=qanoongoi_filter.value or "",
                     ),
-                    asyncio.to_thread(list_cadastral_values, "square_no"),
-                    asyncio.to_thread(list_cadastral_values, "kila_no"),
-                    asyncio.to_thread(list_cadastral_values, "khasra_no"),
                 )
+                # Preload the tiny rural hierarchy once so the district/
+                # tehsil/qanoongoi/mauza filter suggestions answer instantly,
+                # then fill them from the hierarchy (developer request).
+                await asyncio.to_thread(preload_location_dimensions)
+                filter_hint_refresh()
                 refresh_locations(
                     location_picker_data["locations"],
                     qanoongoi_values=location_picker_data["qanoongoi"],
@@ -3435,10 +3575,9 @@ def build_dc_rates_page(
                 mauza_filter.suggestions = [
                     ft.AutoCompleteSuggestion(key=name, value=name) for name in mauza_names
                 ]
-                for control, values in (
-                    (square_filter, squares), (kila_filter, kilas), (khasra_filter, khasras)
-                ):
-                    control.suggestions = [ft.AutoCompleteSuggestion(key=value, value=value) for value in values]
+                # Square/Kila/Khasra suggestions stay empty until a Mauza is
+                # provided (developer request: no more "wild" global lists);
+                # the cadastral refresh scopes them on each change.
                 refresh_rates(update_page=False, records=records, summary=summary,
                               has_more=len(records) > visible_rate_limit)
                 page.update()

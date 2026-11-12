@@ -2747,6 +2747,10 @@ def list_dc_rates(
     published_year: int | None = None,
     mauza: str = "",
     qanoongoi: str = "",
+    district: str = "",
+    tehsil: str = "",
+    committee_town: str = "",
+    property_area: str = "",
     square_no: str = "",
     kila_no: str = "",
     khasra_no: str = "",
@@ -2757,6 +2761,10 @@ def list_dc_rates(
     statement = select(DCValuationRate).options(joinedload(DCValuationRate.location))
     search = search.strip()
     mauza_term = mauza.strip()
+    district_term = district.strip()
+    tehsil_term = tehsil.strip()
+    town_term = committee_town.strip()
+    area_term = property_area.strip()
     cadastral_terms = (square_no.strip(), kila_no.strip(), khasra_no.strip())
     # With a Mauza filter and no free-text/cadastral search, match location
     # fields inside a location-id subquery: SQLite then probes rates through
@@ -2769,12 +2777,23 @@ def list_dc_rates(
             PropertyLocation.mauza.ilike(like_pattern(mauza_term), escape="\\")
         )
         location_match = _apply_qanoongoi_filter(location_match, qanoongoi)
+        for column, term in (
+            (PropertyLocation.district, district_term),
+            (PropertyLocation.tehsil, tehsil_term),
+            (PropertyLocation.committee_town, town_term),
+            (PropertyLocation.property_area, area_term),
+        ):
+            if term:
+                location_match = location_match.where(
+                    column.ilike(like_pattern(term), escape="\\")
+                )
         if land_type in {"rural", "urban"}:
             location_match = location_match.where(
                 PropertyLocation.land_type == land_type
             )
         statement = statement.where(DCValuationRate.location_id.in_(location_match))
     elif (mauza_term or qanoongoi.strip() or any(cadastral_terms)
+            or district_term or tehsil_term or town_term or area_term
             or land_type in {"rural", "urban"} or search):
         statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
@@ -2805,6 +2824,16 @@ def list_dc_rates(
             statement = statement.where(
                 PropertyLocation.mauza.ilike(like_pattern(mauza_term), escape="\\")
             )
+        for column, term in (
+            (PropertyLocation.district, district_term),
+            (PropertyLocation.tehsil, tehsil_term),
+            (PropertyLocation.committee_town, town_term),
+            (PropertyLocation.property_area, area_term),
+        ):
+            if term:
+                statement = statement.where(
+                    column.ilike(like_pattern(term), escape="\\")
+                )
         statement = _apply_qanoongoi_filter(statement, qanoongoi)
     # Cadastral fields are stored as token lists or compact ranges; query a
     # broad superset in SQLite, then validate whole tokens/ranges below so

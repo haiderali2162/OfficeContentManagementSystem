@@ -1153,13 +1153,7 @@ def build_valuation_page(
 
             entered_by_key = {_charge_key(line): line for line in charges_entered["charges"]}
             entered_totals = charges_entered.get("totals_by_currency", {})
-            rows = [
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text("Charge", weight=ft.FontWeight.BOLD)),
-                    ft.DataCell(ft.Text("On calculated valuation", weight=ft.FontWeight.BOLD)),
-                    ft.DataCell(ft.Text("On entered valuation", weight=ft.FontWeight.BOLD)),
-                ]),
-            ]
+            rows = []
             for line in charges["charges"]:
                 key = _charge_key(line)
                 other = entered_by_key.get(key)
@@ -1193,8 +1187,12 @@ def build_valuation_page(
                 weight=ft.FontWeight.BOLD,
             ))
             result_panel.controls.append(ft.DataTable(
-                columns=[], rows=rows, heading_row_height=0, data_row_min_height=34,
-                column_spacing=18,
+                columns=[
+                    ft.DataColumn(ft.Text("Charge", weight=ft.FontWeight.BOLD)),
+                    ft.DataColumn(ft.Text("On calculated valuation", weight=ft.FontWeight.BOLD)),
+                    ft.DataColumn(ft.Text("On entered valuation", weight=ft.FontWeight.BOLD)),
+                ],
+                rows=rows, column_spacing=18,
             ))
         warnings = valuation["warnings"] + charges["warnings"] + [
             f"{item['rule']}: {item['reason']}" for item in charges["skipped_rules"]

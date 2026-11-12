@@ -39,10 +39,21 @@ def walk_controls(control):
     content = getattr(control, "content", None)
     if isinstance(content, ft.Control):
         yield from walk_controls(content)
-    # DataTables keep their content in rows/cells rather than `controls`.
-    for row in getattr(control, "rows", ()) or ():
-        for cell in getattr(row, "cells", ()) or ():
-            yield from walk_controls(cell)
+    # DataTables keep their content in columns/rows/cells, not `controls`
+    # (DataColumn stores its widget in `label`, DataCell in `content`).
+    dt_columns = getattr(control, "columns", None)
+    if isinstance(dt_columns, (list, tuple)):
+        for column in dt_columns:
+            label = getattr(column, "label", None)
+            if isinstance(label, ft.Control):
+                yield from walk_controls(label)
+    dt_rows = getattr(control, "rows", None)
+    if isinstance(dt_rows, (list, tuple)):
+        for row in dt_rows:
+            for cell in getattr(row, "cells", ()) or ():
+                content = getattr(cell, "content", None)
+                if isinstance(content, ft.Control):
+                    yield from walk_controls(content)
 
 
 def _stub_control_updates(root):

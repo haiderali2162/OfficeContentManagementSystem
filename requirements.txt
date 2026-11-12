@@ -7,3 +7,5 @@ reportlab>=4.0
 odfpy>=1.4.1
 arabic-reshaper>=3.0,<4.0
 python-bidi>=0.6,<1.0
+# Packaging: builds the desktop executable from app.spec.
+pyinstaller>=6.0
