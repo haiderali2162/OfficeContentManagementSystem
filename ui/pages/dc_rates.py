@@ -46,6 +46,7 @@ from services.dc_rate_service import (
     list_mauza_names,
     DELETION_SCOPES,
     delete_dc_rate_schedules,
+    MAX_EXPANDED_ROWS_PER_SOURCE,
     find_duplicate_dc_rates,
     find_khewat_year_conflicts,
     latest_rhz_year,
@@ -217,6 +218,7 @@ def build_dc_rates_page(
         dialog_title: str,
         allowed_extensions: list[str],
         with_data: bool = True,
+        allow_multiple: bool = False,
     ) -> list:
         """Open the import picker, optionally starting in the default folder."""
         default_location = get_default_file_location()
@@ -231,7 +233,7 @@ def build_dc_rates_page(
                 default_location if choice == "default" else None
             ),
             allowed_extensions=allowed_extensions,
-            allow_multiple=False,
+            allow_multiple=allow_multiple,
             with_data=with_data,
         )
 
@@ -1097,22 +1099,18 @@ def build_dc_rates_page(
         # Import moves from file parsing -> worksheet selection -> column
         # mapping -> validated preview -> service commit, so every worksheet is
         # accounted for and spreadsheet columns are never guessed silently.
+        # Multiple files can be selected at once; every file's worksheets join
+        # one queue that is walked in order (developer request).
         try:
             files = await pick_import_file(
                 action="schedule import",
-                dialog_title="Import DC or FBR schedule",
+                dialog_title="Import DC or FBR schedule (one or more files)",
                 allowed_extensions=["csv", "xlsx", "ods"],
+                allow_multiple=True,
             )
             if not files:
                 return
-            selected = files[0]
-            payload = selected.bytes
-            if payload is None and selected.path:
-                payload = Path(selected.path).read_bytes()
-            if payload is None:
-                raise DCRateServiceError("Could not read the selected spreadsheet.")
-            sheets = read_schedule_sheets(payload, selected.name)
-            groups = group_schedule_sheets(sheets)
+            queue_items: list[dict[str, Any]] = []
             profile_fields = {
                 "rural_dc": [
                     ("serial_no", "Serial no. (optional)"), ("district", "District (optional)"),
@@ -1144,25 +1142,38 @@ def build_dc_rates_page(
                     ("per_marla_value", "Per marla valuation (optional; defaults to square-foot value × 272)"),
                 ],
             }
+            for selected in files:
+                payload = selected.bytes
+                if payload is None and selected.path:
+                    payload = Path(selected.path).read_bytes()
+                if payload is None:
+                    raise DCRateServiceError(
+                        f"Could not read the selected spreadsheet: {selected.name}"
+                    )
+                sheets = read_schedule_sheets(payload, selected.name)
+                for group in group_schedule_sheets(sheets):
+                    queue_items.append({"file": selected, "group": group})
 
-            def open_group_picker(groups):
+            def open_group_picker(queue_items):
                 """Let the user review every worksheet layout before importing."""
-                if len(groups) == 1:
-                    open_mapping(groups, 0)
+                if len(queue_items) == 1:
+                    open_mapping(queue_items, 0)
                     return
                 checks = []
                 error = ft.Text("", color="#B91C1C", size=12)
-                for index, group in enumerate(groups, start=1):
+                for index, item in enumerate(queue_items, start=1):
+                    group = item["group"]
                     check = ft.Checkbox(
                         value=True,
                         label=(
-                            f"Layout {index}: {', '.join(group['sheets'])} "
+                            f"{item['file'].name} · Layout {index}: "
+                            f"{', '.join(group['sheets'])} "
                             f"({len(group['rows']):,} row(s))"
                         ),
                     )
-                    checks.append((group, check))
+                    checks.append((item, check))
                 def continue_import(_):
-                    selected_groups = [group for group, check in checks if check.value]
+                    selected_groups = [item for item, check in checks if check.value]
                     if not selected_groups:
                         error.value = "Select at least one worksheet layout to import."
                         page.update()
@@ -1171,10 +1182,13 @@ def build_dc_rates_page(
                     open_mapping(selected_groups, 0)
                 page.show_dialog(ft.AlertDialog(
                     modal=True,
-                    title=ft.Text(f"Choose worksheets - {selected.name}"),
+                    title=ft.Text(
+                        f"Choose worksheets ({len(files)} file(s))"
+                        if len(files) > 1 else f"Choose worksheets - {files[0].name}"
+                    ),
                     content=ft.Column([
                         ft.Text(
-                            f"This file contains {len(groups)} column layout(s). "
+                            f"The selected file(s) contain {len(queue_items)} column layout(s). "
                             "Every worksheet is listed; selected layouts are imported "
                             "one after another with their own column mapping.",
                             size=12,
@@ -1197,7 +1211,7 @@ def build_dc_rates_page(
                                     ),
                                 ], spacing=2),
                             )
-                            for group, check in checks
+                            for item, check in checks
                         ],
                         error,
                     ], width=680, tight=True, scroll=ft.ScrollMode.AUTO),
@@ -1210,7 +1224,9 @@ def build_dc_rates_page(
 
             def open_mapping(queue, index):
                 """Map and import one worksheet layout, then continue the queue."""
-                group = queue[index]
+                item = queue[index]
+                selected = item["file"]
+                group = item["group"]
                 headers = group["headers"]
                 rows = group["rows"]
                 row_numbers = group.get("row_numbers")
@@ -1259,6 +1275,38 @@ def build_dc_rates_page(
                     ], wrap=True, spacing=12),
                 )
                 storage_mode.on_change = refresh_storage_warning
+                # The developer controls the caps: a typed import cap applies
+                # to the whole import (and per row); blank means no cap. The
+                # checkbox alone removes the per-row expansion limit.
+                expansion_cap_field = ft.TextField(
+                    label="Import cap (expanded records; blank = no limit)",
+                    width=340,
+                )
+                allow_large_expansion = ft.Checkbox(
+                    label="Allow very large row expansion (no per-row limit)",
+                    value=False,
+                )
+                allow_large_expansion_help = ft.Text(
+                    "Per-row default limit: "
+                    f"{MAX_EXPANDED_ROWS_PER_SOURCE:,} records. A typed cap also "
+                    "applies per row; the checkbox alone removes the per-row "
+                    "limit.",
+                    size=11, color="#64748B",
+                )
+
+                def expansion_limits():
+                    """Resolve the developer's per-row and whole-import caps."""
+                    raw_cap = (expansion_cap_field.value or "").strip()
+                    if raw_cap:
+                        cap = int(raw_cap)
+                        if cap < 0:
+                            raise ValueError("The import cap cannot be negative.")
+                        per_row = cap if allow_large_expansion.value else min(
+                            MAX_EXPANDED_ROWS_PER_SOURCE, cap
+                        )
+                        return per_row, cap
+                    per_row = 0 if allow_large_expansion.value else None
+                    return per_row, None
                 duplicate_policy = ft.RadioGroup(
                     value="check_now",
                     content=ft.Row([
@@ -1348,6 +1396,7 @@ def build_dc_rates_page(
                     applied_rule = preview.get("duplicate_rule") or {}
                     chosen_policy = duplicate_policy.value or "check_now"
                     chosen_storage = storage_mode.value or "individual"
+                    chosen_per_row_cap, chosen_total_cap = expansion_limits()
                     import_year = ft.TextField(
                         label="Published year for this import (optional)",
                         hint_text="Example: 2026. Leave blank to use each row's date/year.",
@@ -1534,6 +1583,8 @@ def build_dc_rates_page(
                                     duplicate_policy=chosen_policy,
                                     duplicate_rule=duplicate_rule_dropdown.value,
                                     storage_mode=chosen_storage,
+                                    max_per_source=chosen_per_row_cap,
+                                    max_total=chosen_total_cap,
                                 )
                                 picker = await asyncio.to_thread(list_location_picker)
                                 refresh_locations(
@@ -1602,6 +1653,7 @@ def build_dc_rates_page(
                     try:
                         mapping = {key: int(control.value) for key, control in selects.items()
                                    if control.value not in (None, "")}
+                        per_row_cap, total_cap = expansion_limits()
                         preview = preview_mapped_schedule(
                             headers,
                             rows,
@@ -1610,6 +1662,8 @@ def build_dc_rates_page(
                             duplicate_policy=duplicate_policy.value or "check_now",
                             duplicate_rule=duplicate_rule_dropdown.value,
                             storage_mode=storage_mode.value or "individual",
+                            max_per_source=per_row_cap,
+                            max_total=total_cap,
                             row_numbers=row_numbers,
                             row_sheets=row_sheets,
                         )
@@ -1641,6 +1695,9 @@ def build_dc_rates_page(
                         ),
                         storage_mode,
                         storage_warning,
+                        expansion_cap_field,
+                        allow_large_expansion,
+                        allow_large_expansion_help,
                         ft.Text("Duplicate detection", weight=ft.FontWeight.BOLD),
                         duplicate_policy,
                         duplicate_rule_dropdown,
@@ -1652,7 +1709,7 @@ def build_dc_rates_page(
                 rebuild_mapping()
                 page.update()
 
-            open_group_picker(groups)
+            open_group_picker(queue_items)
         except Exception as exc:
             status_text.value = f"Could not open schedule spreadsheet: {exc}"
             page.update()

@@ -2240,3 +2240,95 @@ def test_import_cleans_cells_and_warns_on_collective_ranges(rate_database):
         if warning["kind"] == "collective value kept as one record"
     ]
     assert preview["expanded_rows"] == 2
+
+
+def test_large_row_expansion_cap_and_override(rate_database):
+    """A row over the per-row cap errors by default and expands when allowed."""
+    headers = ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location",
+               "Square No", "Killa No", "DC Rate", "Unit"]
+    # 113 squares x 50 kilas = 5,650 combinations: just over the default cap.
+    mapping = dc_rate_service.suggested_column_mapping(headers)
+    row = ["Tehsil A", "Qanoongoi A", "Mauza A", "Agricultural", "Farm",
+           "1-113", "1-50", "1000", "per_marla"]
+
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="individual",
+    )
+    # The too-large row is reported as an invalid-row issue, not a crash.
+    assert preview["valid_records"] == []
+    assert "5,650" in preview["issues"][0]["message"]
+    assert "at most 5,000" in preview["issues"][0]["message"]
+
+    # Accepting the suggestion to expand: the developer ticks the large-row
+    # option, which lifts the per-row cap (the whole-import cap still
+    # applies) and the preview succeeds with every combination expanded.
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="individual",
+        max_per_source=dc_rate_service.MAX_EXPANDED_ROWS_PER_IMPORT,
+    )
+    assert preview["issues"] == []
+    assert preview["expanded_rows"] == 5650
+    squares = {candidate["location"]["square_no"]
+               for candidate in preview["valid_records"]}
+    assert "113" in squares and "1" in squares and len(squares) == 113
+
+    # Ranges storage never expands, so the same row needs no override.
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="ranges",
+    )
+    assert preview["issues"] == []
+    assert preview["expanded_rows"] == 1
+
+
+def test_import_total_cap_is_developer_defined_or_absent(rate_database):
+    """The hardcoded 250,000 cap is gone: the cap is the developer's own.
+
+    ``max_total=None`` applies no import-total cap; a typed cap is enforced
+    and also supersedes the per-row default when the row alone exceeds it.
+    """
+    headers = ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location",
+               "Square No", "Killa No", "DC Rate", "Unit"]
+    mapping = dc_rate_service.suggested_column_mapping(headers)
+    # 113 squares x 50 kilas = 5,650 combinations.
+    row = ["Tehsil A", "Qanoongoi A", "Mauza A", "Agricultural", "Farm",
+           "1-113", "1-50", "1000", "per_marla"]
+
+    # No caps at all: the preview expands everything without any total check.
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="individual",
+        max_per_source=0,
+    )
+    assert preview["issues"] == []
+    assert preview["expanded_rows"] == 5650
+
+    # A developer cap below the row's expansion reports it against the cap.
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="individual",
+        max_per_source=0,
+        max_total=1000,
+    )
+    assert preview["valid_records"] == []
+    assert "more than 1,000" in preview["issues"][0]["message"]
+    assert "raise the import cap" in preview["issues"][0]["message"]
+
+    # A developer cap above the row's expansion lets the row through even
+    # though it exceeds the old fixed per-row default.
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="individual",
+        max_per_source=6000,
+        max_total=6000,
+    )
+    assert preview["issues"] == []
+    assert preview["expanded_rows"] == 5650

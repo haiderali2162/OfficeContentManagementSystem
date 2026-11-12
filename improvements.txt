@@ -1,7 +1,2 @@
-got the following error while importing "Table 1 row 5456 · invalid: Row 5456 expands to 6,175 cadastral records. Split the square, Kila, or Khasra range so one source row expands to at most 5,000 records." there are too many of them.
-"Source values: 102 | Sheikhupura | Sheikhupura | Sheikhupura | Ajnianwala | Gujyana nou | Agricultural | Off road | 1-113; 116-148; 152-181; 183-188; 229-254; 257-295 | 1-25 |  | 2931600 | Acre | 0"
-here is the suggestion also "Suggested fix: Use an ascending range or split an exceptionally large range into smaller ranges." provide a way to accept suggestion. or some more options including to expand the records.
-
-also answer some questions.
-    1. if we import schedule with ranges as they are in the excel file, does our system is capable to find a square and killa or any schedule by just providing individual value?
-    2. if search works according to the above criteria then does it also work in calcualte tab?
+on the calcualte tab of "valuation & taxes":
+1. currently system calcualtes fees only against the calculated valuation only but i also need the user entered valuation fees also. provide these in a comparison kind view like a table view or provide some options so that user can choose from.

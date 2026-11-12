@@ -280,17 +280,26 @@ _MAX_EXPORTED_ROWS = 250_000
 
 
 MAX_EXPANDED_ROWS_PER_SOURCE = 5_000
+# Deprecated default import-total cap. Since the developer's request the
+# whole-import cap exists only when the developer types one in the import
+# dialog (blank = no cap); the constant remains for reference.
 MAX_EXPANDED_ROWS_PER_IMPORT = 250_000
 _EXPANDABLE_REFERENCE_FIELDS = ("square_no", "kila_no", "khasra_no")
 
 
 def _expand_location_values(
-    location: dict[str, Any], *, source_row: int | None = None
+    location: dict[str, Any], *, source_row: int | None = None,
+    max_per_source: int | None = None,
 ) -> list[dict[str, Any]]:
     """Expand square/Kila/Khasra tokens into one record per combination.
 
     A missing field is treated as a single empty value, so a row with only a
     Khasra range still expands. Every non-cadastral value is copied unchanged.
+
+    ``max_per_source`` controls the per-row expansion cap: ``None`` keeps the
+    default :data:`MAX_EXPANDED_ROWS_PER_SOURCE`, a positive int is the cap,
+    and zero or negative removes the cap entirely (developer request: no cap
+    unless the developer provides one).
     """
     token_lists: list[list[str | None]] = []
     for field in _EXPANDABLE_REFERENCE_FIELDS:
@@ -299,12 +308,19 @@ def _expand_location_values(
     combinations = 1
     for tokens in token_lists:
         combinations *= len(tokens)
-    if combinations > MAX_EXPANDED_ROWS_PER_SOURCE:
+    if max_per_source is None:
+        per_source_cap: int | None = MAX_EXPANDED_ROWS_PER_SOURCE
+    elif max_per_source > 0:
+        per_source_cap = max_per_source
+    else:
+        per_source_cap = None
+    if per_source_cap is not None and combinations > per_source_cap:
         row_label = f"Row {source_row} " if source_row is not None else "This row "
         raise DCRateServiceError(
             f"{row_label}expands to {combinations:,} cadastral records. Split the "
             f"square, Kila, or Khasra range so one source row expands to at most "
-            f"{MAX_EXPANDED_ROWS_PER_SOURCE:,} records."
+            f"{per_source_cap:,} records, or allow very large row expansion in "
+            "the import options."
         )
     expanded: list[dict[str, Any]] = []
     for combination in itertools.product(*token_lists):
@@ -3177,6 +3193,8 @@ def _preview_import_items(
     storage_mode: str = "ranges",
     initial_issues: list[dict[str, Any]] | None = None,
     initial_invalid_rows: int = 0,
+    max_per_source: int | None = None,
+    max_total: int | None = None,
 ) -> dict[str, Any]:
     """Validate prepared import rows and apply the chosen duplicate policy.
 
@@ -3184,6 +3202,9 @@ def _preview_import_items(
     location/rate values, and the raw source values used in reports. Rows whose
     required profile fields are blank are supplied through ``initial_issues``
     by the caller so their accurate source row numbers are preserved.
+    ``max_per_source`` controls the per-row expansion cap (``None`` = the
+    standard cap, ``0`` = unlimited). ``max_total`` is the developer's own
+    whole-import cap; ``None`` (the default) applies no import-total cap.
     """
     if duplicate_policy not in {"check_now", "import_all"}:
         raise DCRateServiceError("Choose whether to check duplicates now or later.")
@@ -3279,14 +3300,16 @@ def _preview_import_items(
                 expanded_locations = [location]
             else:
                 expanded_locations = _expand_location_values(
-                    location, source_row=row_number
+                    location, source_row=row_number, max_per_source=max_per_source
                 )
             new_expanded_total = expanded_rows + len(expanded_locations)
-            if new_expanded_total > MAX_EXPANDED_ROWS_PER_IMPORT:
+            if max_total is not None and new_expanded_total > max_total:
+                # The developer's own whole-import cap; without one there is
+                # deliberately no import-total cap (developer request).
                 raise DCRateServiceError(
-                    f"This import expands to more than "
-                    f"{MAX_EXPANDED_ROWS_PER_IMPORT:,} cadastral records. "
-                    "Split the schedule into smaller files or keep ranges."
+                    f"This import expands to more than {max_total:,} cadastral "
+                    "records. Split the schedule into smaller files, keep "
+                    "ranges, or raise the import cap."
                 )
             expanded_rows = new_expanded_total
             seen_combinations: set[tuple[Any, ...]] = set()
@@ -3437,6 +3460,8 @@ def preview_mapped_schedule(
     storage_mode: str = "ranges",
     row_numbers: list[int] | None = None,
     row_sheets: list[str] | None = None,
+    max_per_source: int | None = None,
+    max_total: int | None = None,
 ) -> dict[str, Any]:
     """Normalize a rural/urban DC or FBR profile and validate it without writes.
 
@@ -3609,6 +3634,8 @@ def preview_mapped_schedule(
         storage_mode=storage_mode,
         initial_issues=row_issues,
         initial_invalid_rows=len(row_issues),
+        max_per_source=max_per_source,
+        max_total=max_total,
     )
     if storage_mode == "ranges":
         # Collective (range/list) values kept in one record are deprecated:
@@ -3653,6 +3680,8 @@ def preview_dc_rate_workbook(
     duplicate_policy: str = "check_now",
     duplicate_rule: str | None = None,
     storage_mode: str = "ranges",
+    max_per_source: int | None = None,
+    max_total: int | None = None,
 ) -> dict[str, Any]:
     """Validate an XLSX sheet and report invalid/exact-duplicate rows without writes.
 
@@ -3730,6 +3759,7 @@ def preview_dc_rate_workbook(
             duplicate_policy=duplicate_policy,
             duplicate_rule=duplicate_rule,
             storage_mode=storage_mode,
+            max_per_source=max_per_source,
         )
         preview["rows_read"] = len(items)
         preview["source_rows"] = len(items)
@@ -3744,13 +3774,16 @@ def import_dc_rate_records(
     duplicate_policy: str = "check_now",
     duplicate_rule: str | None = None,
     storage_mode: str = "ranges",
+    max_per_source: int | None = None,
+    max_total: int | None = None,
 ) -> dict[str, Any]:
     """Batch-insert previewed rows using the chosen storage and duplicate policy.
 
     ``storage_mode='ranges'`` stores one compact Square/Kila/Khasra range per
     previewed record, while ``individual`` expands it into one row per value.
     ``duplicate_policy='import_all'`` inserts exact duplicates too so they can be
-    removed later with the duplicate tools.
+    removed later with the duplicate tools. ``max_per_source`` lifts the
+    per-row expansion cap when the developer accepted very large rows.
     """
     if duplicate_policy not in {"check_now", "import_all"}:
         raise DCRateServiceError("Choose whether to check duplicates now or later.")
@@ -3784,14 +3817,17 @@ def import_dc_rate_records(
                 expanded_locations = [base_location]
             else:
                 expanded_locations = _expand_location_values(
-                    base_location, source_row=candidate.get("row")
+                    base_location, source_row=candidate.get("row"),
+                    max_per_source=max_per_source,
                 )
             expanded_total += len(expanded_locations)
-            if expanded_total > MAX_EXPANDED_ROWS_PER_IMPORT:
+            if max_total is not None and expanded_total > max_total:
+                # The developer's own whole-import cap; without one there is
+                # deliberately no import-total cap (developer request).
                 raise DCRateServiceError(
-                    f"This import expands to more than "
-                    f"{MAX_EXPANDED_ROWS_PER_IMPORT:,} cadastral records. "
-                    "Split the schedule into smaller files or keep ranges."
+                    f"This import expands to more than {max_total:,} cadastral "
+                    "records. Split the schedule into smaller files, keep "
+                    "ranges, or raise the import cap."
                 )
             for location_values in expanded_locations:
                 location_key = _location_key(location_values)
