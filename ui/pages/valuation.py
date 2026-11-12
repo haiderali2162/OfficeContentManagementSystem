@@ -271,10 +271,10 @@ def build_valuation_page(
     # DC schedule dropdown with a type-to-filter entry option.
     dc_rate_unit = ft.Dropdown(label="DC rate unit", hint_text="Unit appears when a matching rate is found", width=240, options=[
         ft.dropdown.Option(unit, RATE_UNITS[unit]) for unit in DC_RATE_UNITS
-    ])
+    ], menu_height=200)
     fbr_rate_unit = ft.Dropdown(label="FBR rate unit (if available)", width=220, options=[
         ft.dropdown.Option(unit, RATE_UNITS[unit]) for unit in DC_RATE_UNITS
-    ])
+    ], menu_height=200)
     area_value = ft.TextField(label="Area (K-M-F or 10k5m)", width=210,
                               hint_text="e.g. 2-5-0, 10k5m, 5m, 100f; plain number = kanal")
     area_unit = ft.Dropdown(label="Area input unit", value="kmf", visible=False, options=[
@@ -282,28 +282,43 @@ def build_valuation_page(
     ])
     dc_rate_choice = ft.Dropdown(
         label="Matched DC rate", hint_text="No matching rate yet", expand=True,
-        options=[], enable_filter=True, editable=True,
+        options=[], enable_filter=True, editable=True, menu_height=200,
     )
     fbr_rate_choice = ft.Dropdown(
         label="Matched FBR rate (editable)", hint_text="No matching rate yet", expand=True,
-        options=[], enable_filter=True, editable=True, visible=False,
+        options=[], enable_filter=True, editable=True, menu_height=200, visible=False,
     )
     location_match = ft.Dropdown(
         label="Choose matching schedule location", expand=True, options=[],
-        visible=False, enable_filter=True, editable=True,
+        visible=False, enable_filter=True, editable=True, menu_height=180,
     )
     # Display mode for the schedule location choices: the rows exactly as
     # imported ("Square 1, 13, 40-41") or expanded into one choice per
     # individual square/Kila pair using the importer's expansion rules.
     # Display only; stored schedule records are never rewritten.
     schedule_display = ft.RadioGroup(
-        value="imported",
+        value="individual",
         content=ft.Row([
             ft.Radio(value="imported", label="As imported"),
             ft.Radio(value="individual", label="Individual values"),
         ], spacing=14, wrap=True),
         visible=False,
     )
+    # Exact schedule matching works through individual values (developer
+    # request); choosing the compact "As imported" view shows a warning
+    # because collective range records can lead to wrong results.
+    schedule_display_warning = ft.Text(
+        "", size=11, color="#B45309",
+    )
+
+    def _refresh_schedule_display_warning() -> None:
+        schedule_display_warning.value = (
+            "As imported keeps collective Square/Kila ranges in one record, "
+            "which could lead to wrong results. Exact schedule matching works "
+            "through individual values."
+            if (schedule_display.value or "individual") == "imported" else ""
+        )
+
     # The display-mode radio sits at the top of the card, right after the
     # Rural/Urban choice and separated by a vertical divider (developer
     # request); the divider is hidden whenever the radio itself is hidden.
@@ -313,6 +328,8 @@ def build_valuation_page(
         schedule_display.visible = value
         schedule_display.disabled = disabled
         schedule_display_divider.visible = value
+        schedule_display_warning.visible = value
+        _refresh_schedule_display_warning()
     # Searchable square/Kila filter: typing "2/12" or "2 - 12" fills the two
     # cadastral inputs at once and re-runs the schedule match, so rural DC
     # rates are fetched from Mauza + square + Kila in one place. Alphanumeric
@@ -323,6 +340,17 @@ def build_valuation_page(
         hint_text="Square and Kila separated by / or -",
         expand=True, visible=False,
     )
+    # The combined "2/12" Square/Kila search box is optional (developer
+    # request): unchecked, the queries use the Square and Kila fields; when
+    # the user prefers the combined notation, the checkbox reveals it.
+    combined_search_toggle = ft.Checkbox(
+        label="Search by combined Square/Kila (e.g. 2/12)",
+        value=False,
+    )
+    # Backend suggestion fetches report themselves so the user knows lists
+    # are loading (developer request).
+    suggestions_status = ft.Text("", size=11, color="#64748B")
+
     # Restore the cached draft so leaving and re-entering this tab keeps the
     # user's location inputs. This runs before any handlers are wired, so no
     # change event fires during restoration.
@@ -474,6 +502,9 @@ def build_valuation_page(
         nonlocal hint_generation
         hint_generation += 1
         generation = hint_generation
+        # Let the user know suggestions are being fetched in the background.
+        suggestions_status.value = "Loading location suggestions…"
+        page.update()
 
         async def load_hints():
             await asyncio.sleep(0.15)
@@ -491,18 +522,21 @@ def build_valuation_page(
                 )
             except Exception as exc:
                 if generation == hint_generation:
+                    suggestions_status.value = ""
                     status.value = f"Could not load location suggestions: {exc}"
                     page.update()
                 return
             if generation != hint_generation:
                 return
             _apply_location_hints(values_by_field)
+            suggestions_status.value = ""
             page.update()
 
         if hasattr(page, "run_task"):
             page.run_task(load_hints)
         else:
             refresh_location_hints()
+            suggestions_status.value = ""
 
     def matching_locations():
         return find_schedule_location_matches(
@@ -699,9 +733,10 @@ def build_valuation_page(
             entries.sort(key=lambda entry: 0 if entry[0] in exact_keys else 1)
         location_match.options = [ft.dropdown.Option(key, label) for key, label, _sq, _kl in entries]
         location_match.visible = len(entries) > 1
-        # Keep the search filter available while any candidate exists so a
-        # filtered single match can be refined again.
-        location_search.visible = bool(candidates)
+        # The combined Square/Kila search box appears only when the user asks
+        # for it via the checkbox (developer request); otherwise the separate
+        # Square and Kila fields drive the queries.
+        location_search.visible = bool(candidates) and bool(combined_search_toggle.value)
         # Individual expansion follows the rural import rules only. The radio
         # stays visible for rural so the user always finds it; without
         # candidates it is disabled because there is nothing to display yet.
@@ -783,16 +818,26 @@ def build_valuation_page(
             unit_control.visible = (
                 schedule == "dc" or bool(units)
             )
-            if unit_control.value not in units:
-                unit_control.value = units[0] if len(units) == 1 else None
+            # When the schedule is unambiguous (one location selected or a
+            # single candidate) the first unit and rate are selected
+            # automatically (developer rule: if more than one unit appears,
+            # select any one of them). With several candidate locations the
+            # choice stays open so the user picks the exact schedule first.
+            unambiguous = bool(selected_location_id) or len(candidates) == 1
+            if unambiguous:
+                unit_control.value = units[0] if units else None
+            elif unit_control.value not in units:
+                unit_control.value = None
             rows = [row for row in rows if not unit_control.value or row["rate_unit"] == unit_control.value]
             rate_records[schedule] = rows
             rate_control.options = [ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows]
             rate_control.visible = (
                 schedule == "dc" or bool(rows)
             )
-            if rate_control.value not in {str(row["id"]) for row in rows}:
-                rate_control.value = str(rows[0]["id"]) if len(rows) == 1 else None
+            if unambiguous:
+                rate_control.value = str(rows[0]["id"]) if rows else None
+            elif rate_control.value not in {str(row["id"]) for row in rows}:
+                rate_control.value = None
         classes = sorted({str(row.get("classification")) for row in all_rates if row.get("classification")})
         classification.options = [ft.dropdown.Option("none", "All / not specified")]
         classification.options.extend(ft.dropdown.Option(value, value) for value in classes)
@@ -920,6 +965,23 @@ def build_valuation_page(
 
     location_search.on_change = on_location_search
 
+    def on_combined_search_toggle(_=None):
+        """Show/hide the combined Square/Kila entry; queries follow the checkbox.
+
+        Unchecking clears the combined field and the two cadastral inputs it
+        had filled, so subsequent queries use the Square/Kila fields only.
+        """
+        if not combined_search_toggle.value:
+            location_search.value = ""
+            square_no.value = ""
+            kila_no.value = ""
+            refresh_rate_matches()
+            return
+        refresh_rate_matches()
+        page.update()
+
+    combined_search_toggle.on_change = on_combined_search_toggle
+
     mauza.on_change = on_mauza_change
     mauza.on_select = on_mauza_change
     square_no.on_change = on_square_change
@@ -934,12 +996,40 @@ def build_valuation_page(
         The location-hint service caches type-ahead values so repeated
         keystrokes and tab switches stay fast; this button is the developer's
         manual escape hatch after a schedule import or any doubt that the
-        cached district/tehsil/qanoongoi/mauza lists are stale.
+        cached district/tehsil/qanoongoi/mauza lists are stale. The dimension
+        cache is reloaded right away, otherwise the first queries after a
+        refresh would silently fall back to the slow whole-table scans.
         """
         clear_location_hint_cache()
-        refresh_location_state()
-        status.value = "Location suggestion lists refreshed from the saved schedules."
+        suggestions_status.value = "Reloading location lists from the saved schedules…"
+        status.value = ""
         page.update()
+
+        async def reload_lists():
+            try:
+                await asyncio.to_thread(preload_location_dimensions)
+            except Exception as exc:
+                status.value = f"Could not reload location lists: {exc}"
+                suggestions_status.value = ""
+                page.update()
+                return
+            # Refresh the visible suggestions synchronously here instead of
+            # scheduling the debounced task: the dimension cache is already
+            # reloaded, so the four top-level fields answer from memory and
+            # the cadastral query is scoped and quick.
+            refresh_location_hints()
+            suggestions_status.value = ""
+            status.value = "Location suggestion lists refreshed from the saved schedules."
+            page.update()
+
+        if hasattr(page, "run_task"):
+            page.run_task(reload_lists)
+        else:
+            preload_location_dimensions()
+            refresh_location_state()
+            suggestions_status.value = ""
+            status.value = "Location suggestion lists refreshed from the saved schedules."
+            page.update()
 
     location_refresh_button = ft.OutlinedButton(
         "Refresh lists", on_click=refresh_cached_location_lists,
@@ -1625,9 +1715,13 @@ def build_valuation_page(
                 ft.Text("Property Profile & Location", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
                 # Display-mode radio sits at the top, right after the
                 # Rural/Urban choice and a vertical divider (developer
-                # request); it stays disabled until a Mauza matches.
-                ft.Row([property_profile, schedule_display_divider, schedule_display],
+                # request); it stays disabled until a Mauza matches. The
+                # combined Square/Kila search box is opt-in via checkbox.
+                ft.Row([property_profile, schedule_display_divider, schedule_display,
+                        combined_search_toggle],
                        wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                schedule_display_warning,
+                suggestions_status,
                 location_fields_row,
                 location_match,
                 location_search,

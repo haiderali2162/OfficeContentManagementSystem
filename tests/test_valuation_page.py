@@ -951,7 +951,13 @@ def test_schedule_display_radio_expands_pairs_into_individual_choices(monkeypatc
     location_match = _dropdown(controls, "Choose matching schedule location")
     radio = _schedule_display_radio(controls)
     assert radio.visible is True
-    # Default mode keeps the rows exactly as imported.
+    # Individual values are now the default display mode (developer request).
+    assert [option.key for option in location_match.options] == [
+        "7:1:1", "7:1:2", "7:2:1", "7:2:2", "7:3:1", "7:3:2",
+    ]
+
+    radio.value = "imported"
+    radio.on_change(SimpleNamespace(control=radio))
     assert [option.key for option in location_match.options] == ["7"]
     assert location_match.value == "7"
 
@@ -1013,6 +1019,11 @@ def test_imported_mode_ranks_exact_pair_first_and_autoselects_single_exact(monke
 
     root = valuation.build_valuation_page(LoadingPage())
     controls = list(walk_controls(root))
+    # The ranking assertions below describe the imported view; individual
+    # values are now the default, so switch explicitly.
+    radio = _schedule_display_radio(controls)
+    radio.value = "imported"
+    radio.on_change(SimpleNamespace(control=radio))
     mauza = _auto(controls, "mauza")
     mauza.value = "Chak"
     mauza.on_change(SimpleNamespace(control=mauza))
@@ -1063,7 +1074,10 @@ def test_calculate_errors_name_the_visible_controls(monkeypatch):
     message = _form_error(root).value
     assert "no active DC rate" in message
 
-    # One location, several DC rates: the message names the rate dropdown.
+    # One location, several DC rates: the first rate is preselected
+    # automatically now (developer rule: if more than one unit/rate appears,
+    # select any one of them), so the calculation no longer stalls asking
+    # for a rate.
     matches = [_location_row(7)]
     rates = {"dc": [_dc_rate(11, 7), _dc_rate(12, 7)]}
     _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
@@ -1071,9 +1085,11 @@ def test_calculate_errors_name_the_visible_controls(monkeypatch):
     mauza = _auto(controls, "mauza")
     mauza.value = "Chak 1"
     mauza.on_change(SimpleNamespace(control=mauza))
+    rate = _dropdown(controls, "Matched DC rate")
+    assert rate.value == "11"
     button.on_click(SimpleNamespace(control=button))
     message = _form_error(root).value
-    assert "Matched DC rate" in message
+    assert "Matched DC rate" not in message
 
     # Several locations, nothing chosen: the message names the location
     # dropdown.
@@ -1370,7 +1386,8 @@ def test_identical_exact_pairs_auto_select_location_unit_and_rate(monkeypatch):
     location_match = _dropdown(controls, "Choose matching schedule location")
     unit = _dropdown(controls, "DC rate unit")
     rate = _dropdown(controls, "Matched DC rate")
-    assert location_match.value == "7"
+    # Individual values are the default, so the auto-picked key is a pair.
+    assert location_match.value == "7:2:12"
     assert unit.value == "per_kanal"
     assert rate.value == "11"
     status = next(control for control in walk_controls(root)

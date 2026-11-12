@@ -44,6 +44,8 @@ from services.dc_rate_service import (
     list_mauza_cadastral_values,
     list_rhz_years,
     list_mauza_names,
+    DELETION_SCOPES,
+    delete_dc_rate_schedules,
     find_duplicate_dc_rates,
     find_khewat_year_conflicts,
     latest_rhz_year,
@@ -1235,13 +1237,28 @@ def build_dc_rates_page(
                 mapping_controls = ft.ResponsiveRow(run_spacing=4)
                 mapping_error = ft.Text("", color="#B91C1C", size=12)
 
+                storage_warning = ft.Text("", color="#B45309", size=11)
+
+                def refresh_storage_warning(_=None):
+                    # Collective (range/list) values kept in one record are
+                    # deprecated: individual values search and value exactly.
+                    storage_warning.value = (
+                        "Warning: keeping collective values as one record could "
+                        "lead to wrong results. 'Store each individual value' is "
+                        "the recommended mode."
+                        if (storage_mode.value or "individual") == "ranges"
+                        else ""
+                    )
+                    page.update()
+
                 storage_mode = ft.RadioGroup(
                     value=get_cadastral_storage_mode(),
                     content=ft.Row([
-                        ft.Radio(value="ranges", label="Keep as ranges (recommended)"),
-                        ft.Radio(value="individual", label="Store each individual value"),
+                        ft.Radio(value="individual", label="Store each individual value (recommended)"),
+                        ft.Radio(value="ranges", label="Keep as ranges (deprecated)"),
                     ], wrap=True, spacing=12),
                 )
+                storage_mode.on_change = refresh_storage_warning
                 duplicate_policy = ft.RadioGroup(
                     value="check_now",
                     content=ft.Row([
@@ -1330,7 +1347,7 @@ def build_dc_rates_page(
                     warnings = preview.get("warnings", [])
                     applied_rule = preview.get("duplicate_rule") or {}
                     chosen_policy = duplicate_policy.value or "check_now"
-                    chosen_storage = storage_mode.value or "ranges"
+                    chosen_storage = storage_mode.value or "individual"
                     import_year = ft.TextField(
                         label="Published year for this import (optional)",
                         hint_text="Example: 2026. Leave blank to use each row's date/year.",
@@ -1592,7 +1609,7 @@ def build_dc_rates_page(
                             schedule.value,
                             duplicate_policy=duplicate_policy.value or "check_now",
                             duplicate_rule=duplicate_rule_dropdown.value,
-                            storage_mode=storage_mode.value or "ranges",
+                            storage_mode=storage_mode.value or "individual",
                             row_numbers=row_numbers,
                             row_sheets=row_sheets,
                         )
@@ -1615,13 +1632,15 @@ def build_dc_rates_page(
                         mapping_controls,
                         ft.Text("Cadastral storage", weight=ft.FontWeight.BOLD),
                         ft.Text(
-                            "Ranges keep Square/Kila/Khasra compact. Search still finds "
-                            "individual values and overlapping ranges. You can change "
-                            "this preference at any time.",
+                            "Store each individual value (recommended) so every "
+                            "Square/Kila value is searchable and valued exactly. "
+                            "Keeping ranges is deprecated: collective values in "
+                            "one record could lead to wrong results.",
                             size=11,
                             color="#64748B",
                         ),
                         storage_mode,
+                        storage_warning,
                         ft.Text("Duplicate detection", weight=ft.FontWeight.BOLD),
                         duplicate_policy,
                         duplicate_rule_dropdown,
@@ -3153,6 +3172,56 @@ def build_dc_rates_page(
     import_export_button.on_click = toggle_import_export
     filter_button.on_click = lambda _: toggle_filters()
 
+    def open_delete_schedules_dialog(_=None):
+        """Bulk-delete schedule rows after explicit confirmation."""
+        scope_choice = ft.RadioGroup(
+            value="fbr",
+            content=ft.Column([
+                ft.Radio(value="fbr", label="All FBR schedule rows"),
+                ft.Radio(value="dc_rural", label="All rural DC schedule rows"),
+                ft.Radio(value="dc_urban", label="All urban DC schedule rows"),
+                ft.Radio(value="all", label="Everything (all DC and FBR rows)"),
+            ], spacing=6),
+        )
+        delete_status = ft.Text("", color="#B91C1C", size=12)
+
+        def confirm_delete(_=None):
+            scope = scope_choice.value or "all"
+            try:
+                deleted = delete_dc_rate_schedules(scope)
+            except Exception as exc:
+                delete_status.value = f"Could not delete: {exc}"
+                page.update()
+                return
+            page.pop_dialog()
+            schedule_rates_refresh()
+            status_text.value = (
+                f"Deleted {deleted:,} schedule row(s) ({DELETION_SCOPES[scope]}). "
+                "Saved estimates keep their own snapshots."
+            )
+            page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Delete schedules"),
+            content=ft.Column([
+                ft.Text(
+                    "This permanently deletes schedule rows in the chosen scope. "
+                    "Location rows are kept, and saved estimates keep their own "
+                    "charge snapshots. This cannot be undone.",
+                    color="#B91C1C", size=12,
+                ),
+                scope_choice, delete_status,
+            ], tight=True, spacing=8, width=460),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                ft.Button(
+                    "Delete permanently", on_click=confirm_delete,
+                    style=ft.ButtonStyle(bgcolor="#B91C1C", color="#FFFFFF"),
+                ),
+            ],
+        ))
+
     toolbar = ft.Row(
         controls=[
             ft.Button("Add DC rate", on_click=open_rate_dialog),
@@ -3163,6 +3232,7 @@ def build_dc_rates_page(
             ft.OutlinedButton("Select squares / Kilas", on_click=open_cadastral_selection_dialog),
             ft.OutlinedButton("View Khewats", on_click=open_khewat_search_dialog),
             ft.OutlinedButton("Tehsil Details", on_click=open_hierarchy_summary_dialog),
+            ft.OutlinedButton("Delete schedules…", on_click=open_delete_schedules_dialog),
             filter_button,
             import_export_button,
             ft.TextButton("Refresh", on_click=schedule_rates_refresh),

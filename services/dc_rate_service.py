@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import joinedload
 
 from core.area_engine import AreaError, LandArea
@@ -647,6 +647,50 @@ def delete_duplicate_rule_profile(profile_id: int) -> None:
         duplicate_rules.delete_custom_profile(session, profile_id)
 
 
+DELETION_SCOPES = {
+    "all": "every DC and FBR schedule row",
+    "dc_rural": "every rural DC schedule row",
+    "dc_urban": "every urban DC schedule row",
+    "fbr": "every FBR schedule row",
+}
+
+
+def delete_dc_rate_schedules(scope: str) -> int:
+    """Bulk-delete schedule rows in the chosen scope; returns the row count.
+
+    Scopes: ``all`` (every rate row), ``dc_rural``, ``dc_urban`` (DC rows
+    filtered by the location's rural/urban type), and ``fbr``. Location rows
+    are deliberately kept: they carry no rates afterwards, so they vanish
+    from searches, and a re-import links new rates back onto them instead
+    of creating duplicate locations. Only call this after explicit user
+    confirmation in the interface.
+    """
+    if scope not in DELETION_SCOPES:
+        raise DCRateServiceError(
+            "Choose All, DC rural, DC urban, or FBR for the deletion."
+        )
+    statement = delete(DCValuationRate)
+    if scope == "dc_rural":
+        statement = statement.where(
+            DCValuationRate.schedule_type == "dc",
+            DCValuationRate.location_id.in_(
+                select(PropertyLocation.id).where(PropertyLocation.land_type == "rural")
+            ),
+        )
+    elif scope == "dc_urban":
+        statement = statement.where(
+            DCValuationRate.schedule_type == "dc",
+            DCValuationRate.location_id.in_(
+                select(PropertyLocation.id).where(PropertyLocation.land_type == "urban")
+            ),
+        )
+    elif scope == "fbr":
+        statement = statement.where(DCValuationRate.schedule_type == "fbr")
+    with SessionLocal.begin() as session:
+        result = session.execute(statement)
+        return int(result.rowcount or 0)
+
+
 def find_duplicate_dc_rates(duplicate_rule: str) -> list[dict[str, Any]]:
     """List rows removed by the selected rule, preserving the lowest record ID."""
     with SessionLocal() as session:
@@ -1211,8 +1255,9 @@ def clear_location_hint_cache() -> None:
 # they are preloaded once and filtered in memory for instant suggestions.
 # Without this, every keystroke ran a DISTINCT query over the whole schedule
 # table joined to the rate rows, which made tehsil suggestions slow enough
-# that they appeared to be missing.
-_LOCATION_DIMENSION_CACHE: dict[str, Any] = {}
+# that they appeared to be missing. The cache is keyed per database (the
+# tests swap sessionmakers), so one database's rows never leak into another.
+_LOCATION_DIMENSION_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def preload_location_dimensions() -> None:
@@ -1241,15 +1286,14 @@ def preload_location_dimensions() -> None:
             tehsils.setdefault(d_value, set()).add(t_value)
         if d_value and t_value and q_value:
             qanoongois.setdefault((d_value, t_value), set()).add(q_value)
-    _LOCATION_DIMENSION_CACHE.clear()
-    _LOCATION_DIMENSION_CACHE.update({
+    _LOCATION_DIMENSION_CACHE[_location_hint_cache_token()] = {
         "rows": entries,
         "districts": sorted(districts, key=str.casefold),
         "tehsils": {key: sorted(value, key=str.casefold)
                     for key, value in tehsils.items()},
         "qanoongois": {key: sorted(value, key=str.casefold)
                        for key, value in qanoongois.items()},
-    })
+    }
 
 
 def _dimension_hint_values(
@@ -1261,7 +1305,7 @@ def _dimension_hint_values(
     contains the typed text (case-insensitive, wildcards supported through
     the same helper the queries use for the non-cached path).
     """
-    cache = _LOCATION_DIMENSION_CACHE
+    cache = _LOCATION_DIMENSION_CACHE.get(_location_hint_cache_token()) or {}
 
     def contains(typed: str, stored: str) -> bool:
         # Same wildcard-aware semantics as the SQL LIKE path.
@@ -1343,7 +1387,7 @@ def list_location_hint_values(
                     continue
             if (hierarchy
                     and field_name in ("district", "tehsil", "qanoongoi", "mauza")
-                    and _LOCATION_DIMENSION_CACHE.get("rows")):
+                    and _LOCATION_DIMENSION_CACHE.get(_location_hint_cache_token(), {}).get("rows")):
                 # Preloaded hierarchy: filter in memory instead of running a
                 # DISTINCT query over the whole schedule table per keystroke.
                 result[field_name] = _dimension_hint_values(
@@ -3365,6 +3409,23 @@ def _preview_import_items(
     }
 
 
+def _clean_import_cell(value: Any) -> Any:
+    """Clean one imported cell before validation.
+
+    Removes newlines and stray repeated separators that spreadsheets and PDF
+    exports leave behind ("1,\n2" → "1, 2"), collapses whitespace, and trims
+    dangling commas/semicolons. The "/" character is kept: it is meaningful
+    inside Kila references such as "3/B".
+    """
+    if value is None or isinstance(value, (int, float, Decimal)):
+        return value
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"[,;]\s*[,;]+", ", ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip(" ,;")
+    return text or None
+
+
 def preview_mapped_schedule(
     headers: list[str],
     rows: list[list[Any]],
@@ -3453,6 +3514,9 @@ def preview_mapped_schedule(
     row_issues: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
     required_targets = required_by_profile[schedule_type]
+    # Clean every cell first (newlines, repeated separators, stray commas) so
+    # downstream parsing sees tidy values (developer request).
+    rows = [[_clean_import_cell(value) for value in row] for row in rows]
     rate_fields = (
         "property_type", "classification", "floor", "rate_value",
         "structure_rate", "per_marla_value", "rate_unit", "effective_from",
@@ -3546,6 +3610,35 @@ def preview_mapped_schedule(
         initial_issues=row_issues,
         initial_invalid_rows=len(row_issues),
     )
+    if storage_mode == "ranges":
+        # Collective (range/list) values kept in one record are deprecated:
+        # warn per row that this could lead to wrong search/valuation results.
+        for item in items:
+            for field in ("square_no", "kila_no", "khasra_no"):
+                value = _text(item["location_values"].get(field))
+                if not value:
+                    continue
+                try:
+                    expanded = expand_references(value)
+                except DCRateServiceError:
+                    continue
+                if len(expanded) > 1:
+                    preview["warnings"].append({
+                        "row": item["row"],
+                        "sheet": item.get("sheet"),
+                        "kind": "collective value kept as one record",
+                        "message": (
+                            f"{field.replace('_', ' ').capitalize()} '{value}' is a "
+                            "collective value stored as one record. This could lead "
+                            "to wrong results; prefer the 'Store each individual "
+                            "value' storage mode."
+                        ),
+                        "source_values": item.get("source_values", []),
+                        "allowed_by_rule": True,
+                    })
+        preview["warnings"] = sorted(
+            preview["warnings"], key=lambda warning: warning["row"]
+        )
     preview["rows_read"] = len(rows)
     preview["source_rows"] = len(rows)
     preview["sheet_names"] = sorted({

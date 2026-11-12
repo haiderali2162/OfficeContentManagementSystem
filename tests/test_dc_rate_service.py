@@ -2167,3 +2167,76 @@ def test_search_terms_support_wildcards_in_mauza_filters(rate_database):
     assert [rate["location_id"] for rate in rates] == [first_id]
     rates = dc_rate_service.list_dc_rates(search="Chak*")
     assert {rate["location_id"] for rate in rates} == {first_id, second_id}
+
+
+def test_delete_dc_rate_schedules_scopes(rate_database):
+    first_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Rural Chak", mauza="Rural Chak", land_type="rural",
+        district="District A", tehsil="Tehsil A",
+    ))
+    dc_rate_service.create_dc_rate(location_id=first_id, **_rate_values())
+    urban_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Urban Block", mauza="Urban Block", land_type="urban",
+        district="District A", tehsil="Tehsil A",
+    ))
+    urban_rate = _rate_values()
+    dc_rate_service.create_dc_rate(location_id=urban_id, **urban_rate)
+    dc_rate_service.create_dc_rate(
+        location_id=urban_id, schedule_type="fbr", **{
+            **_rate_values(), "rate_unit": "per_square_foot",
+        }
+    )
+
+    deleted = dc_rate_service.delete_dc_rate_schedules("fbr")
+    assert deleted == 1
+    remaining = dc_rate_service.list_dc_rates()
+    assert len(remaining) == 2
+
+    deleted = dc_rate_service.delete_dc_rate_schedules("dc_rural")
+    assert deleted == 1
+    remaining = dc_rate_service.list_dc_rates()
+    assert len(remaining) == 1
+    assert remaining[0]["land_type"] == "urban"
+
+    deleted = dc_rate_service.delete_dc_rate_schedules("all")
+    assert deleted == 1
+    assert dc_rate_service.list_dc_rates() == []
+
+    with pytest.raises(dc_rate_service.DCRateServiceError):
+        dc_rate_service.delete_dc_rate_schedules("everything")
+
+
+def test_import_cleans_cells_and_warns_on_collective_ranges(rate_database):
+    """Cells are cleaned and collective values warn when kept as ranges."""
+    headers = ["Tehsil", "Qanoongoi", "Mauza", "Classification", "Location", "Square No", "Killa No", "DC Rate", "Unit"]
+    mapping = dc_rate_service.suggested_column_mapping(headers)
+    # Newline inside the cell and a repeated separator; square "1, 2" is a
+    # collective value that only makes sense with individual storage.
+    row = ["Tehsil A\n", "Qanoongoi,, A", "Mauza A ", "Agricultural", " Farm ",
+           "1,\n2", "3/B", "1000", "per_marla"]
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="ranges",
+    )
+    record = preview["valid_records"][0]["location"]
+    assert record["square_no"] == "1-2"   # canonical collective range form
+    assert record["qanoongoi"] == "Qanoongoi, A"
+    assert record["kila_no"] == "3/B"          # "/" is meaningful and kept
+    collective = [
+        warning for warning in preview["warnings"]
+        if warning["kind"] == "collective value kept as one record"
+    ]
+    assert collective and "could lead" in collective[0]["message"]
+
+    # The same row stored individually expands without the warning.
+    preview = dc_rate_service.preview_mapped_schedule(
+        headers, [row], mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap",
+        storage_mode="individual",
+    )
+    assert not [
+        warning for warning in preview["warnings"]
+        if warning["kind"] == "collective value kept as one record"
+    ]
+    assert preview["expanded_rows"] == 2

@@ -34,7 +34,10 @@ from core.models import AppSetting
 
 CADASTRAL_STORAGE_KEY = "dc_rates.cadastral_storage"
 CADASTRAL_STORAGE_MODES = ("ranges", "individual")
-DEFAULT_CADASTRAL_STORAGE = "ranges"
+# Individual storage is the default (developer request): collective/range
+# values in one record can lead to wrong search and valuation results.
+# Keeping ranges is still possible but warned about in the import dialog.
+DEFAULT_CADASTRAL_STORAGE = "individual"
 
 FILE_LOCATION_KEY = "files.default_location"
 

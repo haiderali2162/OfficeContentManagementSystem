@@ -149,9 +149,11 @@ def test_format_card_heading_uses_default_and_custom_placeholders():
 
 
 def test_cadastral_storage_preference_round_trip(settings_database):
-    assert settings_service.get_cadastral_storage_mode() == "ranges"
-    settings_service.set_cadastral_storage_mode("individual")
+    # Individual storage is the default (developer request); ranges remain
+    # selectable but are warned about in the import dialog.
     assert settings_service.get_cadastral_storage_mode() == "individual"
+    settings_service.set_cadastral_storage_mode("ranges")
+    assert settings_service.get_cadastral_storage_mode() == "ranges"
 
     with pytest.raises(settings_service.SettingsError):
         settings_service.set_cadastral_storage_mode("columns")
