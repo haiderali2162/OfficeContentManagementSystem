@@ -43,7 +43,9 @@ FILE_LOCATION_KEY = "files.default_location"
 
 CARD_APPEARANCE_KEY = "dc_rates.card_appearance"
 DEFAULT_CARD_APPEARANCE = {
-    "heading_template": "{schedule} schedule · {location}",
+    # The land type (urban/rural) belongs in the heading next to the schedule
+    # (developer request: cards used to show only DC/FBR).
+    "heading_template": "{schedule} · {land_type} schedule · {location}",
     "background_color": "#FFFFFF",
     "border_color": "#E2E8F0",
     "heading_color": "#0F172A",
@@ -213,6 +215,10 @@ def _normalize_heading_template(template: Any) -> str:
                 f"Unsupported placeholder '{{{field_name}}}'. "
                 f"Use one of: {supported}."
             )
+    # Land type upgrade: headings saved before the land type existed show the
+    # schedule's urban/rural kind next to DC/FBR (developer request).
+    if "{land_type}" not in template:
+        template = template.replace("{schedule}", "{schedule} · {land_type}", 1)
     return template
 
 
@@ -322,8 +328,10 @@ def format_card_heading(template: str, record: dict) -> str:
         template = DEFAULT_CARD_APPEARANCE["heading_template"]
 
     schedule = str(record.get("schedule_type") or "dc").upper()
+    land_type = str(record.get("land_type") or "").strip()
     values = {
         "schedule": schedule,
+        "land_type": land_type.title() or "Unspecified",
         "location": record.get("location_name") or "Unknown location",
         "classification": (
             record.get("classification") or record.get("property_type") or ""
@@ -332,9 +340,9 @@ def format_card_heading(template: str, record: dict) -> str:
         "district": record.get("district") or "",
         "tehsil": record.get("tehsil") or "",
         "mauza": record.get("mauza") or "",
-        "land_type": record.get("land_type") or "",
         "year": str(record.get("published_year") or "Not supplied"),
     }
+    values["land_type"] = land_type.title() or "Unspecified"
     return template.format_map(values)
 
 
@@ -681,6 +689,9 @@ def _card_field_value(field_name: str, record: dict) -> str:
                 record.get("mauza"),
             ) if part
         )
+    if field_name == "land_type":
+        # Human-readable kind on the card: Urban / Rural (developer request).
+        return str(record.get("land_type") or "").strip().title()
     if field_name in {"effective_from", "effective_to"}:
         value = record.get(field_name)
         return value.isoformat() if value else ""

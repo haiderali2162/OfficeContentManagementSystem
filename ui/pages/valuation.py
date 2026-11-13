@@ -373,11 +373,45 @@ def build_valuation_page(
         ft.dropdown.Option("272", "272 sq ft"), ft.dropdown.Option("225", "225 sq ft")
     ])
     registry_written_value = ft.TextField(label="Registry written value (PKR)", width=230)
-    # Optional developer-entered valuation: when filled, the fees are also
-    # computed against this valuation and shown as a comparison table.
-    entered_valuation_field = ft.TextField(
-        label="Entered valuation (PKR, optional)", width=230,
-        hint_text="Compare fees against your own valuation",
+    # Urban extended FBR finder (developer request): the FBR schedule lives
+    # on sibling rows keyed by its own columns, so it is searched directly
+    # by revenue circle, property area, classification, location, and the
+    # location square number.
+    fbr_search_circle = ft.TextField(label="Revenue circle", width=190)
+    fbr_search_area = ft.TextField(label="Property area", width=190)
+    fbr_search_classification = ft.TextField(label="Classification", width=170)
+    fbr_search_location = ft.TextField(label="Location", width=190)
+    fbr_search_square = ft.TextField(label="Location square no.", width=150)
+    fbr_search_button = ft.OutlinedButton("Search FBR schedule")
+    fbr_search_status = ft.Text("", size=11, color="#64748B")
+    fbr_search_result = ft.Dropdown(
+        label="Matching FBR schedule", expand=True, options=[],
+        visible=False, enable_filter=True, editable=True, menu_height=180,
+    )
+    fbr_search_rows: dict[str, dict[str, Any]] = {}
+    fbr_search_section = ft.Container(
+        ft.Column([
+            ft.Text("Find FBR schedule (extended search)", size=13, weight=ft.FontWeight.BOLD, color="#1E293B"),
+            ft.Text(
+                "The FBR schedule sheet is keyed by its own columns. Search it "
+                "directly here; the matched rate is used for the FBR valuation "
+                "and the 236C/236K fees.",
+                size=11, color="#64748B",
+            ),
+            ft.Row([
+                fbr_search_circle, fbr_search_area, fbr_search_classification,
+            ], wrap=True, spacing=6),
+            ft.Row([
+                fbr_search_location, fbr_search_square, fbr_search_button,
+            ], wrap=True, spacing=6),
+            fbr_search_status,
+            fbr_search_result,
+        ], spacing=6),
+        padding=12,
+        bgcolor="#F8FAFC",
+        border=ft.Border.all(1, "#E2E8F0"),
+        border_radius=8,
+        visible=False,
     )
     constructed = ft.Checkbox(label="Property is constructed", value=False)
     building_material_value = ft.TextField(label="Building material value (PKR)", width=230, value="0")
@@ -796,25 +830,40 @@ def build_valuation_page(
             page.update()
             return
 
-        # A chosen (or auto-selected) location determines the exact schedule:
-        # only its rate rows feed the unit/rate menus below, so a unique rate
-        # is picked automatically instead of asking the user to disambiguate
-        # rows from other candidate locations.
+        # A chosen (or auto-selected) location determines the exact DC
+        # schedule: its rate rows feed the DC unit/rate menus below, so a
+        # unique rate is picked automatically instead of asking the user to
+        # disambiguate rows from other candidate locations.
         selected_key_value = str(location_match.value) if location_match.value else ""
         selected_location_id = selected_key_value.split(":")[0]
+        dc_pool = [row for row in all_rates if row.get("schedule_type") == "dc"]
+        fbr_pool = [row for row in all_rates if row.get("schedule_type") == "fbr"]
         if selected_location_id:
-            all_rates = [
-                row for row in all_rates
+            dc_pool = [
+                row for row in dc_pool
                 if str(row.get("location_id")) == selected_location_id
             ]
+            fbr_on_picked = [
+                row for row in fbr_pool
+                if str(row.get("location_id")) == selected_location_id
+            ]
+            if not fbr_on_picked:
+                # Urban/FBR: the FBR schedule usually lives on a sibling
+                # location row imported from the FBR sheet (only the shared
+                # columns match — tehsil, revenue circle, location, square).
+                # Keep the context-matched FBR rows of the other candidates so
+                # the FBR valuation still resolves (developer report).
+                fbr_pool = fbr_on_picked or fbr_pool
 
         if classification.value not in (None, "", "none"):
-            all_rates = [row for row in all_rates if str(row.get("classification") or "").casefold()
-                         == classification.value.casefold()]
+            dc_pool = [row for row in dc_pool if str(row.get("classification") or "").casefold()
+                       == classification.value.casefold()]
+            fbr_pool = [row for row in fbr_pool if str(row.get("classification") or "").casefold()
+                        == classification.value.casefold()]
         for schedule, unit_control, rate_control in (
             ("dc", dc_rate_unit, dc_rate_choice), ("fbr", fbr_rate_unit, fbr_rate_choice)
         ):
-            rows = [row for row in all_rates if row.get("schedule_type") == schedule]
+            rows = dc_pool if schedule == "dc" else fbr_pool
             units = sorted({row["rate_unit"] for row in rows})
             unit_control.options = [ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units]
             # The DC unit and rate menus stay permanently visible (developer
@@ -988,6 +1037,89 @@ def build_valuation_page(
 
     combined_search_toggle.on_change = on_combined_search_toggle
 
+    def search_fbr_schedule(_=None):
+        """Find FBR schedules by their own sheet columns (developer request).
+
+        Revenue circle, property area, location, and the location square
+        number filter the FBR rows; the classification is matched on the
+        rate rows. Empty fields are simply not applied, so any single field
+        alone finds schedules. Fields left blank are prefilled from the
+        typed urban context (Tehsil/Town/Revenue circle/Property area/
+        Location/Square) so one search covers both sheet layouts.
+        """
+        prefill = (
+            (fbr_search_circle, revenue_circle),
+            (fbr_search_area, property_area),
+            (fbr_search_location, schedule_location),
+            (fbr_search_square, square_no),
+        )
+        for field, source in prefill:
+            if not (field.value or "").strip() and (source.value or "").strip():
+                field.value = source.value
+        try:
+            rows = list_dc_rates(
+                schedule_type="fbr",
+                revenue_circle=fbr_search_circle.value or "",
+                property_area=fbr_search_area.value or "",
+                locality=fbr_search_location.value or "",
+                square_no=fbr_search_square.value or "",
+                land_type="urban",
+            )
+        except Exception as exc:
+            fbr_search_status.value = f"Could not search FBR schedules: {exc}"
+            page.update()
+            return
+        classification = (fbr_search_classification.value or "").strip()
+        if classification:
+            rows = [
+                row for row in rows
+                if str(row.get("classification") or "").casefold()
+                == classification.casefold()
+            ]
+        fbr_search_rows.clear()
+        fbr_search_rows.update({str(row["id"]): row for row in rows})
+        fbr_search_result.options = [
+            ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows
+        ]
+        fbr_search_result.visible = bool(rows)
+        if len(rows) == 1:
+            fbr_search_result.value = str(rows[0]["id"])
+        elif fbr_search_result.value not in {str(row["id"]) for row in rows}:
+            fbr_search_result.value = None
+        fbr_search_status.value = (
+            f"{len(rows)} FBR schedule(s) found."
+            if rows else
+            "No FBR schedule matched those fields."
+        )
+        if len(rows) == 1:
+            # A single match is used immediately (same auto-select rule as
+            # the unit/rate menus); several matches wait for the user pick.
+            pick_fbr_search_result()
+            return
+        page.update()
+
+    def pick_fbr_search_result(_=None):
+        """Use the chosen extended-search row as the calculation's FBR rate."""
+        row = fbr_search_rows.get(str(fbr_search_result.value or ""))
+        if not row:
+            return
+        rate_records["fbr"] = [row]
+        unit = row.get("rate_unit") or ""
+        fbr_rate_unit.options = [
+            ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit))
+        ] if unit else []
+        fbr_rate_unit.value = unit or None
+        fbr_rate_unit.visible = True
+        fbr_rate_choice.options = [ft.dropdown.Option(str(row["id"]), _rate_label(row))]
+        fbr_rate_choice.value = str(row["id"])
+        fbr_rate_choice.visible = True
+        fbr_search_status.value = f"FBR schedule selected: {_rate_label(row)}"
+        page.update()
+
+    fbr_search_button.on_click = search_fbr_schedule
+    fbr_search_result.on_select = pick_fbr_search_result
+    fbr_search_result.on_change = pick_fbr_search_result
+
     mauza.on_change = on_mauza_change
     mauza.on_select = on_mauza_change
     square_no.on_change = on_square_change
@@ -1142,21 +1274,20 @@ def build_valuation_page(
         result_panel.controls.extend(ft.Text(
             f"Total {currency}: {_money(amount, currency)}", weight=ft.FontWeight.BOLD
         ) for currency, amount in charges["totals_by_currency"].items())
-        # Optional comparison: when the developer entered a valuation, the
-        # same fees were computed against it too — show them side by side
-        # (developer request).
-        charges_entered = charges.get("charges_on_entered_valuation")
-        if charges_entered is not None:
+        # Optional comparison (developer request): the same fees computed on
+        # the registry written value, side by side with the calculated ones.
+        charges_written = charges.get("charges_on_written_valuation")
+        if charges_written is not None:
             def _charge_key(line: dict[str, Any]) -> tuple[str, str]:
                 party = line.get("party") or {}
                 return (str(line.get("name")), str(party.get("label") or ""))
 
-            entered_by_key = {_charge_key(line): line for line in charges_entered["charges"]}
-            entered_totals = charges_entered.get("totals_by_currency", {})
+            written_by_key = {_charge_key(line): line for line in charges_written["charges"]}
+            written_totals = charges_written.get("totals_by_currency", {})
             rows = []
             for line in charges["charges"]:
                 key = _charge_key(line)
-                other = entered_by_key.get(key)
+                other = written_by_key.get(key)
                 rows.append(ft.DataRow(cells=[
                     ft.DataCell(ft.Text(
                         f"{line['name']}"
@@ -1178,22 +1309,23 @@ def build_valuation_page(
                 )),
                 ft.DataCell(ft.Text(
                     " · ".join(f"{currency}: {_money(amount, currency)}" for currency, amount
-                               in entered_totals.items()) or "—",
+                               in written_totals.items()) or "—",
                     weight=ft.FontWeight.BOLD, size=12,
                 )),
             ]))
             result_panel.controls.append(ft.Text(
-                "Fee comparison (calculated valuation vs entered valuation)",
+                "Fee comparison (calculated valuation vs written value)",
                 weight=ft.FontWeight.BOLD,
             ))
             result_panel.controls.append(ft.DataTable(
                 columns=[
                     ft.DataColumn(ft.Text("Charge", weight=ft.FontWeight.BOLD)),
                     ft.DataColumn(ft.Text("On calculated valuation", weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("On entered valuation", weight=ft.FontWeight.BOLD)),
+                    ft.DataColumn(ft.Text("On written value", weight=ft.FontWeight.BOLD)),
                 ],
                 rows=rows, column_spacing=18,
             ))
+
         warnings = valuation["warnings"] + charges["warnings"] + [
             f"{item['rule']}: {item['reason']}" for item in charges["skipped_rules"]
         ]
@@ -1396,25 +1528,16 @@ def build_valuation_page(
                 return result
 
             charges = compute_charges(context)
-            # Optional developer-entered valuation: compute the same fees
-            # against it so the result can show a side-by-side comparison
-            # (developer request).
-            entered_valuation_text = (entered_valuation_field.value or "").strip()
-            entered_value: Decimal | None = None
-            if entered_valuation_text:
-                try:
-                    entered_value = Decimal(entered_valuation_text)
-                except (InvalidOperation, ValueError):
-                    raise ValueError(
-                        "Entered valuation must be a valid number."
-                    ) from None
-                if entered_value < 0:
-                    raise ValueError("Entered valuation cannot be negative.")
-                entered_context = dict(context)
-                entered_context["dc_value"] = entered_value
-                entered_context["property_value"] = entered_value
-                entered_context["transferred_value"] = entered_value
-                charges["charges_on_entered_valuation"] = compute_charges(entered_context)
+            # Second comparison base (developer request): the registry
+            # written value. The same fees are computed against it so the
+            # result can show a side-by-side comparison.
+            written_base = valuation.get("registry_written_value")
+            if written_base is not None:
+                written_context = dict(context)
+                written_context["dc_value"] = written_base
+                written_context["property_value"] = written_base
+                written_context["transferred_value"] = written_base
+                charges["charges_on_written_valuation"] = compute_charges(written_context)
             inputs = {
                 "location_id": int(dc_rate["location_id"]),
                 "client_id": int(client.value) if client.value not in (None, "none") else None,
@@ -1443,7 +1566,6 @@ def build_valuation_page(
                 "share_numerator": 1,
                 "share_denominator": 1,
                 "declared_consideration": valuation["registry_written_value"],
-                "entered_valuation": entered_value,
                 "parties": [
                     {key: party[key] for key in ("role", "name", "area_marla", "filer_status")}
                     for party in parties
@@ -1774,6 +1896,8 @@ def build_valuation_page(
         # FBR dropdowns are no longer hidden for rural deeds here; the rate
         # refresh shows them whenever the matched locations carry FBR rows,
         # so rural FBR fees can calculate.
+        # The extended FBR finder is an urban tool (developer request).
+        fbr_search_section.visible = not is_rural
         refresh_rate_matches()
 
     advanced_button.on_click = toggle_advanced_inputs
@@ -1827,10 +1951,8 @@ def build_valuation_page(
                     ft.Container(fbr_rate_choice, col={"xs": 12, "md": 8}),
                     ft.Container(area_value, col={"xs": 12, "md": 4}),
                     # Optional written amount drives the under-valuation check
-                    # (deficient amount) in the result.
+                    # (deficient amount) and the written-value fee comparison.
                     ft.Container(registry_written_value, col={"xs": 12, "md": 4}),
-                    # Optional entered valuation drives the fee comparison table.
-                    ft.Container(entered_valuation_field, col={"xs": 12, "md": 4}),
                 ], run_spacing=8),
             ], spacing=10),
             padding=14,
@@ -1838,6 +1960,7 @@ def build_valuation_page(
             border=ft.Border.all(1, "#E2E8F0"),
             border_radius=10,
         ),
+        fbr_search_section,
         ft.Container(
             ft.Column([
                 ft.Text("Buyers & sellers (deed parties)", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
@@ -2084,8 +2207,11 @@ def build_valuation_page(
                 category.value = "236c" if section == "236C" else "236k"
                 method.value = "percentage"
                 rate.value = ""
+                # 236C/236K apply against the FBR valuation (developer
+                # request: every other fee uses the urban DC rate, these
+                # sections use their relevant FBR schedule).
                 conditions.value = json.dumps({
-                    "base": "dc_value",
+                    "base": "fbr_value",
                     "payer": payer,
                     "when": {filer_key: status},
                 }, sort_keys=True)

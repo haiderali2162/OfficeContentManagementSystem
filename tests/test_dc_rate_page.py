@@ -350,7 +350,7 @@ def test_rate_card_shows_rate_and_location_text(monkeypatch):
 
     root = dc_rates.build_dc_rates_page(page)
     text_values = [control.value for control in _walk(root) if isinstance(control, ft.Text)]
-    assert any("Test Mauza" in value and "DC schedule" in value for value in text_values)
+    assert any("Test Mauza" in value and "DC · Unspecified schedule" in value for value in text_values)
     assert any("Rate: 12345.00" in value for value in text_values)
     assert any("Residential" in value for value in text_values)
     assert any("Square no.: 7-8" in value and "Kila no.: 4" in value
@@ -1095,7 +1095,7 @@ def test_rate_card_uses_default_appearance(monkeypatch):
     card = _first_rate_card(root)
     heading = card.content.controls[0].controls[0]
 
-    assert heading.value == "DC schedule · Test Mauza"
+    assert heading.value == "DC · Unspecified schedule · Test Mauza"
     assert heading.color == "#0F172A"
     assert card.bgcolor == "#FFFFFF"
     assert card.border is not None
@@ -1122,7 +1122,7 @@ def test_rate_card_uses_saved_heading_and_colours(monkeypatch):
     card = _first_rate_card(root)
     heading = card.content.controls[0].controls[0]
 
-    assert heading.value == "FBR - Test Mauza (2025)"
+    assert heading.value == "FBR · Unspecified - Test Mauza (2025)"
     assert heading.color == "#7C2D12"
     assert card.bgcolor == "#FFF8E7"
     assert card.content.controls[1].color == "#1E293B"

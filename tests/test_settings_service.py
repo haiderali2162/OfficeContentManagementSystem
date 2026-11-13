@@ -49,7 +49,7 @@ def test_card_appearance_defaults_when_settings_table_is_missing(
 
 def test_card_appearance_round_trip_and_partial_update(settings_database):
     saved = settings_service.set_card_appearance({
-        "heading_template": "  {schedule} · {location}  ",
+        "heading_template": "  {schedule} · {land_type} · {location}  ",
         "background_color": "#fff8e7",
         "border_color": "#c2410c",
         "heading_color": "#7c2d12",
@@ -57,7 +57,7 @@ def test_card_appearance_round_trip_and_partial_update(settings_database):
     })
 
     assert saved == {
-        "heading_template": "{schedule} · {location}",
+        "heading_template": "{schedule} · {land_type} · {location}",
         "background_color": "#FFF8E7",
         "border_color": "#C2410C",
         "heading_color": "#7C2D12",
@@ -67,7 +67,7 @@ def test_card_appearance_round_trip_and_partial_update(settings_database):
 
     partial = settings_service.set_card_appearance({"body_color": "#334155"})
     assert partial["body_color"] == "#334155"
-    assert partial["heading_template"] == "{schedule} · {location}"
+    assert partial["heading_template"] == "{schedule} · {land_type} · {location}"
     assert partial["background_color"] == "#FFF8E7"
 
 
@@ -110,7 +110,7 @@ def test_invalid_stored_fields_fall_back_individually(settings_database):
     )
 
     appearance = settings_service.get_card_appearance()
-    assert appearance["heading_template"] == "{schedule} schedule · {location}"
+    assert appearance["heading_template"] == "{schedule} · {land_type} schedule · {location}"
     assert appearance["background_color"] == "#FFFFFF"
     assert appearance["border_color"] == "#123456"
     assert appearance["heading_color"] == "#0F172A"
@@ -134,17 +134,17 @@ def test_format_card_heading_uses_default_and_custom_placeholders():
         settings_service.format_card_heading(
             settings_service.DEFAULT_CARD_APPEARANCE["heading_template"], record
         )
-        == "FBR schedule · Test Mauza"
+        == "FBR · Urban schedule · Test Mauza"
     )
     assert (
         settings_service.format_card_heading(
-            "{schedule}: {classification} in {tehsil} ({year})", record
+            "{schedule} · {land_type}: {classification} in {tehsil} ({year})", record
         )
-        == "FBR: Residential in Test Tehsil (2025)"
+        == "FBR · Urban: Residential in Test Tehsil (2025)"
     )
     assert (
         settings_service.format_card_heading("{unknown}", record)
-        == "FBR schedule · Test Mauza"
+        == "FBR · Urban schedule · Test Mauza"
     )
 
 

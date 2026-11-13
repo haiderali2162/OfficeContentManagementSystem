@@ -83,13 +83,13 @@ def test_settings_page_renders_defaults_and_preview(settings_database):
     root = settings.build_settings_page(FakePage())
 
     assert _field(root, "Card heading template").value == (
-        "{schedule} schedule · {location}"
+        "{schedule} · {land_type} schedule · {location}"
     )
     assert _field(root, "Card background").value == "#FFFFFF"
     assert _field(root, "Card border").value == "#E2E8F0"
     assert _field(root, "Heading text").value == "#0F172A"
     assert _field(root, "Body text").value == "#475569"
-    assert _preview_heading(root).value == "DC schedule · Sample Mauza"
+    assert _preview_heading(root).value == "DC · Urban schedule · Sample Mauza"
 
 
 def test_settings_page_preview_updates_and_save_persists(settings_database):
@@ -98,15 +98,15 @@ def test_settings_page_preview_updates_and_save_persists(settings_database):
     heading = _field(root, "Card heading template")
     background = _field(root, "Card background")
 
-    heading.value = "{schedule} - {location} ({year})"
+    heading.value = "{schedule} · {land_type} - {location} ({year})"
     background.value = "#fff8e7"
     heading.on_change(None)
-    assert _preview_heading(root).value == "DC - Sample Mauza (2025)"
+    assert _preview_heading(root).value == "DC · Urban - Sample Mauza (2025)"
 
     _button(root, "Save appearance").on_click(None)
 
     saved = settings_service.get_card_appearance()
-    assert saved["heading_template"] == "{schedule} - {location} ({year})"
+    assert saved["heading_template"] == "{schedule} · {land_type} - {location} ({year})"
     assert saved["background_color"] == "#FFF8E7"
     assert any(
         "saved" in (control.value or "").lower()
@@ -212,7 +212,7 @@ def test_settings_page_reset_restores_defaults(settings_database):
 
     assert _field(root, "Card background").value == "#FFFFFF"
     assert _field(root, "Card heading template").value == (
-        "{schedule} schedule · {location}"
+        "{schedule} · {land_type} schedule · {location}"
     )
     assert settings_service.get_card_appearance() == settings_service.DEFAULT_CARD_APPEARANCE
 

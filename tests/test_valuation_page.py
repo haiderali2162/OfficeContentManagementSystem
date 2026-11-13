@@ -1574,8 +1574,8 @@ def test_location_choices_show_the_measurement_unit(monkeypatch):
     assert labels and all("Per marla" in label for label in labels)
 
 
-def test_entered_valuation_produces_fee_comparison(monkeypatch):
-    """An entered valuation computes the same fees against it side by side."""
+def test_written_value_produces_fee_comparison(monkeypatch):
+    """Fees are computed on the calculated and the written-value bases."""
     matches = [_location_row(7)]
     rates = {"dc": [_dc_rate(11, 7)]}
     _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
@@ -1610,24 +1610,72 @@ def test_entered_valuation_produces_fee_comparison(monkeypatch):
                    if isinstance(control, ft.TextField)
                    and control.label == "Registry written value (PKR)")
     written.value = "50"
-    entered = next(control for control in walk_controls(root)
-                   if isinstance(control, ft.TextField)
-                   and control.label == "Entered valuation (PKR, optional)")
-    entered.value = "100000"
     button = next(control for control in walk_controls(root)
                   if isinstance(control, ft.Button)
                   and getattr(control, "content", None) == "Calculate estimate")
     button.on_click(SimpleNamespace(control=button))
 
     # The charges ran twice: once on the calculated valuation, once on the
-    # entered one (same rules, same parties, only the valuation base moved).
+    # written value (only the valuation base moved).
     assert len(captured_contexts) == 2
-    assert captured_contexts[1]["dc_value"] == Decimal("100000")
-    assert captured_contexts[1]["transferred_value"] == Decimal("100000")
+    assert captured_contexts[1]["dc_value"] == Decimal("50")
+    assert captured_contexts[1]["transferred_value"] == Decimal("50")
 
     texts = [control.value for control in walk_controls(root)
              if isinstance(control, ft.Text) and control.value]
     assert any("Fee comparison" in text for text in texts)
-    assert any("On entered valuation" in text for text in texts)
-    # PKR 1.00 on the calculated base vs PKR 1,000.00 on the entered base.
-    assert any("1,000.00" in text for text in texts)
+    assert any("On written value" in text for text in texts)
+    # PKR 1.00 on the calculated base vs PKR 0.50 on the written base.
+    assert any("0.50" in text for text in texts)
+
+
+def test_urban_extended_fbr_finder_selects_the_fbr_rate(monkeypatch):
+    """The extended FBR search feeds its result into the FBR rate menus."""
+    matches = [_location_row(7)]
+    fbr_row = {
+        "id": 31, "location_id": 9, "schedule_type": "fbr",
+        "rate_unit": "per_square_foot", "rate_value": "300",
+        "classification": "Commercial", "property_type": "Commercial",
+        "mauza": "Market Block", "effective_from": valuation.date(2020, 1, 1),
+        "effective_to": None, "revenue_circle": "Circle C",
+        "property_area": "Sector C", "locality": "Market Road",
+        "square_no": "22",
+    }
+    _patch_estimate_services(monkeypatch, matches=matches, rates={"dc": [_dc_rate(11, 7)]})
+    monkeypatch.setattr(
+        valuation, "list_dc_rates",
+        lambda **kwargs: [fbr_row] if kwargs.get("schedule_type") == "fbr" else [],
+    )
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    # Urban profile so the FBR finder section shows.
+    profile = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.RadioGroup)
+                   and any(isinstance(radio, ft.Radio) and radio.value == "rural"
+                           for radio in walk_controls(control)))
+    profile.value = "urban"
+    profile.on_change(SimpleNamespace(control=profile))
+
+    circle = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.TextField)
+                  and control.label == "Revenue circle")
+    area_field = next(control for control in walk_controls(root)
+                      if isinstance(control, ft.TextField)
+                      and control.label == "Property area")
+    circle.value = "Circle C"
+    area_field.value = "Sector C"
+    search_button = next(control for control in walk_controls(root)
+                         if isinstance(control, ft.OutlinedButton)
+                         and getattr(control, "content", None) == "Search FBR schedule")
+    search_button.on_click(SimpleNamespace(control=search_button))
+
+    result = _dropdown(controls, "Matching FBR schedule")
+    assert result.visible is True
+    assert result.value == "31"
+    fbr_unit = _dropdown(controls, "FBR rate unit (if available)")
+    fbr_rate = _dropdown(controls, "Matched FBR rate (editable)")
+    assert fbr_unit.value == "per_square_foot"
+    assert fbr_rate.value == "31"
+

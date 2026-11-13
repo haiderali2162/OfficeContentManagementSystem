@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import joinedload
 
 from core.area_engine import AreaError, LandArea
@@ -196,11 +196,15 @@ def _reference_values(value: Any) -> list[str]:
     if not normalized:
         return []
     tokens: list[str] = []
-    for segment in re.split(r"[,;]", normalized):
+    # Messy published cells ("1 22-123", "17 3- 175") split into their
+    # individual values: normalise dash spacing, then treat whitespace runs
+    # as separators too (developer request).
+    normalized = re.sub(r"\s*-\s*", "-", normalized)
+    for segment in re.split(r"[,;\s]+", normalized):
         segment = segment.strip()
         if not segment:
             continue
-        interval = re.fullmatch(r"(\d+)\s*-\s*(\d+)", segment)
+        interval = re.fullmatch(r"(\d+)-(\d+)", segment)
         if interval:
             # Published schedules sometimes write the larger endpoint first;
             # treat either order as the same inclusive range.
@@ -246,11 +250,16 @@ def _canonical_reference(value: Any) -> str | None:
         return None
     numeric: set[int] = set()
     other: list[str] = []
-    for segment in re.split(r"[,;]", normalized):
+    # Published cells arrive with messy separators: "1 22-123", "17 3- 175",
+    # "7 3- 74". Normalise the dash spacing first so ranges stay intact, then
+    # treat every whitespace run as a separator too (developer request:
+    # break these into their individual values).
+    normalized = re.sub(r"\s*-\s*", "-", normalized)
+    for segment in re.split(r"[,;\s]+", normalized):
         segment = segment.strip()
         if not segment:
             continue
-        interval = re.fullmatch(r"(\d+)\s*-\s*(\d+)", segment)
+        interval = re.fullmatch(r"(\d+)-(\d+)", segment)
         if interval:
             start, end = sorted(int(part) for part in interval.groups())
             if end - start > 100_000:
@@ -663,6 +672,57 @@ def delete_duplicate_rule_profile(profile_id: int) -> None:
         duplicate_rules.delete_custom_profile(session, profile_id)
 
 
+def find_malformed_reference_values() -> dict[str, str]:
+    """Return stored Square/Kila/Khasra values that are not canonical.
+
+    Messy published text ("1 22-123", "17 3- 175") reaches the database when
+    a schedule was imported before the cleaning existed. Each malformed
+    stored value maps to its canonical form so the developer can review and
+    repair them in one action.
+    """
+    malformed: dict[str, str] = {}
+    with SessionLocal() as session:
+        for field in _EXPANDABLE_REFERENCE_FIELDS:
+            column = _LOCATION_HINT_COLUMNS[field]
+            values = session.execute(
+                select(column).distinct()
+            ).scalars()
+            for value in values:
+                text = _text(value)
+                if not text:
+                    continue
+                try:
+                    canonical = _canonical_reference(text)
+                except DCRateServiceError:
+                    canonical = None
+                if canonical and canonical != text:
+                    malformed[text] = canonical
+    return dict(sorted(malformed.items()))
+
+
+def repair_malformed_reference_values() -> int:
+    """Rewrite every malformed stored value into its canonical form.
+
+    Returns the number of location rows updated. Rates keep their
+    location link, so no rate row is touched or removed.
+    """
+    malformed = find_malformed_reference_values()
+    if not malformed:
+        return 0
+    updated = 0
+    with SessionLocal.begin() as session:
+        for field in _EXPANDABLE_REFERENCE_FIELDS:
+            column = getattr(PropertyLocation, field)
+            for bad, fixed in malformed.items():
+                result = session.execute(
+                    update(PropertyLocation)
+                    .where(column == bad)
+                    .values(**{field: fixed})
+                )
+                updated += int(result.rowcount or 0)
+    return updated
+
+
 DELETION_SCOPES = {
     "all": "every DC and FBR schedule row",
     "dc_rural": "every rural DC schedule row",
@@ -893,7 +953,12 @@ def export_schedule_records(
     export_records: list[dict[str, Any]] = []
     for record in records:
         if reference_mode == "stored":
-            export_records.append(record)
+            # Even the stored view shows canonical values (developer report:
+            # messy ranges like "1 22-123" used to be exported verbatim).
+            transformed = dict(record)
+            for field in _EXPANDABLE_REFERENCE_FIELDS:
+                transformed[field] = _canonical_reference(record.get(field))
+            export_records.append(transformed)
             continue
         if reference_mode == "ranges":
             transformed = dict(record)
@@ -1118,6 +1183,17 @@ def _apply_location_context(statement, context: dict[str, Any] | None):
                 PropertyLocation.locality.ilike(pattern, escape="\\"),
                 PropertyLocation.name.ilike(pattern, escape="\\"),
             ))
+        elif field_name == "committee_town":
+            # Best effort (developer report: FBR rates vanished when a Town
+            # was typed): the FBR sheet has no Town column, so its sibling
+            # location rows carry an empty Town. Match the typed town or
+            # accept rows without one; the Python validator still checks
+            # rows that do carry a Town.
+            statement = statement.where(or_(
+                PropertyLocation.committee_town.ilike(pattern, escape="\\"),
+                PropertyLocation.committee_town.is_(None),
+                func.trim(PropertyLocation.committee_town) == "",
+            ))
         elif field_name in _LOCATION_REFERENCE_FIELDS:
             statement = statement.where(_reference_search_condition(field_name, value))
         else:
@@ -1201,6 +1277,16 @@ def _location_matches_context(location: dict[str, Any], context: dict[str, Any])
             except DCRateServiceError:
                 return False
             if not requested.intersection(stored):
+                return False
+            continue
+        if field_name == "committee_town":
+            # Best effort: the FBR schedule sheet has no Town column, so
+            # its location rows carry an empty Town while the urban DC
+            # rows of the same property have one. An empty stored value
+            # must not exclude the sibling schedule's rows (developer
+            # report: FBR rates vanished when a Town was typed).
+            stored = _text(location.get(field_name))
+            if stored and not matches_pattern(stored, value):
                 return False
             continue
         if not matches_pattern(location.get(field_name), value):
@@ -2751,6 +2837,8 @@ def list_dc_rates(
     tehsil: str = "",
     committee_town: str = "",
     property_area: str = "",
+    revenue_circle: str = "",
+    locality: str = "",
     square_no: str = "",
     kila_no: str = "",
     khasra_no: str = "",
@@ -2765,6 +2853,8 @@ def list_dc_rates(
     tehsil_term = tehsil.strip()
     town_term = committee_town.strip()
     area_term = property_area.strip()
+    circle_term = revenue_circle.strip()
+    locality_term = locality.strip()
     cadastral_terms = (square_no.strip(), kila_no.strip(), khasra_no.strip())
     # With a Mauza filter and no free-text/cadastral search, match location
     # fields inside a location-id subquery: SQLite then probes rates through
@@ -2780,13 +2870,22 @@ def list_dc_rates(
         for column, term in (
             (PropertyLocation.district, district_term),
             (PropertyLocation.tehsil, tehsil_term),
-            (PropertyLocation.committee_town, town_term),
             (PropertyLocation.property_area, area_term),
+            (PropertyLocation.revenue_circle, circle_term),
+            (PropertyLocation.locality, locality_term),
         ):
             if term:
                 location_match = location_match.where(
                     column.ilike(like_pattern(term), escape="\\")
                 )
+        if town_term:
+            # Best effort for FBR sibling rows: they carry no Town column, so
+            # accept the typed town or rows without one (developer report).
+            location_match = location_match.where(or_(
+                PropertyLocation.committee_town.ilike(like_pattern(town_term), escape="\\"),
+                PropertyLocation.committee_town.is_(None),
+                func.trim(PropertyLocation.committee_town) == "",
+            ))
         if land_type in {"rural", "urban"}:
             location_match = location_match.where(
                 PropertyLocation.land_type == land_type
@@ -2794,6 +2893,7 @@ def list_dc_rates(
         statement = statement.where(DCValuationRate.location_id.in_(location_match))
     elif (mauza_term or qanoongoi.strip() or any(cadastral_terms)
             or district_term or tehsil_term or town_term or area_term
+            or circle_term or locality_term
             or land_type in {"rural", "urban"} or search):
         statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
@@ -2827,13 +2927,22 @@ def list_dc_rates(
         for column, term in (
             (PropertyLocation.district, district_term),
             (PropertyLocation.tehsil, tehsil_term),
-            (PropertyLocation.committee_town, town_term),
             (PropertyLocation.property_area, area_term),
+            (PropertyLocation.revenue_circle, circle_term),
+            (PropertyLocation.locality, locality_term),
         ):
             if term:
                 statement = statement.where(
                     column.ilike(like_pattern(term), escape="\\")
                 )
+        if town_term:
+            # Best effort for FBR sibling rows (no Town column): match the
+            # typed town or rows without one (developer report).
+            statement = statement.where(or_(
+                PropertyLocation.committee_town.ilike(like_pattern(town_term), escape="\\"),
+                PropertyLocation.committee_town.is_(None),
+                func.trim(PropertyLocation.committee_town) == "",
+            ))
         statement = _apply_qanoongoi_filter(statement, qanoongoi)
     # Cadastral fields are stored as token lists or compact ranges; query a
     # broad superset in SQLite, then validate whole tokens/ranges below so
@@ -3666,6 +3775,36 @@ def preview_mapped_schedule(
         max_per_source=max_per_source,
         max_total=max_total,
     )
+    # Messy published cells ("1 22-123", "17 3- 175") are normalized on
+    # import; warn per row so the source sheet can be reviewed (developer
+    # request to catch these at import time).
+    for item in items:
+        for field in _EXPANDABLE_REFERENCE_FIELDS:
+            raw = _text(item["location_values"].get(field))
+            if not raw:
+                continue
+            try:
+                canonical = _canonical_reference(raw)
+            except DCRateServiceError:
+                continue
+            if canonical and canonical != raw:
+                preview["warnings"].append({
+                    "row": item["row"],
+                    "sheet": item.get("sheet"),
+                    "kind": "messy cadastral value normalized",
+                    "message": (
+                        f"{field.replace('_', ' ').capitalize()} '{raw}' is not in "
+                        f"the canonical form and will be stored as '{canonical}'. "
+                        "Review the source sheet if this looks wrong."
+                    ),
+                    "source_values": item.get("source_values", []),
+                    "allowed_by_rule": True,
+                })
+        # Deduplicate per row: one warning per field value.
+        preview["warnings"] = sorted(
+            {(w["row"], w["message"]): w for w in preview["warnings"]}.values(),
+            key=lambda warning: warning["row"],
+        )
     if storage_mode == "ranges":
         # Collective (range/list) values kept in one record are deprecated:
         # warn per row that this could lead to wrong search/valuation results.

@@ -47,8 +47,10 @@ from services.dc_rate_service import (
     list_mauza_names,
     DELETION_SCOPES,
     delete_dc_rate_schedules,
+    find_malformed_reference_values,
     MAX_EXPANDED_ROWS_PER_SOURCE,
     preload_location_dimensions,
+    repair_malformed_reference_values,
     find_duplicate_dc_rates,
     find_khewat_year_conflicts,
     latest_rhz_year,
@@ -3413,12 +3415,76 @@ def build_dc_rates_page(
             ],
         ))
 
+    def open_repair_references_dialog(_=None):
+        """Show stored cadastral values that are not canonical and fix them."""
+        try:
+            malformed = find_malformed_reference_values()
+        except Exception as exc:
+            status_text.value = f"Could not scan stored values: {exc}"
+            page.update()
+            return
+        if not malformed:
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Find / fix messy ranges"),
+                content=ft.Text(
+                    "No malformed Square/Kila/Khasra values were found — every "
+                    "stored value is already in the canonical form.",
+                    size=12,
+                ),
+                actions=[ft.TextButton("Close", on_click=lambda _: page.pop_dialog())],
+            ))
+            page.update()
+            return
+
+        def repair(_=None):
+            try:
+                repaired = repair_malformed_reference_values()
+            except Exception as exc:
+                status_text.value = f"Could not repair stored values: {exc}"
+                page.update()
+                return
+            page.pop_dialog()
+            schedule_rates_refresh()
+            status_text.value = (
+                f"Repaired {repaired:,} location row(s) to the canonical form. "
+                "Rates keep their location links."
+            )
+            page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Find / fix messy ranges"),
+            content=ft.Column([
+                ft.Text(
+                    f"{len(malformed):,} stored value(s) are not in the canonical "
+                    "form. Repairing rewrites the stored text (for example "
+                    "'1 22-123' becomes '1, 22-123'); rates keep their location "
+                    "links and no rows are removed.",
+                    size=12, color="#B91C1C",
+                ),
+                ft.Column([
+                    ft.Text(f"'{bad}'  →  '{fixed}'", size=11, selectable=True)
+                    for bad, fixed in list(malformed.items())[:60]
+                ], spacing=2, scroll=ft.ScrollMode.AUTO, height=260),
+            ], tight=True, spacing=6, width=520),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                ft.Button(
+                    f"Fix {len(malformed):,} value(s)", on_click=repair,
+                    style=ft.ButtonStyle(bgcolor="#B91C1C", color="#FFFFFF"),
+                ),
+            ],
+        ))
+        page.update()
+
     toolbar = ft.Row(
         controls=[
             ft.Button("Add DC rate", on_click=open_rate_dialog),
             ft.OutlinedButton("Add FBR rate", on_click=lambda _: open_rate_dialog(schedule_type="fbr")),
             ft.OutlinedButton("Add location", on_click=open_location_dialog),
             ft.OutlinedButton("Find / remove duplicates", on_click=open_duplicate_cleanup_dialog),
+            ft.OutlinedButton("Find / fix messy ranges", on_click=open_repair_references_dialog),
             ft.OutlinedButton("Duplicate rules", on_click=open_duplicate_rules_dialog),
             ft.OutlinedButton("Select squares / Kilas", on_click=open_cadastral_selection_dialog),
             ft.OutlinedButton("View Khewats", on_click=open_khewat_search_dialog),
