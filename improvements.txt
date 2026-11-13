@@ -1,3 +1,0 @@
-make these changes on the calculate tab of "valuaiton & taxes" page.
-    1. under the urban, defining the urban schedule, it is still not automatically fetching the fbr schedule. make a section an extended one to find the fbr schedule based on the fbr schedule fields like revenue circle, property area, classification, location, location square no.
-    2. make a a little change about fee calculation comparison. we need only two comparisons one on the actual schedule calculated and the other is on the registry written value. show the comparison in a tabular format or another 1 or 2 more comparison options.

@@ -343,7 +343,14 @@ def format_card_heading(template: str, record: dict) -> str:
         "year": str(record.get("published_year") or "Not supplied"),
     }
     values["land_type"] = land_type.title() or "Unspecified"
-    return template.format_map(values)
+    heading = template.format_map(values)
+    # FBR cards lead with their revenue circle (developer request: the card
+    # used to show only "- FBR Urban" without saying which circle).
+    if schedule == "FBR":
+        circle = str(record.get("revenue_circle") or "").strip()
+        if circle:
+            heading = f"{circle} · {heading}"
+    return heading
 
 
 # --------------------------------------------------------------------------

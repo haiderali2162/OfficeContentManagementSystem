@@ -1659,11 +1659,11 @@ def test_urban_extended_fbr_finder_selects_the_fbr_rate(monkeypatch):
     profile.on_change(SimpleNamespace(control=profile))
 
     circle = next(control for control in walk_controls(root)
-                  if isinstance(control, ft.TextField)
-                  and control.label == "Revenue circle")
+                  if isinstance(control, ft.AutoComplete)
+                  and control.data == "revenue_circle")
     area_field = next(control for control in walk_controls(root)
-                      if isinstance(control, ft.TextField)
-                      and control.label == "Property area")
+                      if isinstance(control, ft.AutoComplete)
+                      and control.data == "property_area")
     circle.value = "Circle C"
     area_field.value = "Sector C"
     search_button = next(control for control in walk_controls(root)

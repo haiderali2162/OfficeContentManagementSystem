@@ -256,6 +256,9 @@ def build_dc_rates_page(
     tehsil_filter = ft.AutoComplete(width=160, suggestions_max_height=220, data="tehsil")
     town_filter = ft.AutoComplete(width=160, suggestions_max_height=220, data="committee_town")
     property_area_filter = ft.AutoComplete(width=160, suggestions_max_height=220, data="property_area")
+    revenue_circle_filter = ft.AutoComplete(
+        width=160, suggestions_max_height=220, data="revenue_circle"
+    )
     search_field = ft.TextField(
         label="Search location, property, classification, or source",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
@@ -548,6 +551,7 @@ def build_dc_rates_page(
                         district=district_filter.value or "", tehsil=tehsil_filter.value or "",
                         committee_town=town_filter.value or "",
                         property_area=property_area_filter.value or "",
+                        revenue_circle=revenue_circle_filter.value or "",
                         square_no=square_filter.value or "", kila_no=kila_filter.value or "",
                         khasra_no=khasra_filter.value or "",
                         schedule_type=schedule_type, land_type=land_type,
@@ -1068,6 +1072,7 @@ def build_dc_rates_page(
                 mauza_filter.value = ""
                 district_filter.value = ""
                 tehsil_filter.value = ""
+                revenue_circle_filter.value = ""
                 town_filter.value = ""
                 property_area_filter.value = ""
                 square_filter.value = ""
@@ -1375,10 +1380,18 @@ def build_dc_rates_page(
                         )
                     refresh_rule_help()
 
+                # Per-column manual values (developer request): sheets missing
+                # District/Tehsil (or any column) let the user type one value
+                # that is applied to every imported row of that column.
+                manual_checks: dict[str, ft.Checkbox] = {}
+                manual_fields: dict[str, ft.TextField] = {}
+
                 def rebuild_mapping(_=None):
                     """Display only fields supported by the selected schedule profile."""
                     profile = schedule.value or "rural_dc"
                     selects.clear()
+                    manual_checks.clear()
+                    manual_fields.clear()
                     controls = []
                     for target, label in profile_fields[profile]:
                         control = ft.Dropdown(
@@ -1387,7 +1400,25 @@ def build_dc_rates_page(
                             options=source_options,
                         )
                         selects[target] = control
-                        controls.append(ft.Container(control, col={"xs": 12, "md": 6}))
+                        manual_check = ft.Checkbox(
+                            label="Type value manually", value=False, data=target,
+                        )
+                        manual_field = ft.TextField(
+                            label=f"Value for every row ({label})",
+                            visible=False, width=220,
+                        )
+
+                        def toggle_manual_field(_=None, field=manual_field, check=manual_check):
+                            field.visible = bool(check.value)
+                            page.update()
+
+                        manual_check.on_change = toggle_manual_field
+                        manual_checks[target] = manual_check
+                        manual_fields[target] = manual_field
+                        controls.append(ft.Container(
+                            ft.Column([control, manual_check, manual_field], spacing=2),
+                            col={"xs": 12, "md": 6},
+                        ))
                     mapping_controls.controls = controls
                     rebuild_rule_options()
                     page.update()
@@ -1670,11 +1701,39 @@ def build_dc_rates_page(
                     try:
                         mapping = {key: int(control.value) for key, control in selects.items()
                                    if control.value not in (None, "")}
+                        # Apply the per-column manual values (developer
+                        # request): a checked field either overwrites its
+                        # mapped column on every row or, when the sheet has
+                        # no such column, is added as a virtual column.
+                        effective_headers = list(headers)
+                        effective_rows = [list(row) for row in rows]
+                        effective_mapping = dict(mapping)
+                        virtual_index = len(headers)
+                        for target, checkbox in manual_checks.items():
+                            if not checkbox.value:
+                                continue
+                            value = (manual_fields[target].value or "").strip()
+                            if not value:
+                                continue
+                            column = effective_mapping.get(target)
+                            if column in (None, ""):
+                                effective_headers.append(
+                                    target.replace("_", " ").title()
+                                )
+                                for effective_row in effective_rows:
+                                    effective_row.append(value)
+                                effective_mapping[target] = virtual_index
+                                virtual_index += 1
+                            elif column == -1 or column >= len(headers):
+                                continue
+                            else:
+                                for effective_row in effective_rows:
+                                    effective_row[column] = value
                         per_row_cap, total_cap = expansion_limits()
                         preview = preview_mapped_schedule(
-                            headers,
-                            rows,
-                            mapping,
+                            effective_headers,
+                            effective_rows,
+                            effective_mapping,
                             schedule.value,
                             duplicate_policy=duplicate_policy.value or "check_now",
                             duplicate_rule=duplicate_rule_dropdown.value,
@@ -1750,6 +1809,7 @@ def build_dc_rates_page(
             tehsil=tehsil_filter.value or "",
             committee_town=town_filter.value or "",
             property_area=property_area_filter.value or "",
+            revenue_circle=revenue_circle_filter.value or "",
             square_no=square_filter.value or "",
             kila_no=kila_filter.value or "",
             khasra_no=khasra_filter.value or "",
@@ -3021,6 +3081,9 @@ def build_dc_rates_page(
                     },
                     fields=[
                         "district", "tehsil", "qanoongoi", "mauza",
+                        # The FBR schedule fields show hints while typing
+                        # too (developer request).
+                        "committee_town", "property_area", "revenue_circle",
                     ],
                     limit=100,
                     hierarchy=True,
@@ -3032,6 +3095,9 @@ def build_dc_rates_page(
             for field_name, control in (
                 ("district", district_filter), ("tehsil", tehsil_filter),
                 ("qanoongoi", qanoongoi_filter), ("mauza", mauza_filter),
+                ("committee_town", town_filter),
+                ("property_area", property_area_filter),
+                ("revenue_circle", revenue_circle_filter),
             ):
                 control.suggestions = [
                     ft.AutoCompleteSuggestion(key=value, value=value)
@@ -3092,6 +3158,26 @@ def build_dc_rates_page(
     district_filter.on_select = district_changed
     tehsil_filter.on_change = tehsil_changed
     tehsil_filter.on_select = tehsil_changed
+    # The FBR fields filter independently and refresh their hints (each
+    # typed field narrows the records progressively — developer note 1.1).
+    town_filter.on_change = lambda event: (
+        schedule_rates_refresh(event), filter_hint_refresh(),
+    )
+    town_filter.on_select = lambda event: (
+        schedule_rates_refresh(event), filter_hint_refresh(),
+    )
+    property_area_filter.on_change = lambda event: (
+        schedule_rates_refresh(event), filter_hint_refresh(),
+    )
+    property_area_filter.on_select = lambda event: (
+        schedule_rates_refresh(event), filter_hint_refresh(),
+    )
+    revenue_circle_filter.on_change = lambda event: (
+        schedule_rates_refresh(event), filter_hint_refresh(),
+    )
+    revenue_circle_filter.on_select = lambda event: (
+        schedule_rates_refresh(event), filter_hint_refresh(),
+    )
     qanoongoi_filter.on_change = qanoongoi_changed
     qanoongoi_filter.on_select = qanoongoi_changed
     mauza_filter.on_change = mauza_changed
@@ -3548,9 +3634,10 @@ def build_dc_rates_page(
     extended_filters = ft.ResponsiveRow([
         ft.Container(ft.Column([ft.Text("District"), district_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(ft.Column([ft.Text("Tehsil"), tehsil_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
-        ft.Container(location_filter, col={"xs": 12, "sm": 6, "md": 4}),
+        ft.Container(ft.Column([ft.Text("Revenue circle"), revenue_circle_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(ft.Column([ft.Text("Town"), town_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(ft.Column([ft.Text("Property area"), property_area_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(location_filter, col={"xs": 12, "sm": 6, "md": 4}),
         ft.Container(published_year_filter, col={"xs": 12, "md": 4}),
     ], visible=False, run_spacing=4)
 
@@ -3643,7 +3730,7 @@ def build_dc_rates_page(
                 ]
                 # Square/Kila/Khasra suggestions stay empty until a Mauza is
                 # provided (developer request: no more "wild" global lists);
-                # the cadastral refresh scopes them on each change.
+                 # the cadastral refresh scopes them on each change.
                 refresh_rates(update_page=False, records=records, summary=summary,
                               has_more=len(records) > visible_rate_limit)
                 page.update()

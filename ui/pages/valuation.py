@@ -376,12 +376,13 @@ def build_valuation_page(
     # Urban extended FBR finder (developer request): the FBR schedule lives
     # on sibling rows keyed by its own columns, so it is searched directly
     # by revenue circle, property area, classification, location, and the
-    # location square number.
-    fbr_search_circle = ft.TextField(label="Revenue circle", width=190)
-    fbr_search_area = ft.TextField(label="Property area", width=190)
+    # location square number. The fields show DB hints while typing
+    # (developer note 1.3).
+    fbr_search_circle = ft.AutoComplete(width=190, suggestions_max_height=200, data="revenue_circle")
+    fbr_search_area = ft.AutoComplete(width=190, suggestions_max_height=200, data="property_area")
     fbr_search_classification = ft.TextField(label="Classification", width=170)
-    fbr_search_location = ft.TextField(label="Location", width=190)
-    fbr_search_square = ft.TextField(label="Location square no.", width=150)
+    fbr_search_location = ft.AutoComplete(width=190, suggestions_max_height=200, data="locality")
+    fbr_search_square = ft.AutoComplete(width=150, suggestions_max_height=200, data="square_no")
     fbr_search_button = ft.OutlinedButton("Search FBR schedule")
     fbr_search_status = ft.Text("", size=11, color="#64748B")
     fbr_search_result = ft.Dropdown(
@@ -389,6 +390,7 @@ def build_valuation_page(
         visible=False, enable_filter=True, editable=True, menu_height=180,
     )
     fbr_search_rows: dict[str, dict[str, Any]] = {}
+    fbr_search_pin: dict[str, Any] | None = None
     fbr_search_section = ft.Container(
         ft.Column([
             ft.Text("Find FBR schedule (extended search)", size=13, weight=ft.FontWeight.BOLD, color="#1E293B"),
@@ -399,10 +401,14 @@ def build_valuation_page(
                 size=11, color="#64748B",
             ),
             ft.Row([
-                fbr_search_circle, fbr_search_area, fbr_search_classification,
+                ft.Column([ft.Text("Revenue circle"), fbr_search_circle], spacing=2),
+                ft.Column([ft.Text("Property area"), fbr_search_area], spacing=2),
+                ft.Column([ft.Text("Classification"), fbr_search_classification], spacing=2),
             ], wrap=True, spacing=6),
             ft.Row([
-                fbr_search_location, fbr_search_square, fbr_search_button,
+                ft.Column([ft.Text("Location"), fbr_search_location], spacing=2),
+                ft.Column([ft.Text("Location square no."), fbr_search_square], spacing=2),
+                fbr_search_button,
             ], wrap=True, spacing=6),
             fbr_search_status,
             fbr_search_result,
@@ -864,6 +870,12 @@ def build_valuation_page(
             ("dc", dc_rate_unit, dc_rate_choice), ("fbr", fbr_rate_unit, fbr_rate_choice)
         ):
             rows = dc_pool if schedule == "dc" else fbr_pool
+            # A rate pinned by the extended FBR search survives the refresh:
+            # it is added to the pool and kept selected (developer report
+            # 1.2), until the user picks a different rate in the menu.
+            if (schedule == "fbr" and fbr_search_pin is not None
+                    and str(fbr_search_pin["id"]) not in {str(row["id"]) for row in rows}):
+                rows = [fbr_search_pin, *rows]
             units = sorted({row["rate_unit"] for row in rows})
             unit_control.options = [ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units]
             # The DC unit and rate menus stay permanently visible (developer
@@ -883,6 +895,10 @@ def build_valuation_page(
                 unit_control.value = units[0] if units else None
             elif unit_control.value not in units:
                 unit_control.value = None
+            # A pinned extended-search row keeps its own unit selected.
+            if (schedule == "fbr" and fbr_search_pin is not None
+                    and fbr_search_pin.get("rate_unit") in units):
+                unit_control.value = fbr_search_pin["rate_unit"]
             rows = [row for row in rows if not unit_control.value or row["rate_unit"] == unit_control.value]
             rate_records[schedule] = rows
             rate_control.options = [ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows]
@@ -891,6 +907,9 @@ def build_valuation_page(
             )
             if unambiguous:
                 rate_control.value = str(rows[0]["id"]) if rows else None
+            elif (schedule == "fbr" and fbr_search_pin is not None
+                    and str(fbr_search_pin["id"]) in {str(row["id"]) for row in rows}):
+                rate_control.value = str(fbr_search_pin["id"])
             elif rate_control.value not in {str(row["id"]) for row in rows}:
                 rate_control.value = None
         classes = sorted({str(row.get("classification")) for row in all_rates if row.get("classification")})
@@ -1100,9 +1119,14 @@ def build_valuation_page(
 
     def pick_fbr_search_result(_=None):
         """Use the chosen extended-search row as the calculation's FBR rate."""
+        nonlocal fbr_search_pin
         row = fbr_search_rows.get(str(fbr_search_result.value or ""))
         if not row:
             return
+        # Pin the row so the debounced rate refresh keeps it selected even
+        # when the sibling location is not among the urban candidates
+        # (developer report 1.2: the found schedule was lost on calculate).
+        fbr_search_pin = dict(row)
         rate_records["fbr"] = [row]
         unit = row.get("rate_unit") or ""
         fbr_rate_unit.options = [
@@ -1119,6 +1143,68 @@ def build_valuation_page(
     fbr_search_button.on_click = search_fbr_schedule
     fbr_search_result.on_select = pick_fbr_search_result
     fbr_search_result.on_change = pick_fbr_search_result
+
+    # Typing hints for the extended FBR fields (developer note 1.3): each
+    # field offers the schedule-backed values matching what was typed, with
+    # the other FBR fields as context.
+    fbr_hint_generation = 0
+
+    def fbr_finder_hint_refresh() -> None:
+        nonlocal fbr_hint_generation
+        fbr_hint_generation += 1
+        generation = fbr_hint_generation
+
+        def apply_fbr_hints() -> None:
+            try:
+                values_by_field = list_location_hint_values(
+                    land_type="urban",
+                    context={
+                        "revenue_circle": fbr_search_circle.value or "",
+                        "property_area": fbr_search_area.value or "",
+                        "locality": fbr_search_location.value or "",
+                        "square_no": fbr_search_square.value or "",
+                    },
+                    fields=["revenue_circle", "property_area", "locality", "square_no"],
+                    limit=100,
+                    hierarchy=False,
+                )
+            except Exception:
+                return
+            for field_name, control in (
+                ("revenue_circle", fbr_search_circle),
+                ("property_area", fbr_search_area),
+                ("locality", fbr_search_location),
+                ("square_no", fbr_search_square),
+            ):
+                control.suggestions = [
+                    ft.AutoCompleteSuggestion(key=value, value=value)
+                    for value in values_by_field.get(field_name, [])
+                ]
+            page.update()
+
+        async def load_fbr_hints():
+            await asyncio.sleep(0.15)
+            if generation != fbr_hint_generation:
+                return
+            await asyncio.to_thread(apply_fbr_hints)
+
+        if hasattr(page, "run_task"):
+            page.run_task(load_fbr_hints)
+        else:
+            apply_fbr_hints()
+
+    for fbr_field in (fbr_search_circle, fbr_search_area,
+                      fbr_search_location, fbr_search_square):
+        fbr_field.on_change = lambda event: fbr_finder_hint_refresh()
+        fbr_field.on_select = lambda event: fbr_finder_hint_refresh()
+
+    def on_fbr_rate_choice_manual(_=None):
+        """A manual pick in the FBR menu replaces the extended-search pin."""
+        nonlocal fbr_search_pin
+        fbr_search_pin = None
+        refresh_rate_matches(_)
+
+    fbr_rate_choice.on_select = on_fbr_rate_choice_manual
 
     mauza.on_change = on_mauza_change
     mauza.on_select = on_mauza_change
@@ -1175,7 +1261,7 @@ def build_valuation_page(
                  "lists and reloads them from the saved schedules."),
     )
     dc_rate_choice.on_select = refresh_rate_matches
-    fbr_rate_choice.on_select = refresh_rate_matches
+    # fbr_rate_choice.on_select is wired to the pin-aware handler above.
 
     def show_estimate(estimate_id: int):
         saved = get_estimate(estimate_id)

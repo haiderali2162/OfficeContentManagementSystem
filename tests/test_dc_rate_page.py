@@ -376,7 +376,7 @@ def test_primary_filters_and_collapsed_extended_filters_are_present(monkeypatch)
     assert {"Qanoongoi", "Mauza", "Square no.", "Kila no.", "Khasra no."} <= text_labels
     assert {"Rate unit", "Schedule"} <= labels
     autocompletes = [control for control in controls if isinstance(control, ft.AutoComplete)]
-    assert len(autocompletes) == 9
+    assert len(autocompletes) == 10  # + revenue circle filter
     schedule = next(control for control in controls if isinstance(control, ft.Dropdown) and control.label == "Schedule")
     assert [option.key for option in schedule.options] == ["dc_rural", "dc_urban", "fbr", "all"]
     search = next(control for control in controls if isinstance(control, ft.TextField)

@@ -2355,3 +2355,69 @@ def test_list_dc_rates_filters_by_extended_location_fields(rate_database):
     # Wildcards work like everywhere else.
     assert [r["id"] for r in dc_rate_service.list_dc_rates(tehsil="Tehsil ?")] == [rural_id]
     assert dc_rate_service.list_dc_rates(district="Nothing") == []
+
+
+def test_partial_text_matches_without_wildcards(rate_database):
+    """Typing "shei" finds "Sheikhupura" — contains search needs no wildcard.
+
+    Wildcard terms (*, ?) and plain partial text both work in every
+    location field (developer item 3).
+    """
+    location_id, _created = dc_rate_service.create_location(**_location_values(
+        name="Farm One", mauza="Chak 1", land_type="rural",
+        district="Sheikhupura", tehsil="Sheikhupura",
+        committee_town="Kamoke", property_area="Sector 7",
+        revenue_circle="Circle 3",
+    ))
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+
+    for field, term in (
+        ("district", "shei"), ("tehsil", "Shei"),
+        ("committee_town", "kamo"), ("property_area", "ctor"),
+        ("revenue_circle", "cle 3"),
+    ):
+        matches = dc_rate_service.list_dc_rates(**{field: term})
+        assert [r["id"] for r in matches] == [location_id], field
+
+    # The same fields honour traditional wildcards too.
+    matches = dc_rate_service.list_dc_rates(tehsil="Shei*ura")
+    assert [r["id"] for r in matches] == [location_id]
+    matches = dc_rate_service.list_dc_rates(tehsil="Sheikhupur?")
+    assert [r["id"] for r in matches] == [location_id]
+
+
+def test_manual_per_column_values_fill_missing_district_and_tehsil(rate_database):
+    """A sheet without District/Tehsil gets them from typed manual values.
+
+    The import dialog appends a virtual column per checked field (or
+    overwrites the mapped column); this test reproduces that shape directly.
+    """
+    headers = ["Qanoongoi", "Mauza", "Classification", "Location",
+               "Square No", "Killa No", "DC Rate", "Unit"]
+    row = ["Qanoongoi A", "Mauza A", "Agricultural", "Farm", "23", "6", "66650", "per_marla"]
+    mapping = dc_rate_service.suggested_column_mapping(headers)
+    assert "district" not in mapping and "tehsil" not in mapping
+
+    # The dialog's manual-value application: virtual columns appended.
+    effective_headers = list(headers) + ["District", "Tehsil"]
+    effective_rows = [row + ["Sheikhupura", "Sheikhupura"]]
+    effective_mapping = {**mapping, "district": len(headers), "tehsil": len(headers) + 1}
+
+    preview = dc_rate_service.preview_mapped_schedule(
+        effective_headers, effective_rows, effective_mapping, "rural_dc",
+        duplicate_rule="default:rural_dc_overlap", storage_mode="individual",
+    )
+    assert preview["issues"] == []
+    record = preview["valid_records"][0]["location"]
+    assert record["district"] == "Sheikhupura"
+    assert record["tehsil"] == "Sheikhupura"
+    assert record["square_no"] == "23"
+    assert dc_rate_service.import_dc_rate_records(
+        preview["valid_records"], duplicate_rule="default:rural_dc_overlap",
+        storage_mode="individual",
+    )["imported_count"] == 1
+    persisted = dc_rate_service.list_dc_rates(
+        tehsil="Sheikhupura", square_no="23"
+    )
+    assert len(persisted) == 1
+    assert persisted[0]["district"] == "Sheikhupura"
