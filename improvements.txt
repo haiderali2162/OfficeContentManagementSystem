@@ -1,0 +1,7 @@
+on the calculate tab of the "valuaiton & taxes" page i encountered the following logical errors.
+	1. on the urban side, i searched a urban dc and then fbr rate and then calculated the schedule. it calculated all the the schedule on the urban dc rate.
+		i. it must calculate 236k and 236c fees on the found fbr shedule.
+		ii. if fbr schedule is not found then only it calculate the fees on the dc rate which is found.
+	2. other bug is that when i started the second registry entry, it keept the previous fbr schedule in calculation and did not calcualted the fee against the newly found shedule. i think it did not picked the area i entered so fix this bug also.
+	3. also provide a clear all fields button so that i can easily clear all fields.
+	4. make every section collapsable/exapndable.

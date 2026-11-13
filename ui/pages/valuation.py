@@ -391,27 +391,47 @@ def build_valuation_page(
     )
     fbr_search_rows: dict[str, dict[str, Any]] = {}
     fbr_search_pin: dict[str, Any] | None = None
+    fbr_search_body = ft.Column([
+        ft.Text(
+            "The FBR schedule sheet is keyed by its own columns. Search it "
+            "directly here; the matched rate is used for the FBR valuation "
+            "and the 236C/236K fees.",
+            size=11, color="#64748B",
+        ),
+        ft.Row([
+            ft.Column([ft.Text("Revenue circle"), fbr_search_circle], spacing=2),
+            ft.Column([ft.Text("Property area"), fbr_search_area], spacing=2),
+            ft.Column([ft.Text("Classification"), fbr_search_classification], spacing=2),
+        ], wrap=True, spacing=6),
+        ft.Row([
+            ft.Column([ft.Text("Location"), fbr_search_location], spacing=2),
+            ft.Column([ft.Text("Location square no."), fbr_search_square], spacing=2),
+            fbr_search_button,
+        ], wrap=True, spacing=6),
+        fbr_search_status,
+        fbr_search_result,
+    ], spacing=6)
+    fbr_search_toggle_icon = ft.IconButton(
+        icon=ft.Icons.EXPAND_LESS, tooltip="Collapse or expand this section",
+    )
+
+    def toggle_fbr_search_section(_=None):
+        fbr_search_body.visible = not fbr_search_body.visible
+        fbr_search_toggle_icon.icon = (
+            ft.Icons.EXPAND_MORE if not fbr_search_body.visible
+            else ft.Icons.EXPAND_LESS
+        )
+        page.update()
+
+    fbr_search_toggle_icon.on_click = toggle_fbr_search_section
     fbr_search_section = ft.Container(
         ft.Column([
-            ft.Text("Find FBR schedule (extended search)", size=13, weight=ft.FontWeight.BOLD, color="#1E293B"),
-            ft.Text(
-                "The FBR schedule sheet is keyed by its own columns. Search it "
-                "directly here; the matched rate is used for the FBR valuation "
-                "and the 236C/236K fees.",
-                size=11, color="#64748B",
-            ),
             ft.Row([
-                ft.Column([ft.Text("Revenue circle"), fbr_search_circle], spacing=2),
-                ft.Column([ft.Text("Property area"), fbr_search_area], spacing=2),
-                ft.Column([ft.Text("Classification"), fbr_search_classification], spacing=2),
-            ], wrap=True, spacing=6),
-            ft.Row([
-                ft.Column([ft.Text("Location"), fbr_search_location], spacing=2),
-                ft.Column([ft.Text("Location square no."), fbr_search_square], spacing=2),
-                fbr_search_button,
-            ], wrap=True, spacing=6),
-            fbr_search_status,
-            fbr_search_result,
+                ft.Text("Find FBR schedule (extended search)", size=13,
+                        weight=ft.FontWeight.BOLD, color="#1E293B", expand=True),
+                fbr_search_toggle_icon,
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            fbr_search_body,
         ], spacing=6),
         padding=12,
         bgcolor="#F8FAFC",
@@ -930,6 +950,11 @@ def build_valuation_page(
         page.update()
 
     def refresh_location_state(_=None):
+        # Any location change starts a new search context: a previously
+        # pinned extended-search FBR rate must not leak into the next
+        # registry entry (developer bug report 2).
+        nonlocal fbr_search_pin
+        fbr_search_pin = None
         schedule_location_hint_refresh()
         refresh_rate_matches()
 
@@ -1101,15 +1126,21 @@ def build_valuation_page(
             ft.dropdown.Option(str(row["id"]), _rate_label(row)) for row in rows
         ]
         fbr_search_result.visible = bool(rows)
+        if not rows:
+            # A search that finds nothing clears a previously pinned rate so
+            # the calculation falls back to the found DC rate (developer
+            # request: FBR first, DC only as fallback).
+            nonlocal fbr_search_pin
+            fbr_search_pin = None
+            fbr_search_result.value = None
+            fbr_search_status.value = "No FBR schedule matched those fields."
+            page.update()
+            return
         if len(rows) == 1:
             fbr_search_result.value = str(rows[0]["id"])
         elif fbr_search_result.value not in {str(row["id"]) for row in rows}:
             fbr_search_result.value = None
-        fbr_search_status.value = (
-            f"{len(rows)} FBR schedule(s) found."
-            if rows else
-            "No FBR schedule matched those fields."
-        )
+        fbr_search_status.value = f"{len(rows)} FBR schedule(s) found."
         if len(rows) == 1:
             # A single match is used immediately (same auto-select rule as
             # the unit/rate menus); several matches wait for the user pick.
@@ -1421,6 +1452,59 @@ def build_valuation_page(
         result_panel.controls.extend(ft.Text(line, size=12, color="#64748B") for line in charges.get("explanation", []))
         result_panel.update()
 
+    def clear_all_fields(_=None):
+        """Clear every input on the Calculate tab for the next registry entry.
+
+        Location fields, area, written value, rate menus, parties, advanced
+        inputs, custom fields, and the extended FBR finder all reset; the
+        location draft is cleared too so re-entering the tab cannot bring
+        the cleared values back (developer request 3).
+        """
+        nonlocal fbr_search_pin
+        fbr_search_pin = None
+        text_controls = (
+            district, tehsil, qanoongoi, mauza, schedule_location,
+            square_no, kila_no, khasra_no, town, revenue_circle,
+            property_area, area_value, registry_written_value, location_search,
+            classification,
+        )
+        for control in text_controls:
+            control.value = ""
+        for control in (district, tehsil, qanoongoi, mauza,
+                        square_no, kila_no, khasra_no):
+            control.suggestions = []
+        location_match.value = None
+        location_match.options = []
+        for field in fbr_search_circle, fbr_search_area, fbr_search_location, fbr_search_square:
+            field.value = ""
+            field.suggestions = []
+        fbr_search_result.value = None
+        fbr_search_result.options = []
+        fbr_search_result.visible = False
+        fbr_search_status.value = ""
+        party_rows.clear()
+        _append_party_row(role_value="buyer")
+        _append_party_row(role_value="seller")
+        _render_party_rows()
+        client.value = "none"
+        constructed.value = False
+        building_material_value.value = "0"
+        transaction_type.value = "sale"
+        floor.value = ""
+        marla_setting.value = "272"
+        for field in custom_field_inputs.values():
+            field.value = ""
+        form_error.value = ""
+        last_calculation.clear()
+        _reset_result_panel()
+        # The draft cache must not restore the cleared values on rebuild.
+        _LOCATION_DRAFT.clear()
+        switch_property_profile()
+        status.value = "All fields cleared for the next registry entry."
+        page.update()
+
+    clear_all_button = ft.OutlinedButton("Clear all fields", on_click=clear_all_fields)
+
     def calculate(_):
         form_error.value = ""
         last_calculation.clear()
@@ -1583,6 +1667,32 @@ def build_valuation_page(
                         raise ValueError(f"Custom field '{field.label}' must be a valid number.") from None
             context.update(custom_values)
             rules = list_tax_fee_rules()
+            # Urban 236C/236K basis (developer request): when an FBR schedule
+            # was found for an urban deed, the 236C/236K rules calculate
+            # against the FBR valuation; only when no FBR schedule was found
+            # do they fall back to the found DC rate. The adjustment is made
+            # at calculation time — the saved rule data is never rewritten,
+            # and the charge snapshot records the base actually used.
+            if property_profile.value == "urban" and fbr_rate is not None:
+                adjusted_rules = []
+                for rule in rules:
+                    if str(rule.get("category") or "").casefold() in {"236c", "236k"}:
+                        adjusted = dict(rule)
+                        try:
+                            conditions = json.loads(
+                                rule.get("eligibility_conditions_json") or "{}"
+                            )
+                        except (ValueError, TypeError):
+                            conditions = {}
+                        if isinstance(conditions, dict) and conditions.get("base") != "fbr_value":
+                            conditions["base"] = "fbr_value"
+                            adjusted["eligibility_conditions_json"] = json.dumps(
+                                conditions, sort_keys=True
+                            )
+                        adjusted_rules.append(adjusted)
+                    else:
+                        adjusted_rules.append(rule)
+                rules = adjusted_rules
             # Both values are available to rules; each rule explicitly picks
             # DC or FBR as its calculation base. Registry formulas use the same
             # separated context and save their expression/source snapshots.
@@ -1984,6 +2094,10 @@ def build_valuation_page(
         # so rural FBR fees can calculate.
         # The extended FBR finder is an urban tool (developer request).
         fbr_search_section.visible = not is_rural
+        # Switching rural/urban starts a new search context: drop any pinned
+        # extended-search rate (developer bug report 2).
+        nonlocal fbr_search_pin
+        fbr_search_pin = None
         refresh_rate_matches()
 
     advanced_button.on_click = toggle_advanced_inputs
@@ -2001,75 +2115,85 @@ def build_valuation_page(
         expand=False,
     )
 
+    # Every input section is collapsible/expandable (developer request 4).
+    def make_collapsible_card(title: str, body_controls: list, *, visible: bool = True):
+        body = ft.Column(body_controls, spacing=10)
+        toggle_icon = ft.IconButton(
+            icon=ft.Icons.EXPAND_LESS,
+            tooltip="Collapse or expand this section",
+        )
+
+        def toggle(_=None):
+            body.visible = not body.visible
+            toggle_icon.icon = (
+                ft.Icons.EXPAND_MORE if not body.visible else ft.Icons.EXPAND_LESS
+            )
+            page.update()
+
+        toggle_icon.on_click = toggle
+        header = ft.Row(
+            [ft.Text(title, size=15, weight=ft.FontWeight.BOLD, color="#1E293B", expand=True),
+             toggle_icon],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        return ft.Container(
+            ft.Column([header, body], spacing=8),
+            padding=14,
+            bgcolor="#FFFFFF",
+            border=ft.Border.all(1, "#E2E8F0"),
+            border_radius=10,
+            visible=visible,
+        )
+
     estimate_form = ft.Column([
         ft.Text("Estimate inputs", size=19, weight=ft.FontWeight.BOLD),
         ft.Text("Choose Rural or Urban, enter schedule-backed location details, then enter the area in K-M-F format. Matching DC and FBR rates are fetched from saved schedules.", size=12, color="#9A3412"),
-        ft.Container(
-            ft.Column([
-                ft.Text("Property Profile & Location", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
-                # Display-mode radio sits at the top, right after the
-                # Rural/Urban choice and a vertical divider (developer
-                # request); it stays disabled until a Mauza matches. The
-                # combined Square/Kila search box is opt-in via checkbox.
-                ft.Row([property_profile, schedule_display_divider, schedule_display,
-                        combined_search_toggle],
-                       wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                schedule_display_warning,
-                suggestions_status,
-                location_fields_row,
-                location_match,
-                location_search,
-                ft.Row([rate_match_status, location_refresh_button],
-                       wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ], spacing=10),
-            padding=14,
-            bgcolor="#FFFFFF",
-            border=ft.Border.all(1, "#E2E8F0"),
-            border_radius=10,
-        ),
-        ft.Container(
-            ft.Column([
-                ft.Text("Valuation Rates & Area", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
-                ft.ResponsiveRow([
-                    ft.Container(dc_rate_unit, col={"xs": 12, "md": 4}),
-                    ft.Container(dc_rate_choice, col={"xs": 12, "md": 8}),
-                    ft.Container(fbr_rate_unit, col={"xs": 12, "md": 4}),
-                    ft.Container(fbr_rate_choice, col={"xs": 12, "md": 8}),
-                    ft.Container(area_value, col={"xs": 12, "md": 4}),
-                    # Optional written amount drives the under-valuation check
-                    # (deficient amount) and the written-value fee comparison.
-                    ft.Container(registry_written_value, col={"xs": 12, "md": 4}),
-                ], run_spacing=8),
-            ], spacing=10),
-            padding=14,
-            bgcolor="#FFFFFF",
-            border=ft.Border.all(1, "#E2E8F0"),
-            border_radius=10,
-        ),
+        make_collapsible_card("Property Profile & Location", [
+            # Display-mode radio sits at the top, right after the
+            # Rural/Urban choice and a vertical divider (developer
+            # request); it stays disabled until a Mauza matches. The
+            # combined Square/Kila search box is opt-in via checkbox.
+            ft.Row([property_profile, schedule_display_divider, schedule_display,
+                    combined_search_toggle],
+                   wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            schedule_display_warning,
+            suggestions_status,
+            location_fields_row,
+            location_match,
+            location_search,
+            ft.Row([rate_match_status, location_refresh_button],
+                   wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ]),
+        make_collapsible_card("Valuation Rates & Area", [
+            ft.ResponsiveRow([
+                ft.Container(dc_rate_unit, col={"xs": 12, "md": 4}),
+                ft.Container(dc_rate_choice, col={"xs": 12, "md": 8}),
+                ft.Container(fbr_rate_unit, col={"xs": 12, "md": 4}),
+                ft.Container(fbr_rate_choice, col={"xs": 12, "md": 8}),
+                ft.Container(area_value, col={"xs": 12, "md": 4}),
+                # Optional written amount drives the under-valuation check
+                # (deficient amount) and the written-value fee comparison.
+                ft.Container(registry_written_value, col={"xs": 12, "md": 4}),
+            ], run_spacing=8),
+        ]),
         fbr_search_section,
-        ft.Container(
-            ft.Column([
-                ft.Text("Buyers & sellers (deed parties)", size=15, weight=ft.FontWeight.BOLD, color="#1E293B"),
-                ft.Text(
-                    "Add each buyer and seller with their own area share and tax status. "
-                    "Areas accept 2-5-0, 10k5m, 5m, or 100f (a plain number means kanal). "
-                    "Taxes that depend on filer status are calculated per party on that party's share.",
-                    size=12, color="#64748B",
-                ),
-                party_rows_column,
-                ft.Row([ft.OutlinedButton("+ Add party", on_click=_add_party)], wrap=True, spacing=8),
-            ], spacing=8),
-            padding=14,
-            bgcolor="#FFFFFF",
-            border=ft.Border.all(1, "#E2E8F0"),
-            border_radius=10,
-        ),
+        make_collapsible_card("Buyers & sellers (deed parties)", [
+            ft.Text(
+                "Add each buyer and seller with their own area share and tax status. "
+                "Areas accept 2-5-0, 10k5m, 5m, or 100f (a plain number means kanal). "
+                "Taxes that depend on filer status are calculated per party on that party's share.",
+                size=12, color="#64748B",
+            ),
+            party_rows_column,
+            ft.Row([ft.OutlinedButton("+ Add party", on_click=_add_party)], wrap=True, spacing=8),
+        ]),
         advanced_button,
         advanced_inputs,
         custom_field_controls,
         ft.Row([
             ft.Button("Calculate estimate", on_click=calculate),
             ft.OutlinedButton("Save estimate", on_click=save_current),
+            clear_all_button,
         ], wrap=True, spacing=8),
         ft.Row([
             ft.Text("Export current result:", size=12, color="#475569"),

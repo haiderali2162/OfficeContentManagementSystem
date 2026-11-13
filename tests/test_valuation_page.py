@@ -1679,3 +1679,184 @@ def test_urban_extended_fbr_finder_selects_the_fbr_rate(monkeypatch):
     assert fbr_unit.value == "per_square_foot"
     assert fbr_rate.value == "31"
 
+
+
+
+def test_urban_236_fees_use_the_found_fbr_schedule(monkeypatch):
+    """Urban: 236C/236K rules calculate on FBR when found, else on the DC rate."""
+    matches = [_location_row(7, property_area="Sector C", name="Market Block")]
+    fbr_row = {
+        "id": 31, "location_id": 9, "schedule_type": "fbr",
+        "rate_unit": "per_square_foot", "rate_value": "300",
+        "classification": "Commercial", "property_type": "Commercial",
+        "mauza": "Market Block", "effective_from": valuation.date(2020, 1, 1),
+        "effective_to": None, "revenue_circle": "Circle C",
+        "property_area": "Sector C", "locality": "Market Road", "square_no": "22",
+    }
+    _patch_estimate_services(monkeypatch, matches=matches, rates={"dc": [_dc_rate(11, 7)]})
+    monkeypatch.setattr(
+        valuation, "list_dc_rates",
+        lambda **kwargs: (
+            [fbr_row] if kwargs.get("schedule_type") == "fbr"
+            else ([_dc_rate(11, 7)] if kwargs.get("schedule_type") == "dc" else [])
+        ),
+    )
+
+    captured = {}
+
+    def fake_party_charges(*, rules, transaction_date, context, parties, jurisdiction):
+        captured["rules"] = rules
+        captured["context"] = context
+        return {"charges": [], "totals_by_currency": {}, "total_charges": Decimal("0"),
+                "total_currency": "PKR", "warnings": [], "skipped_rules": []}
+
+    monkeypatch.setattr(valuation, "calculate_charges_for_parties", fake_party_charges)
+    # 236K rule saved with the old dc_value base; another rule stays on DC.
+    rules = [
+        {"id": 5, "name": "236K (Active filer)", "category": "236k",
+         "calculation_method": "percentage", "rate_value": "1.25",
+         "currency_code": "PKR", "verification_status": "unverified",
+         "eligibility_conditions_json": json.dumps(
+             {"base": "dc_value", "payer": "buyer",
+              "when": {"buyer_filer_status": "ATL"}})},
+        {"id": 6, "name": "Stamp fee", "category": "stamp_fee",
+         "calculation_method": "percentage", "rate_value": "1",
+         "currency_code": "PKR", "verification_status": "unverified",
+         "eligibility_conditions_json": json.dumps(
+             {"base": "dc_value", "payer": "buyer"})},
+    ]
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda: rules)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    profile = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.RadioGroup)
+                   and any(isinstance(radio, ft.Radio) and radio.value == "rural"
+                           for radio in walk_controls(control)))
+    profile.value = "urban"
+    profile.on_change(SimpleNamespace(control=profile))
+    # Urban lookup keys on Property area (or Town).
+    property_area_field = _auto(controls, "property_area")
+    property_area_field.value = "Sector C"
+    property_area_field.on_change(SimpleNamespace(control=property_area_field))
+    area = next(control for control in walk_controls(root)
+                if isinstance(control, ft.TextField)
+                and control.label == "Area (K-M-F or 10k5m)")
+    area.value = "0-20-0"
+
+    # Case 1: an FBR schedule is found (extended search pin) -> 236K on FBR.
+    fbr_row_found = dict(fbr_row, location_id=7)
+    valuation_search = [
+        control for control in walk_controls(root)
+        if isinstance(control, ft.OutlinedButton)
+        and getattr(control, "content", None) == "Search FBR schedule"
+    ]
+    assert valuation_search, "FBR finder search button missing"
+    monkeypatch.setattr(
+        valuation, "list_dc_rates",
+        lambda **kwargs: (
+            [fbr_row_found] if kwargs.get("schedule_type") == "fbr"
+            else ([_dc_rate(11, 7)] if kwargs.get("schedule_type") == "dc" else [])
+        ),
+    )
+    valuation_search[0].on_click(SimpleNamespace(control=valuation_search[0]))
+    button = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+    bases = {}
+    for rule in captured["rules"]:
+        conditions = json.loads(rule["eligibility_conditions_json"])
+        bases[rule["category"]] = conditions.get("base")
+    assert bases["236k"] == "fbr_value"
+    assert bases["stamp_fee"] == "dc_value"
+    assert captured["context"]["fbr_value"] is not None
+
+    # Case 2: a new search finds no FBR schedule (which clears the pinned
+    # rate) -> 236K falls back to the DC-rate base.
+    captured.clear()
+    monkeypatch.setattr(
+        valuation, "list_dc_rates",
+        lambda **kwargs: [] if kwargs.get("schedule_type") == "fbr" else [_dc_rate(11, 7)],
+    )
+    valuation_search[0].on_click(SimpleNamespace(control=valuation_search[0]))
+    button.on_click(SimpleNamespace(control=button))
+    bases = {}
+    for rule in captured["rules"]:
+        conditions = json.loads(rule["eligibility_conditions_json"])
+        bases[rule["category"]] = conditions.get("base")
+    assert bases["236k"] == "dc_value"
+    assert bases["stamp_fee"] == "dc_value"
+
+
+def test_fbr_pin_clears_when_location_changes(monkeypatch):
+    """A pinned extended-search rate never leaks into the next entry."""
+    matches = [_location_row(7)]
+    fbr_row = {
+        "id": 31, "location_id": 9, "schedule_type": "fbr",
+        "rate_unit": "per_square_foot", "rate_value": "300",
+        "classification": "Commercial", "property_type": "Commercial",
+        "mauza": "Market Block", "effective_from": valuation.date(2020, 1, 1),
+        "effective_to": None, "revenue_circle": "Circle C",
+        "property_area": "Sector C", "locality": "Market Road", "square_no": "22",
+    }
+    _patch_estimate_services(monkeypatch, matches=matches, rates={"dc": [_dc_rate(11, 7)]})
+    monkeypatch.setattr(
+        valuation, "list_dc_rates",
+        lambda **kwargs: [fbr_row] if kwargs.get("schedule_type") == "fbr" else [],
+    )
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    profile = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.RadioGroup)
+                   and any(isinstance(radio, ft.Radio) and radio.value == "rural"
+                           for radio in walk_controls(control)))
+    profile.value = "urban"
+    profile.on_change(SimpleNamespace(control=profile))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    search_button = next(control for control in walk_controls(root)
+                         if isinstance(control, ft.OutlinedButton)
+                         and getattr(control, "content", None) == "Search FBR schedule")
+    search_button.on_click(SimpleNamespace(control=search_button))
+    fbr_rate = _dropdown(controls, "Matched FBR rate (editable)")
+    assert fbr_rate.value == "31"
+
+    # Changing the location context clears the pin: the FBR menu rebuilds
+    # from the new context and the found rate is not force-selected.
+    mauza.value = "Other"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    assert fbr_rate.value is None
+
+
+def test_clear_all_fields_resets_everything(monkeypatch):
+    matches = [_location_row(7)]
+    _patch_estimate_services(monkeypatch, matches=matches, rates={"dc": [_dc_rate(11, 7)]})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    area = next(control for control in walk_controls(root)
+                if isinstance(control, ft.TextField)
+                and control.label == "Area (K-M-F or 10k5m)")
+    area.value = "0-20-0"
+    clear_button = next(control for control in walk_controls(root)
+                        if isinstance(control, ft.OutlinedButton)
+                        and getattr(control, "content", None) == "Clear all fields")
+    clear_button.on_click(SimpleNamespace(control=clear_button))
+
+    assert mauza.value == ""
+    assert area.value == ""
+    assert _form_error(root).value == ""
+    texts = [control.value for control in walk_controls(root)
+             if isinstance(control, ft.Text) and control.value]
+    assert any("All fields cleared" in text for text in texts)
+
