@@ -1,7 +1,16 @@
+import sys
 from pathlib import Path
 
 # Project root directory.
-BASE_DIR = Path(__file__).resolve().parent.parent
+# In a PyInstaller standalone build (onefile/onedir) module files live in a
+# temporary extraction folder (sys._MEIPASS) that is wiped on exit, so the
+# database must live NEXT TO THE EXECUTABLE instead. In normal runs the
+# project root stays the repo folder (developer request: the portable app
+# creates and keeps its own SQLite file where the portable file lives).
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Local application data directory.
 DATA_DIR = BASE_DIR / "data"

@@ -17,6 +17,11 @@ from typing import Any, Callable
 
 import flet as ft
 
+# Static import (do not use __import__ here): PyInstaller's dependency scan
+# misses dynamic imports, which broke the standalone .exe with
+# "No module named 'ui.pages.dc_rates'".
+from ui.pages import dc_rates as _dc_rates_page_module
+
 from core.area_engine import (
     AreaError,
     AreaSettings,
@@ -2935,7 +2940,7 @@ def build_valuation_page(
     # Keep the schedule tab truly lazy: its first query starts only when the
     # user selects it, so valuation-page navigation has no competing I/O.
     rate_page_loader: dict[str, Any] = {}
-    rates_page = __import__("ui.pages.dc_rates", fromlist=["build_dc_rates_page"]).build_dc_rates_page(
+    rates_page = _dc_rates_page_module.build_dc_rates_page(
         page,
         defer_initial_load=True,
         on_load_ready=lambda loader: rate_page_loader.update(load=loader),
