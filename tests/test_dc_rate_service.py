@@ -2421,3 +2421,35 @@ def test_manual_per_column_values_fill_missing_district_and_tehsil(rate_database
     )
     assert len(persisted) == 1
     assert persisted[0]["district"] == "Sheikhupura"
+
+
+def test_saved_schedule_lookup_round_trip_and_multi_row(monkeypatch, tmp_path):
+    """Khewat schedule lookups: save several rows, recall by khewat no."""
+    from services import schedule_lookup_service
+
+    saved = {}
+    monkeypatch.setattr(schedule_lookup_service, "get_setting", lambda key, default=None: saved.get(key, default))
+    monkeypatch.setattr(schedule_lookup_service, "set_setting",
+                        lambda key, value: saved.__setitem__(key, value))
+
+    entry_one = {
+        "land_type": "rural", "mauza": "Anmba", "square_no": "23", "kila_no": "6",
+        "dc_rate_id": 319439, "fbr_rate_id": None,
+    }
+    stored = schedule_lookup_service.save_schedule_lookup("K-101", entry_one)
+    assert stored == 1
+
+    entry_two = dict(entry_one, square_no="24", kila_no="7", dc_rate_id=319440)
+    stored = schedule_lookup_service.save_schedule_lookup(" K-101 ", entry_two)
+    assert stored == 2  # several schedule rows under one khewat number
+
+    rows = schedule_lookup_service.list_schedule_lookups("k-101")
+    assert [row["square_no"] for row in rows] == ["23", "24"]
+
+    assert schedule_lookup_service.list_schedule_lookups("K-999") == []
+
+    import pytest
+    with pytest.raises(schedule_lookup_service.ScheduleLookupError):
+        schedule_lookup_service.save_schedule_lookup("  ", entry_one)
+    with pytest.raises(schedule_lookup_service.ScheduleLookupError):
+        schedule_lookup_service.list_schedule_lookups("")

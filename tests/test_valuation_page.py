@@ -1625,8 +1625,26 @@ def test_written_value_produces_fee_comparison(monkeypatch):
              if isinstance(control, ft.Text) and control.value]
     assert any("Fee comparison" in text for text in texts)
     assert any("On written value" in text for text in texts)
-    # PKR 1.00 on the calculated base vs PKR 0.50 on the written base.
+    assert any("Difference (deficient)" in text for text in texts)
+    # PKR 1.00 on the calculated base vs PKR 0.50 on the written base; the
+    # difference column shows the deficient 0.50.
     assert any("0.50" in text for text in texts)
+
+    # The written-column checkbox: unchecked, the written column computes
+    # the FBR-based rules on the DC schedule (the written value replaces
+    # the FBR base too); checked, they use the found FBR valuation.
+    captured_contexts.clear()
+    checkbox = next(control for control in walk_controls(root)
+                    if isinstance(control, ft.Checkbox)
+                    and "Written column on FBR schedule" in (control.label or ""))
+    checkbox.value = True
+    button.on_click(SimpleNamespace(control=button))
+    checked_fbr = captured_contexts[-1]["fbr_value"]
+    checkbox.value = False
+    button.on_click(SimpleNamespace(control=button))
+    unchecked_fbr = captured_contexts[-1]["fbr_value"]
+    assert checked_fbr is None                # the found FBR valuation (absent)
+    assert unchecked_fbr == Decimal("50")     # the DC schedule on the written value
 
 
 def test_urban_extended_fbr_finder_selects_the_fbr_rate(monkeypatch):

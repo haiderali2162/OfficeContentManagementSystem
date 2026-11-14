@@ -29,15 +29,22 @@ from services.dc_rate_service import (
     clear_location_hint_cache,
     expand_references,
     find_schedule_location_matches,
+    get_dc_rate,
     list_dc_rates,
     list_location_hint_values,
     preload_location_dimensions,
+    search_khewats,
 )
 from services.estimate_service import (
     get_estimate,
     list_client_choices,
     list_estimates,
     save_estimate,
+)
+from services.schedule_lookup_service import (
+    ScheduleLookupError,
+    list_schedule_lookups,
+    save_schedule_lookup,
 )
 from services.tax_service import (
     TaxRuleError,
@@ -373,6 +380,14 @@ def build_valuation_page(
         ft.dropdown.Option("272", "272 sq ft"), ft.dropdown.Option("225", "225 sq ft")
     ])
     registry_written_value = ft.TextField(label="Registry written value (PKR)", width=230)
+    # Written-value comparison column basis (developer request 2.i): checked
+    # = the written column's FBR-based fees (236C/236K) use the found FBR
+    # schedule; unchecked = they use the DC schedule. Affects this column
+    # only.
+    written_fbr_toggle = ft.Checkbox(
+        label="Written column on FBR schedule",
+        value=False,
+    )
     # Urban extended FBR finder (developer request): the FBR schedule lives
     # on sibling rows keyed by its own columns, so it is searched directly
     # by revenue circle, property area, classification, location, and the
@@ -1229,6 +1244,8 @@ def build_valuation_page(
         fbr_field.on_change = lambda event: fbr_finder_hint_refresh()
         fbr_field.on_select = lambda event: fbr_finder_hint_refresh()
 
+
+
     def on_fbr_rate_choice_manual(_=None):
         """A manual pick in the FBR menu replaces the extended-search pin."""
         nonlocal fbr_search_pin
@@ -1405,6 +1422,13 @@ def build_valuation_page(
             for line in charges["charges"]:
                 key = _charge_key(line)
                 other = written_by_key.get(key)
+                written_amount = (
+                    other["amount"] if other else None
+                )
+                difference = (
+                    line["amount"] - written_amount
+                    if written_amount is not None else None
+                )
                 rows.append(ft.DataRow(cells=[
                     ft.DataCell(ft.Text(
                         f"{line['name']}"
@@ -1413,8 +1437,16 @@ def build_valuation_page(
                     )),
                     ft.DataCell(ft.Text(_money(line["amount"], line["currency_code"]), size=12)),
                     ft.DataCell(ft.Text(
-                        _money(other["amount"], other.get("currency_code", "PKR"))
+                        _money(written_amount, other.get("currency_code", "PKR"))
                         if other else "—", size=12,
+                    )),
+                    # Difference / deficient amount per charge: calculated
+                    # minus written (positive = deficient, developer request).
+                    ft.DataCell(ft.Text(
+                        _money(difference, line["currency_code"])
+                        if difference is not None else "—", size=12,
+                        weight=ft.FontWeight.BOLD if (difference or 0) > 0 else None,
+                        color="#B45309" if (difference or 0) > 0 else None,
                     )),
                 ]))
             rows.append(ft.DataRow(cells=[
@@ -1429,6 +1461,15 @@ def build_valuation_page(
                                in written_totals.items()) or "—",
                     weight=ft.FontWeight.BOLD, size=12,
                 )),
+                ft.DataCell(ft.Text(
+                    " · ".join(
+                        f"{currency}: {_money(charges['totals_by_currency'].get(currency, Decimal('0')) - written_totals.get(currency, Decimal('0')), currency)}"
+                        for currency in sorted(
+                            set(charges["totals_by_currency"]) | set(written_totals)
+                        )
+                    ) or "—",
+                    weight=ft.FontWeight.BOLD, size=12,
+                )),
             ]))
             result_panel.controls.append(ft.Text(
                 "Fee comparison (calculated valuation vs written value)",
@@ -1439,6 +1480,7 @@ def build_valuation_page(
                     ft.DataColumn(ft.Text("Charge", weight=ft.FontWeight.BOLD)),
                     ft.DataColumn(ft.Text("On calculated valuation", weight=ft.FontWeight.BOLD)),
                     ft.DataColumn(ft.Text("On written value", weight=ft.FontWeight.BOLD)),
+                    ft.DataColumn(ft.Text("Difference (deficient)", weight=ft.FontWeight.BOLD)),
                 ],
                 rows=rows, column_spacing=18,
             ))
@@ -1726,13 +1768,19 @@ def build_valuation_page(
             charges = compute_charges(context)
             # Second comparison base (developer request): the registry
             # written value. The same fees are computed against it so the
-            # result can show a side-by-side comparison.
+            # result can show a side-by-side comparison. A checkbox chooses
+            # whether the FBR-based rules (236C/236K) in THIS column use the
+            # found FBR schedule (checked) or the DC schedule (unchecked —
+            # the written value replaces the FBR base too); it affects this
+            # column only.
             written_base = valuation.get("registry_written_value")
             if written_base is not None:
                 written_context = dict(context)
                 written_context["dc_value"] = written_base
                 written_context["property_value"] = written_base
                 written_context["transferred_value"] = written_base
+                if not written_fbr_toggle.value:
+                    written_context["fbr_value"] = written_base
                 charges["charges_on_written_valuation"] = compute_charges(written_context)
             inputs = {
                 "location_id": int(dc_rate["location_id"]),
@@ -2145,9 +2193,287 @@ def build_valuation_page(
             visible=visible,
         )
 
+    # Khewat schedule lookup (developer request 3): save the searched
+    # schedule (location + selected DC/FBR rates, urban includes FBR) under
+    # a khewat number and recall it later without re-typing; several
+    # schedule rows may live under one khewat number. Each khewat belongs
+    # to a mauza, so the search can be scoped by mauza/district/tehsil,
+    # and khewats saved on the DC/FBR rates tab are offered here too
+    # (developer request, next batch: both stores have the same job).
+    khewat_no_field = ft.TextField(label="Khewat no.", width=180)
+    khewat_mauza_scope = ft.TextField(
+        label="Mauza (scopes the search)", width=190,
+    )
+    khewat_save_button = ft.OutlinedButton("Save current schedule")
+    khewat_load_button = ft.OutlinedButton("Load from khewat no.")
+    khewat_pick = ft.Dropdown(
+        label="Schedule rows under this khewat", expand=True, options=[],
+        visible=False, menu_height=180,
+    )
+    khewat_status = ft.Text("", size=11, color="#64748B")
+    khewat_section = make_collapsible_card("Khewat schedule lookup", [
+        ft.Text(
+            "Save the currently searched schedule (location fields + the "
+            "selected DC and FBR rates; urban stores the FBR too) under a "
+            "khewat number. Loading fills every field again; when several "
+            "schedule rows share a khewat no, pick the row to use. Khewats "
+            "saved on the DC / FBR rates tab are offered here as well.",
+            size=12, color="#64748B",
+        ),
+        ft.Row([khewat_no_field, khewat_mauza_scope, khewat_save_button,
+                khewat_load_button],
+               wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        khewat_pick,
+        khewat_status,
+    ])
+    _saved_fbr_rows: dict[str, dict[str, Any]] = {}
+
+    # Khewat schedule lookup handlers (developer request 3).
+    def _current_schedule_entry() -> dict[str, Any]:
+        """Snapshot the currently searched schedule for khewat storage."""
+        selected_dc = next((row for row in rate_records["dc"]
+                            if str(row["id"]) == dc_rate_choice.value), None)
+        selected_fbr = next((row for row in rate_records["fbr"]
+                             if str(row["id"]) == fbr_rate_choice.value), None)
+        if selected_dc is None:
+            raise ValueError(
+                "Calculate or select a DC schedule before saving it to a khewat."
+            )
+        return {
+            "land_type": property_profile.value,
+            "district": _text_value(district) or selected_dc.get("district"),
+            "tehsil": _text_value(tehsil) or selected_dc.get("tehsil"),
+            "qanoongoi": _text_value(qanoongoi) or selected_dc.get("qanoongoi"),
+            "mauza": _text_value(mauza) or selected_dc.get("mauza"),
+            "square_no": (square_no.value or "").strip() or None,
+            "kila_no": (kila_no.value or "").strip() or None,
+            "locality": _text_value(schedule_location) or selected_dc.get("locality"),
+            "committee_town": _text_value(town) or selected_dc.get("committee_town"),
+            "revenue_circle": (
+                _text_value(revenue_circle) or selected_dc.get("revenue_circle")
+                or (selected_fbr or {}).get("revenue_circle")
+            ),
+            "property_area": (
+                _text_value(property_area) or selected_dc.get("property_area")
+                or (selected_fbr or {}).get("property_area")
+            ),
+            "classification": effective_classification_value(),
+            "dc_rate_id": int(selected_dc["id"]) if selected_dc else None,
+            "dc_rate_label": _rate_label(selected_dc) if selected_dc else None,
+            "fbr_rate_id": int(selected_fbr["id"]) if selected_fbr else None,
+            "fbr_rate_label": _rate_label(selected_fbr) if selected_fbr else None,
+        }
+
+    def effective_classification_value() -> str | None:
+        value = classification.value
+        return value if value not in (None, "", "none") else None
+
+    def save_current_to_khewat(_=None):
+        number = (khewat_no_field.value or "").strip()
+        try:
+            entry = _current_schedule_entry()
+            stored = save_schedule_lookup(number, entry)
+        except (ScheduleLookupError, ValueError) as exc:
+            khewat_status.value = str(exc)
+            page.update()
+            return
+        khewat_status.value = (
+            f"Schedule saved under khewat {number} ({stored} row(s) stored)."
+        )
+        page.update()
+
+    def _apply_saved_lookup(entry: dict[str, Any]) -> None:
+        """Fill every field from a stored khewat row and select its rates."""
+        property_profile.value = entry.get("land_type") or "rural"
+        field_map = {
+            "district": district, "tehsil": tehsil, "qanoongoi": qanoongoi,
+            "mauza": mauza, "square_no": square_no, "kila_no": kila_no,
+            "locality": schedule_location, "committee_town": town,
+            "revenue_circle": revenue_circle, "property_area": property_area,
+        }
+        for key, control in field_map.items():
+            value = entry.get(key)
+            control.value = str(value) if value not in (None, "") else ""
+        switch_property_profile()
+        # Select the stored DC rate; fetch it if the candidate pool changed.
+        dc_id = entry.get("dc_rate_id")
+        if dc_id is not None:
+            row = next((r for r in rate_records["dc"]
+                        if str(r["id"]) == str(dc_id)), None)
+            if row is None:
+                fetched = get_dc_rate(int(dc_id))
+                if fetched is not None:
+                    rate_records["dc"] = [fetched]
+                    row = fetched
+            if row is not None:
+                dc_rate_choice.options = [
+                    ft.dropdown.Option(str(row["id"]), _rate_label(row))
+                ]
+                dc_rate_choice.value = str(row["id"])
+        # Same for the stored FBR rate (urban schedules).
+        fbr_id = entry.get("fbr_rate_id")
+        if fbr_id is not None:
+            row = next((r for r in rate_records["fbr"]
+                        if str(r["id"]) == str(fbr_id)), None)
+            if row is None:
+                fetched = get_dc_rate(int(fbr_id))
+                if fetched is not None:
+                    rate_records["fbr"] = [fetched]
+                    row = fetched
+            if row is not None:
+                unit = row.get("rate_unit") or ""
+                fbr_rate_unit.options = [
+                    ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit))
+                ] if unit else []
+                fbr_rate_unit.value = unit or None
+                fbr_rate_unit.visible = True
+                fbr_rate_choice.options = [
+                    ft.dropdown.Option(str(row["id"]), _rate_label(row))
+                ]
+                fbr_rate_choice.value = str(row["id"])
+                fbr_rate_choice.visible = True
+        khewat_status.value = (
+            "Loaded schedule row: "
+            + ", ".join(str(part) for part in (
+                entry.get("mauza"), entry.get("square_no"), entry.get("kila_no"),
+                entry.get("fbr_rate_id") and "FBR included",
+            ) if part)
+        )
+        page.update()
+
+    def load_from_khewat(_=None):
+        """Load a khewat: saved Calculate rows + DC/FBR-rates-tab khewats.
+
+        The khewat belongs to a mauza, so the search can be scoped by
+        mauza/district/tehsil (qanoongoi optional); entries from both
+        stores are offered in one picker (developer requests 1 and 2).
+        """
+        number = (khewat_no_field.value or "").strip()
+        mauza_scope = (khewat_mauza_scope.value or "").strip() or (
+            _text_value(mauza)
+        )
+        if not mauza_scope and not khewat_mauza_scope.value:
+            khewat_mauza_scope.value = mauza_scope
+        try:
+            entries = list_schedule_lookups(
+                number, mauza=mauza_scope,
+            )
+        except ScheduleLookupError as exc:
+            khewat_status.value = str(exc)
+            page.update()
+            return
+        choices: list[tuple[str, str, dict[str, Any]]] = []
+        for index, entry in enumerate(entries, start=1):
+            label = " · ".join(str(part) for part in (
+                f"Row {index}",
+                entry.get("district"),
+                entry.get("tehsil"),
+                entry.get("mauza"),
+                f"Square {entry.get('square_no')}" if entry.get("square_no") else None,
+                f"Kila {entry.get('kila_no')}" if entry.get("kila_no") else None,
+                "FBR" if entry.get("fbr_rate_id") else None,
+            ) if part)
+            choices.append((f"s:{index}", label, {"kind": "saved", "entry": entry}))
+        # Khewats saved on the DC / FBR rates tab share the same job: their
+        # mauza context and square/kila references are offered too.
+        try:
+            rates_khewats = search_khewats(khewat_number=number)
+        except Exception as exc:
+            rates_khewats = []
+            status.value = f"Could not load rates-tab khewats: {exc}"
+        for khewat in rates_khewats:
+            squares = [square for square in khewat.get("squares") or [] if square]
+            kilas = [kila for kila in khewat.get("kilas") or [] if kila]
+            base_label = " · ".join(str(part) for part in (
+                "Khewat record",
+                khewat.get("district"),
+                khewat.get("tehsil"),
+                khewat.get("qanoongoi"),
+                khewat.get("mauza_name"),
+            ) if part)
+            if squares and kilas:
+                pairs = [
+                    (square, kila) for square in squares for kila in kilas
+                ][:40]
+                for square, kila in pairs:
+                    choices.append((
+                        f"k:{khewat['id']}:{square}:{kila}",
+                        f"{base_label} · Square {square} · Kila {kila}",
+                        {
+                            "kind": "rates_khewat", "record": khewat,
+                            "square": square, "kila": kila,
+                        },
+                    ))
+            else:
+                choices.append((f"k:{khewat['id']}", base_label,
+                                {"kind": "rates_khewat", "record": khewat}))
+        if not choices:
+            khewat_status.value = (
+                f"No schedule rows or khewat records are stored under khewat {number}."
+            )
+            khewat_pick.options = []
+            khewat_pick.visible = False
+            page.update()
+            return
+        if len(choices) == 1:
+            _key, _label, payload = choices[0]
+            khewat_pick.visible = False
+            _apply_khewat_payload(payload)
+            return
+        khewat_pick.options = [
+            ft.dropdown.Option(key, label) for key, label, _payload in choices
+        ]
+        khewat_pick.value = None
+        khewat_pick.visible = True
+        _saved_fbr_rows.clear()
+        _saved_fbr_rows.update({key: payload for key, _label, payload in choices})
+        khewat_status.value = (
+            f"{len(choices)} schedule row(s) found for khewat {number}; "
+            "pick the row to load."
+        )
+        page.update()
+
+    def _apply_khewat_payload(payload: dict[str, Any]) -> None:
+        if payload.get("kind") == "saved":
+            _apply_saved_lookup(payload["entry"])
+            return
+        # A DC/FBR-rates-tab khewat: fill the mauza context and its
+        # square/kila pair, then the normal schedule flow finds the rates.
+        record = payload["record"]
+        property_profile.value = "rural"
+        mauza.value = str(record.get("mauza_name") or "")
+        district.value = str(record.get("district") or "")
+        tehsil.value = str(record.get("tehsil") or "")
+        qanoongoi.value = str(record.get("qanoongoi") or "")
+        square = payload.get("square")
+        kila = payload.get("kila")
+        square_no.value = str(square) if square else ""
+        kila_no.value = str(kila) if kila else ""
+        switch_property_profile()
+        khewat_status.value = (
+            "Loaded khewat record: "
+            + ", ".join(str(part) for part in (
+                record.get("mauza_name"),
+                f"Square {square}" if square else None,
+                f"Kila {kila}" if kila else None,
+            ) if part)
+            + ". The matching rates appear below."
+        )
+        page.update()
+
+    def pick_saved_khewat_row(_=None):
+        entry = _saved_fbr_rows.get(str(khewat_pick.value or ""))
+        if entry:
+            _apply_khewat_payload(entry)
+
+    khewat_save_button.on_click = save_current_to_khewat
+    khewat_load_button.on_click = load_from_khewat
+    khewat_pick.on_select = pick_saved_khewat_row
+    khewat_pick.on_change = pick_saved_khewat_row
     estimate_form = ft.Column([
         ft.Text("Estimate inputs", size=19, weight=ft.FontWeight.BOLD),
         ft.Text("Choose Rural or Urban, enter schedule-backed location details, then enter the area in K-M-F format. Matching DC and FBR rates are fetched from saved schedules.", size=12, color="#9A3412"),
+        khewat_section,
         make_collapsible_card("Property Profile & Location", [
             # Display-mode radio sits at the top, right after the
             # Rural/Urban choice and a vertical divider (developer
@@ -2173,7 +2499,8 @@ def build_valuation_page(
                 ft.Container(area_value, col={"xs": 12, "md": 4}),
                 # Optional written amount drives the under-valuation check
                 # (deficient amount) and the written-value fee comparison.
-                ft.Container(registry_written_value, col={"xs": 12, "md": 4}),
+                ft.Container(registry_written_value, col={"xs": 12, "md": 5}),
+                ft.Container(written_fbr_toggle, col={"xs": 12, "md": 3}),
             ], run_spacing=8),
         ]),
         fbr_search_section,

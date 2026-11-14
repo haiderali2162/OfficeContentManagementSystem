@@ -1208,13 +1208,19 @@ def _reference_tokens(values: Iterable[str]) -> set[str]:
 
     ``3/B`` and ``3b`` denote the same Kila in published schedules, so "3b"
     must find a stored ``3/B`` too. Pure digit tokens stay canonical.
+    Slash-combined values ("10/1", "1/2") additionally keep their written
+    form as a key, so typing the slashed form finds the stored slashed form
+    (developer report: "10/1, 10/2" pairs stopped matching).
     """
     keys: set[str] = set()
     for token in values:
-        key = str(token).casefold()
+        raw = str(token).strip().casefold()
+        key = raw
         if not key.isdigit():
             key = re.sub(r"[\s/\-]", "", key)
         keys.add(key)
+        if "/" in raw:
+            keys.add(raw)
     return keys
 
 
