@@ -2436,20 +2436,249 @@ def test_saved_schedule_lookup_round_trip_and_multi_row(monkeypatch, tmp_path):
         "land_type": "rural", "mauza": "Anmba", "square_no": "23", "kila_no": "6",
         "dc_rate_id": 319439, "fbr_rate_id": None,
     }
-    stored = schedule_lookup_service.save_schedule_lookup("K-101", entry_one)
-    assert stored == 1
+    result = schedule_lookup_service.save_schedule_lookup("K-101", entry_one)
+    assert result["status"] == "saved"
+    assert result["rows"] == 1
 
     entry_two = dict(entry_one, square_no="24", kila_no="7", dc_rate_id=319440)
-    stored = schedule_lookup_service.save_schedule_lookup(" K-101 ", entry_two)
-    assert stored == 2  # several schedule rows under one khewat number
+    result = schedule_lookup_service.save_schedule_lookup(" K-101 ", entry_two)
+    assert result["status"] == "saved"
+    assert result["rows"] == 2  # several schedule rows under one khewat number
 
     rows = schedule_lookup_service.list_schedule_lookups("k-101")
     assert [row["square_no"] for row in rows] == ["23", "24"]
 
     assert schedule_lookup_service.list_schedule_lookups("K-999") == []
 
+    # Saving the identical schedule again never adds a duplicate row.
+    result = schedule_lookup_service.save_schedule_lookup("k-101", entry_two)
+    assert result["status"] == "duplicate"
+    assert result["rows"] == 2
+
+    # Re-saving the same schedule row with a different rate pick refreshes
+    # the stored row in place instead of adding a second one.
+    result = schedule_lookup_service.save_schedule_lookup(
+        "K-101", dict(entry_one, dc_rate_id=319441)
+    )
+    assert result["status"] == "updated"
+    assert result["rows"] == 2
+    rows = schedule_lookup_service.list_schedule_lookups("K-101")
+    row_23 = next(row for row in rows if row["square_no"] == "23")
+    assert row_23["dc_rate_id"] == 319441
+
     import pytest
     with pytest.raises(schedule_lookup_service.ScheduleLookupError):
         schedule_lookup_service.save_schedule_lookup("  ", entry_one)
     with pytest.raises(schedule_lookup_service.ScheduleLookupError):
         schedule_lookup_service.list_schedule_lookups("")
+
+
+def test_saved_schedule_lookup_edit_delete_and_mauza_summary(monkeypatch, tmp_path):
+    """Saved rows can be edited and deleted; summaries group mauza-wise."""
+    from services import schedule_lookup_service
+
+    saved = {}
+    monkeypatch.setattr(schedule_lookup_service, "get_setting", lambda key, default=None: saved.get(key, default))
+    monkeypatch.setattr(schedule_lookup_service, "set_setting",
+                        lambda key, value: saved.__setitem__(key, value))
+
+    rural_a = {
+        "land_type": "rural", "district": "Sheikhupura", "tehsil": "Safdarabad",
+        "qanoongoi": "", "mauza": "Anmba", "square_no": "9", "kila_no": "2",
+        "dc_rate_id": 1, "fbr_rate_id": None,
+    }
+    rural_b = dict(rural_a, square_no="23", kila_no="6", dc_rate_id=2)
+    urban_c = dict(rural_a, mauza="Model Town", square_no=None, kila_no=None,
+                   locality="Main Bazar", dc_rate_id=3)
+    for entry in (rural_a, rural_b, urban_c):
+        schedule_lookup_service.save_schedule_lookup("K-101", entry)
+
+    summaries = schedule_lookup_service.summarize_schedule_lookups()
+    by_group = {(s["mauza"], s["khewat_no"]): s for s in summaries}
+    assert len(summaries) == 2
+    anmba = by_group[("Anmba", "K-101")]
+    assert anmba["rows"] == 2
+    assert anmba["lowest"] == "Square 9 · Kila 2"
+    assert anmba["highest"] == "Square 23 · Kila 6"
+    town = by_group[("Model Town", "K-101")]
+    assert town["rows"] == 1
+    assert town["lowest"] == "Main Bazar"
+
+    # Edit: move Square 23 to Square 30 under the same khewat.
+    old_fingerprint = schedule_lookup_service.row_fingerprint(rural_b)
+    edited = schedule_lookup_service.update_schedule_lookup(
+        "K-101", old_fingerprint, dict(rural_b, square_no="30"),
+    )
+    assert edited["square_no"] == "30"
+    rows = schedule_lookup_service.list_schedule_lookups("K-101", mauza="Anmba")
+    assert sorted(row["square_no"] for row in rows) == ["30", "9"]
+    # The old identity is gone, so deleting by it removes nothing.
+    assert schedule_lookup_service.delete_schedule_lookup(
+        "K-101", old_fingerprint
+    ) is False
+
+    # Editing into an identity that already exists is rejected.
+    with pytest.raises(schedule_lookup_service.ScheduleLookupError):
+        schedule_lookup_service.update_schedule_lookup(
+            "K-101", schedule_lookup_service.row_fingerprint(
+                dict(rural_b, square_no="30")
+            ),
+            dict(rural_a, dc_rate_id=999),
+        )
+
+    # Rename the khewat number through the edit dialog path.
+    schedule_lookup_service.update_schedule_lookup(
+        "K-101", schedule_lookup_service.row_fingerprint(urban_c),
+        dict(urban_c, khewat_no="K-202"),
+    )
+    assert schedule_lookup_service.list_schedule_lookups("K-202", mauza="Model Town")
+    assert not schedule_lookup_service.list_schedule_lookups("K-101", mauza="Model Town")
+
+    # Delete removes exactly the matching row.
+    fingerprint_a = schedule_lookup_service.row_fingerprint(rural_a)
+    assert schedule_lookup_service.delete_schedule_lookup("K-101", fingerprint_a)
+    rows = schedule_lookup_service.list_schedule_lookups("K-101")
+    assert [row["square_no"] for row in rows] == ["30"]
+    assert schedule_lookup_service.delete_schedule_lookup("K-101", fingerprint_a) is False
+
+
+def test_saved_lookup_summary_search_scopes(monkeypatch, tmp_path):
+    """The view-all dialog search narrows by khewat no and location fields."""
+    from services import schedule_lookup_service
+
+    saved = {}
+    monkeypatch.setattr(schedule_lookup_service, "get_setting", lambda key, default=None: saved.get(key, default))
+    monkeypatch.setattr(schedule_lookup_service, "set_setting",
+                        lambda key, value: saved.__setitem__(key, value))
+
+    # Two different mauzas that share the same khewat number.
+    schedule_lookup_service.save_schedule_lookup("K-101", {
+        "land_type": "rural", "district": "Sheikhupura", "tehsil": "Safdarabad",
+        "qanoongoi": "Q1", "mauza": "Anmba", "square_no": "9", "kila_no": "2",
+    })
+    schedule_lookup_service.save_schedule_lookup("K-101", {
+        "land_type": "rural", "district": "Lahore", "tehsil": "Model Town",
+        "qanoongoi": "Q2", "mauza": "Model Town", "locality": "Main Bazar",
+    })
+
+    everything = schedule_lookup_service.search_saved_lookups_summary()
+    assert len(everything) == 2  # no scopes: both mauzas show
+
+    # Same khewat number in two mauzas: mauza separates them.
+    found = schedule_lookup_service.search_saved_lookups_summary(
+        khewat_no="101", mauza="anmb",
+    )
+    assert [(s["mauza"], s["khewat_no"]) for s in found] == [("Anmba", "K-101")]
+
+    found = schedule_lookup_service.search_saved_lookups_summary(khewat_no="K-1")
+    assert {s["mauza"] for s in found} == {"Anmba", "Model Town"}
+
+    found = schedule_lookup_service.search_saved_lookups_summary(
+        district="laho", tehsil="model",
+    )
+    assert [(s["mauza"], s["district"]) for s in found] == [("Model Town", "Lahore")]
+
+    found = schedule_lookup_service.search_saved_lookups_summary(qanoongoi="q1")
+    assert [s["mauza"] for s in found] == ["Anmba"]
+
+    found = schedule_lookup_service.search_saved_lookups_summary(
+        khewat_no="K-101", mauza="Anmba", district="Lahore",
+    )
+    assert found == []  # scopes combine; this mauza is not in Lahore
+
+
+def test_saved_lookup_mirrors_rates_tab_khewat(monkeypatch, rate_database):
+    """Saving/deleting a rural row mirrors its Square/Kila in the khewat registry."""
+    from services import schedule_lookup_service
+
+    saved = {}
+    monkeypatch.setattr(schedule_lookup_service, "get_setting", lambda key, default=None: saved.get(key, default))
+    monkeypatch.setattr(schedule_lookup_service, "set_setting",
+                        lambda key, value: saved.__setitem__(key, value))
+
+    location_id, _ = dc_rate_service.create_location(**_location_values(
+        square_no="23", kila_no="6",
+    ))
+    # A second location of the same mauza provides Square 10 / Kila 2, the
+    # khewat's own pre-existing references (cadastral validation only sees
+    # locations that carry at least one rate).
+    second_id, _ = dc_rate_service.create_location(**_location_values(
+        square_no="10", kila_no="2",
+    ))
+    dc_rate_service.create_dc_rate(location_id=second_id, **_rate_values())
+    dc_rate_service.create_dc_rate(location_id=location_id, **_rate_values())
+    context = {
+        "province": "Punjab", "district": "Sample District",
+        "tehsil": "Sample Tehsil", "qanoongoi": "", "patwar_circle": "",
+        "mauza_name": "Sample Mauza", "hadbast_number": "123",
+    }
+    dc_rate_service.assign_cadastral_references_to_khewat(
+        context=context, khewat_number="K-5", rhz_year="2024-25",
+        khewat_size=None, square_numbers=["10"], kila_numbers=["2"],
+    )
+
+    entry = {
+        "land_type": "rural", "district": "", "tehsil": "", "qanoongoi": "",
+        "mauza": "Sample Mauza", "square_no": "23", "kila_no": "6",
+        "dc_rate_id": 1, "fbr_rate_id": None,
+    }
+    result = schedule_lookup_service.save_schedule_lookup("K-5", entry)
+    assert result["status"] == "saved"
+    note = schedule_lookup_service.sync_saved_lookup_to_registry("K-5", entry)
+    assert "mirrored" in note
+    records = dc_rate_service.search_khewats(khewat_number="K-5", mauza="Sample Mauza")
+    assert len(records) == 1
+    assert records[0]["squares"] == ["10", "23"]
+    assert records[0]["kilas"] == ["2", "6"]
+
+    # Deleting the saved row removes its references again (the khewat's
+    # own Square 10 / Kila 2 stay untouched).
+    fingerprint = schedule_lookup_service.row_fingerprint(entry)
+    assert schedule_lookup_service.delete_schedule_lookup("K-5", fingerprint)
+    note = schedule_lookup_service.unsync_deleted_lookup_from_registry("K-5", entry)
+    assert "removed" in note
+    records = dc_rate_service.search_khewats(khewat_number="K-5", mauza="Sample Mauza")
+    assert records[0]["squares"] == ["10"]
+    assert records[0]["kilas"] == ["2"]
+
+
+def test_saved_lookup_sync_notes_skip_conditions(monkeypatch, rate_database):
+    """The mirror reports honestly when there is nothing to mirror to."""
+    from services import schedule_lookup_service
+
+    saved = {}
+    monkeypatch.setattr(schedule_lookup_service, "get_setting", lambda key, default=None: saved.get(key, default))
+    monkeypatch.setattr(schedule_lookup_service, "set_setting",
+                        lambda key, value: saved.__setitem__(key, value))
+
+    # Urban row without square/kila: nothing to mirror.
+    urban = {"land_type": "urban", "mauza": "Model Town", "locality": "Bazar",
+             "dc_rate_id": 1, "fbr_rate_id": 2}
+    note = schedule_lookup_service.sync_saved_lookup_to_registry("K-9", urban)
+    assert "no Square/Kila" in note
+
+    # Rural row but no khewat record on the rates tab for this mauza.
+    rural = dict(urban, land_type="rural", square_no="4", kila_no="1",
+                 locality=None)
+    note = schedule_lookup_service.sync_saved_lookup_to_registry("K-9", rural)
+    assert "No khewat record" in note
+
+    # Several RHZ-year records with the same number in the same mauza:
+    # ambiguous, skipped with an honest note.
+    fourth_id, _ = dc_rate_service.create_location(**_location_values(
+        square_no="4", kila_no="1",
+    ))
+    dc_rate_service.create_dc_rate(location_id=fourth_id, **_rate_values())
+    rural_mauza = dict(rural, mauza="Sample Mauza")
+    context = {
+        "province": "Punjab", "district": "Sample District",
+        "tehsil": "Sample Tehsil", "qanoongoi": "", "patwar_circle": "",
+        "mauza_name": "Sample Mauza", "hadbast_number": "123",
+    }
+    for year in ("2023-24", "2024-25"):
+        dc_rate_service.assign_cadastral_references_to_khewat(
+            context=context, khewat_number="K-9", rhz_year=year,
+            khewat_size=None, square_numbers=["4"], kila_numbers=["1"],
+        )
+    note = schedule_lookup_service.sync_saved_lookup_to_registry("K-9", rural_mauza)
+    assert "several RHZ-year" in note

@@ -2413,6 +2413,41 @@ def update_khewat_record(
             "khewat_size": size, "added": added, "removed": removed}
 
 
+def remove_khewat_references(
+    *, khewat_id: int, square_numbers: list[str], kila_numbers: list[str],
+) -> int:
+    """Remove the given Square/Kila references from a Khewat, keep the rest.
+
+    Used by the Calculate tab's khewat-schedule mirror: when a saved
+    schedule row is deleted there, its Square/Kila reference is dropped
+    from the matching khewat record here (developer request: both tabs
+    must show the same khewat membership). Values are canonicalized with
+    the same rules the assignment flow uses. Returns the removed count.
+    """
+    squares = list(dict.fromkeys(_reference_values(",".join(square_numbers))))
+    kilas = list(dict.fromkeys(_reference_values(",".join(kila_numbers))))
+    if not squares and not kilas:
+        return 0
+    wanted = {("square", value) for value in squares}
+    wanted |= {("kila", value) for value in kilas}
+    removed = 0
+    with SessionLocal.begin() as session:
+        khewat = session.get(PropertyKhewat, khewat_id)
+        if khewat is None:
+            raise DCRateServiceError(
+                "This Khewat no longer exists. Refresh the search results."
+            )
+        current = session.scalars(
+            select(KhewatReference).where(KhewatReference.khewat_id == khewat_id)
+        ).all()
+        for reference in current:
+            key = (reference.reference_type, reference.reference_value)
+            if key in wanted:
+                session.delete(reference)
+                removed += 1
+    return removed
+
+
 def _mauza_cadastral_values_in_session(session, context: dict[str, Any], field_name: str) -> list[str]:
     field = getattr(PropertyLocation, field_name)
     statement = (

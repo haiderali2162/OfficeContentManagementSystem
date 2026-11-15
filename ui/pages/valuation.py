@@ -37,6 +37,8 @@ from services.dc_rate_service import (
     get_dc_rate,
     list_dc_rates,
     list_location_hint_values,
+    list_mauza_names,
+    list_saved_khewat_mauzas,
     preload_location_dimensions,
     search_khewats,
 )
@@ -48,8 +50,17 @@ from services.estimate_service import (
 )
 from services.schedule_lookup_service import (
     ScheduleLookupError,
+    delete_schedule_lookup,
+    list_all_schedule_lookups,
     list_schedule_lookups,
+    row_fingerprint,
+    row_reference_label,
     save_schedule_lookup,
+    search_saved_lookups_summary,
+    summarize_schedule_lookups,
+    sync_saved_lookup_to_registry,
+    unsync_deleted_lookup_from_registry,
+    update_schedule_lookup,
 )
 from services.tax_service import (
     TaxRuleError,
@@ -2206,11 +2217,19 @@ def build_valuation_page(
     # and khewats saved on the DC/FBR rates tab are offered here too
     # (developer request, next batch: both stores have the same job).
     khewat_no_field = ft.TextField(label="Khewat no.", width=180)
-    khewat_mauza_scope = ft.TextField(
-        label="Mauza (scopes the search)", width=190,
+    # Mauza scopes the khewat search and is auto-filled from the currently
+    # searched schedule (rural and urban) when a row is saved; it offers
+    # type-ahead hints of the available mauzas (developer request).
+    khewat_mauza_scope = ft.AutoComplete(
+        data="khewat_mauza_scope", width=190, suggestions_max_height=220,
     )
+    khewat_mauza_col = ft.Column([
+        ft.Text("Mauza (auto-filled)", size=12, weight=ft.FontWeight.W_500),
+        khewat_mauza_scope,
+    ], spacing=4)
     khewat_save_button = ft.OutlinedButton("Save current schedule")
     khewat_load_button = ft.OutlinedButton("Load from khewat no.")
+    khewat_view_button = ft.OutlinedButton("View all khewats")
     khewat_pick = ft.Dropdown(
         label="Schedule rows under this khewat", expand=True, options=[],
         visible=False, menu_height=180,
@@ -2225,8 +2244,8 @@ def build_valuation_page(
             "saved on the DC / FBR rates tab are offered here as well.",
             size=12, color="#64748B",
         ),
-        ft.Row([khewat_no_field, khewat_mauza_scope, khewat_save_button,
-                khewat_load_button],
+        ft.Row([khewat_no_field, khewat_mauza_col, khewat_save_button,
+                khewat_load_button, khewat_view_button],
                wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         khewat_pick,
         khewat_status,
@@ -2273,18 +2292,89 @@ def build_valuation_page(
         value = classification.value
         return value if value not in (None, "", "none") else None
 
+    def refresh_khewat_mauza_hints() -> None:
+        """Offer the available mauzas as type-ahead hints for the khewat field.
+
+        Saved khewat mauzas (rates tab) and schedule mauzas are merged so a
+        mauza can be typed or picked without remembering the spelling.
+        """
+        def fetch():
+            saved: list[str] = []
+            names: list[str] = []
+            try:
+                saved = list(list_saved_khewat_mauzas(limit=100))
+            except Exception:
+                saved = []
+            try:
+                names = list(list_mauza_names(limit=100))
+            except Exception:
+                names = []
+            return saved, names
+
+        async def load_hints():
+            saved, names = await asyncio.to_thread(fetch)
+            merged = list(dict.fromkeys(
+                [value for value in [*saved, *names] if str(value).strip()]
+            ))[:120]
+            khewat_mauza_scope.suggestions = [
+                ft.AutoCompleteSuggestion(key=value, value=value)
+                for value in merged
+            ]
+            page.update()
+
+        if hasattr(page, "run_task"):
+            page.run_task(load_hints)
+        else:
+            saved, names = fetch()
+            khewat_mauza_scope.suggestions = [
+                ft.AutoCompleteSuggestion(key=value, value=value)
+                for value in dict.fromkeys([*saved, *names])
+            ]
+
     def save_current_to_khewat(_=None):
         number = (khewat_no_field.value or "").strip()
         try:
             entry = _current_schedule_entry()
-            stored = save_schedule_lookup(number, entry)
-        except (ScheduleLookupError, ValueError) as exc:
+        except ValueError as exc:
             khewat_status.value = str(exc)
             page.update()
             return
-        khewat_status.value = (
-            f"Schedule saved under khewat {number} ({stored} row(s) stored)."
-        )
+        # Auto-fill the mauza from the currently searched schedule (rural
+        # and urban) instead of asking the user to retype it.
+        if not (khewat_mauza_scope.value or "").strip():
+            khewat_mauza_scope.value = str(entry.get("mauza") or "")
+        try:
+            result = save_schedule_lookup(number, entry)
+        except ScheduleLookupError as exc:
+            khewat_status.value = str(exc)
+            page.update()
+            return
+        stored_number = str(result.get("khewat_no") or number)
+        rows = result.get("rows", 0)
+        status_text = {
+            "saved": (
+                f"Schedule saved under khewat {stored_number} "
+                f"({rows} row(s) stored)."
+            ),
+            "updated": (
+                f"This schedule row was already saved under khewat "
+                f"{stored_number}; its stored rate selection was refreshed "
+                f"in place ({rows} row(s) stored)."
+            ),
+            "duplicate": (
+                f"This schedule row is already saved under khewat "
+                f"{stored_number} — no duplicate was added ({rows} row(s) "
+                "stored). Use View all khewats to edit it."
+            ),
+        }.get(str(result.get("status")), "Schedule saved.")
+        try:
+            sync_note = sync_saved_lookup_to_registry(stored_number, entry)
+        except Exception as exc:
+            sync_note = f"Rates-tab mirror skipped: {exc}"
+        if sync_note:
+            status_text = f"{status_text} {sync_note}"
+        khewat_status.value = status_text
+        refresh_khewat_mauza_hints()
         page.update()
 
     def _apply_saved_lookup(entry: dict[str, Any]) -> None:
@@ -2471,10 +2561,352 @@ def build_valuation_page(
         if entry:
             _apply_khewat_payload(entry)
 
+    # View-all dialog (developer request): every saved khewat schedule
+    # grouped mauza-wise with row counts and the lowest/highest schedule
+    # reference stored in each khewat, plus edit/delete per row.
+    def _describe_saved_row(record: dict[str, Any]) -> str:
+        parts = [row_reference_label(record)]
+        if record.get("land_type"):
+            parts.append(str(record["land_type"]))
+        if record.get("fbr_rate_id"):
+            parts.append("FBR")
+        saved_at = str(record.get("saved_at") or "")
+        if saved_at:
+            parts.append("saved " + saved_at[:10])
+        return " · ".join(str(part) for part in parts if part)
+
+    def _registry_note_for(mauza: str, khewat_no: str) -> str:
+        """One-line summary of the matching rates-tab khewat record(s)."""
+        try:
+            records = search_khewats(mauza=mauza) if mauza.strip() else []
+        except Exception:
+            return ""
+        matches = [
+            record for record in records
+            if str(record.get("khewat_number") or "").strip().casefold()
+            == khewat_no.strip().casefold()
+        ]
+        if not matches:
+            return ""
+        squares = sum(len(record.get("squares") or []) for record in matches)
+        kilas = sum(len(record.get("kilas") or []) for record in matches)
+        years = ", ".join(
+            str(record.get("rhz_year")) for record in matches if record.get("rhz_year")
+        )
+        detail = f"{squares} square(s) / {kilas} kila(s)"
+        if years:
+            detail = f"{detail} · RHZ {years}"
+        return f"Rates tab: {len(matches)} khewat record(s) · {detail}"
+
+    def _saved_row_line(record: dict[str, Any]) -> ft.Control:
+        fingerprint = row_fingerprint(record)
+        return ft.Row([
+            ft.Text(_describe_saved_row(record), size=12, expand=True),
+            ft.TextButton(
+                "Load schedule", on_click=lambda _, r=record: load_saved_row(r),
+            ),
+            ft.TextButton("Edit", on_click=lambda _, r=record: edit_saved_row(r)),
+            ft.TextButton(
+                "Delete",
+                on_click=lambda _, r=record, f=fingerprint: confirm_delete_row(r, f),
+            ),
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+    def load_saved_row(record: dict[str, Any]):
+        """Load a saved row straight from the view-all dialog into the form."""
+        page.pop_dialog()
+        khewat_no_field.value = str(record.get("khewat_no") or "")
+        khewat_mauza_scope.value = str(record.get("mauza") or "")
+        _apply_saved_lookup(record)
+
+    # The search values survive dialog re-opens (after edit/delete) so the
+    # filtered view stays where the user left it.
+    overview_search_state = {"khewat_no": "", "mauza": "", "district": "",
+                             "tehsil": "", "qanoongoi": ""}
+
+    def open_khewat_overview(_=None):
+        refresh_khewat_mauza_hints()
+        try:
+            summaries = search_saved_lookups_summary(**overview_search_state)
+            all_rows = list_all_schedule_lookups()
+        except Exception as exc:
+            status.value = f"Could not load the saved khewats: {exc}"
+            page.update()
+            return
+        if not summarize_schedule_lookups():
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Saved khewat schedules"),
+                content=ft.Text(
+                    "No khewat schedules are saved yet. Search a schedule on "
+                    "this tab and use 'Save current schedule'.",
+                    size=13,
+                ),
+                actions=[ft.TextButton("Close", on_click=lambda _: page.pop_dialog())],
+            ))
+            return
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for record in all_rows:
+            key = (
+                str(record.get("mauza") or "").strip().casefold(),
+                str(record.get("khewat_no") or "").strip().casefold(),
+            )
+            groups.setdefault(key, []).append(record)
+
+        def render_results(group_summaries: list[dict[str, Any]]) -> list[ft.Control]:
+            blocks: list[ft.Control] = []
+            for summary in group_summaries:
+                key = (
+                    str(summary["mauza"]).strip().casefold(),
+                    str(summary["khewat_no"]).strip().casefold(),
+                )
+                registry_note = _registry_note_for(
+                    str(summary["mauza"]), str(summary["khewat_no"]),
+                )
+                context_parts = [
+                    f"{field.title()}: {summary[field]}"
+                    for field in ("district", "tehsil", "qanoongoi")
+                    if summary.get(field)
+                ]
+                rows_text = f"{summary['rows']} saved row(s)"
+                if summary["rows"] > 1:
+                    rows_text += (
+                        f" · Lowest: {summary['lowest']} · Highest: {summary['highest']}"
+                    )
+                header = ft.Column([
+                    ft.Text(
+                        f"{summary['mauza']} · Khewat {summary['khewat_no']}",
+                        size=13, weight=ft.FontWeight.BOLD, color="#1E293B",
+                    ),
+                    ft.Text(rows_text, size=11, color="#64748B"),
+                    *([ft.Text(" · ".join(context_parts), size=11,
+                               color="#64748B")] if context_parts else []),
+                    *([ft.Text(registry_note, size=11, color="#0F766E")]
+                      if registry_note else []),
+                ], spacing=2)
+                blocks.append(ft.Container(
+                    ft.Column(
+                        [header, *[ft.Container(
+                            _saved_row_line(record), padding=ft.Padding(left=12),
+                        ) for record in groups.get(key, [])]],
+                        spacing=4,
+                    ),
+                    padding=10,
+                    bgcolor="#FFFFFF",
+                    border=ft.Border.all(1, "#E2E8F0"),
+                    border_radius=8,
+                ))
+            if not blocks:
+                blocks.append(ft.Text(
+                    "No saved khewat matches this search. Adjust the fields "
+                    "or press Show all.",
+                    size=12, color="#64748B",
+                ))
+            return blocks
+
+        search_no = ft.TextField(
+            label="Khewat no.", value=overview_search_state["khewat_no"], width=140,
+        )
+        search_mauza = ft.TextField(
+            label="Mauza", value=overview_search_state["mauza"], width=150,
+        )
+        search_district = ft.TextField(
+            label="District (optional)", value=overview_search_state["district"],
+            width=150,
+        )
+        search_tehsil = ft.TextField(
+            label="Tehsil (optional)", value=overview_search_state["tehsil"],
+            width=150,
+        )
+        search_qanoongoi = ft.TextField(
+            label="Qanoongoi (optional)", value=overview_search_state["qanoongoi"],
+            width=150,
+        )
+        search_status = ft.Text("", size=11, color="#64748B")
+        search_fields = [search_no, search_mauza, search_district,
+                         search_tehsil, search_qanoongoi]
+        results_column = ft.Column(
+            render_results(summaries), spacing=10,
+        )
+
+        def run_search(_=None):
+            overview_search_state.update({
+                "khewat_no": search_no.value or "",
+                "mauza": search_mauza.value or "",
+                "district": search_district.value or "",
+                "tehsil": search_tehsil.value or "",
+                "qanoongoi": search_qanoongoi.value or "",
+            })
+            try:
+                found = search_saved_lookups_summary(**overview_search_state)
+            except Exception as exc:
+                search_status.value = f"Search failed: {exc}"
+                page.update()
+                return
+            results_column.controls = render_results(found)
+            shown = sum(item["rows"] for item in found)
+            search_status.value = (
+                f"{len(found)} khewat(s) · {shown} saved row(s) match."
+                if overview_search_state["khewat_no"].strip()
+                or any(
+                    overview_search_state[field].strip()
+                    for field in ("mauza", "district", "tehsil", "qanoongoi")
+                )
+                else ""
+            )
+            page.update()
+
+        def clear_search(_=None):
+            for field in search_fields:
+                field.value = ""
+            overview_search_state.update({key: "" for key in overview_search_state})
+            results_column.controls = render_results(
+                summarize_schedule_lookups()
+            )
+            search_status.value = ""
+            page.update()
+
+        search_button = ft.OutlinedButton("Search", on_click=run_search)
+        show_all_button = ft.TextButton("Show all", on_click=clear_search)
+        for field in search_fields:
+            field.on_submit = run_search
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Saved khewat schedules (mauza-wise)"),
+            content=ft.Column([
+                ft.Text(
+                    "Search a khewat by number (may be partial) and its "
+                    "location; mauza separates khewats that share a number.",
+                    size=11, color="#64748B",
+                ),
+                ft.Row([*search_fields, search_button, show_all_button],
+                       wrap=True, spacing=8,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                search_status,
+                results_column,
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[ft.TextButton("Close", on_click=lambda _: page.pop_dialog())],
+        ))
+
+    def edit_saved_row(record: dict[str, Any]):
+        page.pop_dialog()
+        # Only the identifying fields are editable here; the rest of the
+        # stored snapshot (rate selection etc.) is kept untouched.
+        editable = {
+            key: record.get(key)
+            for key in record
+            if key not in ("khewat_no", "saved_at", "row_fingerprint")
+        }
+        number_field = ft.TextField(
+            label="Khewat no.", value=str(record.get("khewat_no") or ""), width=160,
+        )
+        mauza_field = ft.TextField(
+            label="Mauza", value=str(record.get("mauza") or ""), width=180,
+        )
+        square_field = ft.TextField(
+            label="Square no.", value=str(record.get("square_no") or ""), width=130,
+        )
+        kila_field = ft.TextField(
+            label="Kila no.", value=str(record.get("kila_no") or ""), width=130,
+        )
+        locality_field = ft.TextField(
+            label="Locality (urban)", value=str(record.get("locality") or ""), width=200,
+        )
+        error_text = ft.Text("", size=11, color="#B91C1C")
+
+        def do_save(_=None):
+            editable.update({
+                "khewat_no": number_field.value.strip(),
+                "mauza": mauza_field.value.strip(),
+                "square_no": square_field.value.strip() or None,
+                "kila_no": kila_field.value.strip() or None,
+                "locality": locality_field.value.strip() or None,
+            })
+            try:
+                update_schedule_lookup(
+                    record.get("khewat_no"), row_fingerprint(record), editable,
+                )
+            except ScheduleLookupError as exc:
+                error_text.value = str(exc)
+                page.update()
+                return
+            page.pop_dialog()
+            khewat_status.value = "Saved row updated."
+            open_khewat_overview()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Edit saved khewat row"),
+            content=ft.Column([
+                ft.Row([number_field, mauza_field], wrap=True, spacing=8),
+                ft.Row([square_field, kila_field, locality_field],
+                       wrap=True, spacing=8),
+                ft.Text(
+                    "Other stored details (rate selection, classification, "
+                    "area context) are kept. Square/Kila belong to rural "
+                    "schedules; the locality line belongs to urban ones.",
+                    size=11, color="#64748B",
+                ),
+                error_text,
+            ], tight=True, spacing=8),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                ft.TextButton("Save", on_click=do_save),
+            ],
+        ))
+
+    def confirm_delete_row(record: dict[str, Any], fingerprint: str):
+        def do_delete(_=None):
+            try:
+                deleted = delete_schedule_lookup(
+                    record.get("khewat_no"), fingerprint,
+                )
+                note = ""
+                if deleted:
+                    note = unsync_deleted_lookup_from_registry(
+                        record.get("khewat_no"), record,
+                    )
+            except ScheduleLookupError as exc:
+                page.pop_dialog()
+                khewat_status.value = str(exc)
+                page.update()
+                return
+            page.pop_dialog()
+            page.pop_dialog()
+            khewat_status.value = (
+                "Saved row deleted."
+                + (f" {note}" if note else "")
+            )
+            open_khewat_overview()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Delete saved khewat row?"),
+            content=ft.Column([
+                ft.Text(
+                    f"Remove the saved row '{_describe_saved_row(record)}' from "
+                    f"khewat {record.get('khewat_no')}?",
+                    size=13,
+                ),
+                ft.Text(
+                    "Its Square/Kila reference is also removed from the "
+                    "matching rates-tab khewat, unless another saved row of "
+                    "the same khewat still uses it.",
+                    size=12, color="#64748B",
+                ),
+            ], tight=True, spacing=8),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                ft.TextButton("Delete", on_click=do_delete),
+            ],
+        ))
+
     khewat_save_button.on_click = save_current_to_khewat
     khewat_load_button.on_click = load_from_khewat
+    khewat_view_button.on_click = open_khewat_overview
     khewat_pick.on_select = pick_saved_khewat_row
     khewat_pick.on_change = pick_saved_khewat_row
+    refresh_khewat_mauza_hints()
     estimate_form = ft.Column([
         ft.Text("Estimate inputs", size=19, weight=ft.FontWeight.BOLD),
         ft.Text("Choose Rural or Urban, enter schedule-backed location details, then enter the area in K-M-F format. Matching DC and FBR rates are fetched from saved schedules.", size=12, color="#9A3412"),

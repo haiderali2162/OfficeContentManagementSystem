@@ -1,3 +1,51 @@
-on calculate page
-	1. each khewat belongs to a muaza so save the khewat under the mauza name of a tehsil & district. Qanoongoi could also be added to make it more unique while searching.
-	2. there is also an option of khewat on "DC / FBR rates" tab, link them both as both have the same job.
+Objective: Build the "Naqsha Alif / Bay / Jeem" module, which allows users to import land and owner records (from the Punjab Zameen portal or spreadsheets), validate and normalize the data, save it hierarchically, and reuse it across other modules.
+(Note: Let's complete Step 1: Data Ingestion, Mapping, Validation, and Storage first before moving to the final PDF generation).
+
+1. Data Ingestion & Field Mapping
+
+Allow users to input two distinct datasets (Land Details and Owner Details) using either:
+• Direct Paste: Copying tabular data directly from the Punjab Zameen web portal into the app.
+• File Upload: Importing spreadsheet files (.xlsx, .xls, .ods, .csv).
+Auto-Mapping & Manual Override:
+The system should automatically detect and map columns to the required fields below. If a column cannot be recognized automatically, display an interactive mapping UI so the user can manually assign the fields and ignore extra/unneeded columns.
+• Dataset A: Land Details
+	• Khewat No.
+	• Khatoni No.
+	• Square No. (Murabba)
+	• Killa No.
+	• Type of Land (Qism Arazi)
+	• Area (Kanal-Marla-Sarsahi/Sq. Ft.)
+• Dataset B: Owner Details (Ignore extraneous portal columns)
+	• Owner Name & Relation/Parentage (Parse strings formatted like: [Owner Name] s/o, d/o, w/o, widow of [Father/Husband Name])
+	• Owner Caste (Qaum)
+	• Owner Share (Hissa)
+	• Owner Area according to share (Raqba)
+
+2. Automated Calculations & Data Validation (Per Khewat)
+
+Group the imported records by Khewat No. and perform the following logic:
+• Total Calculations:
+	• Total Land Area = Sum of the area of all Square/Killa entries in that Khewat.
+	• Total Owner Area = Sum of the area allocated to all owners in that Khewat.
+• Discrepancy Check (Checkage):
+	• Compare Total Land Area vs. Total Owner Area.
+	• If equal: Display status as 1/1 (Valid).
+	• If unequal: Flag an error clearly showing the mismatch ratio (Total Owner Area / Total Land Area) and highlight which total is incorrect.
+• Share Normalization (Hissa Correction):
+	• Because shares copied from the web portal are often corrupted, recalculate each owner's share mathematically using their area and the Khewat's total area.
+	• Formula: Convert areas to the smallest standard unit (e.g., Marlas or Sarsahis). If an owner has 1 Kanal (20 Marlas) and the total Khewat is 4 Kanals (80 Marlas), output the corrected share as 20/80. Apply this to all owners.
+
+3. Hierarchical Data Storage
+
+Allow users to save the validated Khewat records under a structured location hierarchy:
+• District \(\rightarrow \) Tehsil \(\rightarrow \) Qanoongoi \(\rightarrow \) Mauza \(\rightarrow \) Khewat No.
+
+4. Cross-Module Integration ("Valuation & Taxes" Page)
+
+Enable users to import saved records by Khewat No. directly into the "Calculate" and "DC / FBR Rate" tabs on the Valuation & Taxes page.
+When importing into Valuation & Taxes, filter out owner details and extract only the land data based on the property classification:
+• Rural Properties:
+	• Required: Mauza, Square No., Killa No.
+	• Optional: District, Tehsil, Qanoongoi.
+• Urban Properties:
+	• Required: Revenue Circle, Property Area, and either Khasra No. or Square No. + Killa No. (these two are mutually exclusive—if Khasra is provided, Square/Killa are not required, and vice versa).

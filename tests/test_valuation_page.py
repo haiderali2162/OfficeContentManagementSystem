@@ -124,13 +124,16 @@ def test_dc_fbr_rates_load_is_scheduled_only_when_tab_is_selected(monkeypatch):
     tab_states = []
     root = valuation.build_valuation_page(page, on_rates_tab_change=tab_states.append)
     tabs = root.controls[2]
-    assert len(page.scheduled) == 1  # valuation choice/history loads only
+    # Two deferred loads at build: valuation choice/history plus the khewat
+    # mauza hints (saved khewat mauzas + schedule mauzas for type-ahead).
+    # The DC/FBR rates loads are NOT among them; they stay on demand.
+    assert len(page.scheduled) == 2
     assert root.controls[0].visible is True
     assert root.controls[1].visible is True
 
     tabs.on_change(SimpleNamespace(control=SimpleNamespace(selected_index=2)))
 
-    assert len(page.scheduled) == 2  # DC/FBR load is scheduled on demand
+    assert len(page.scheduled) == 3  # DC/FBR load is scheduled on demand
     assert tab_states == [True]
     assert root.controls[0].visible is False
     assert root.controls[1].visible is False
