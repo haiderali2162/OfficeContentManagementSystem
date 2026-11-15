@@ -833,3 +833,113 @@ class AppSetting(Base):
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
 
+
+class NaqshaRecord(Base):
+    """A saved Naqsha khewat: land rows and owner rows under one location.
+
+    One record groups the imported Land Details (Dataset A) and Owner
+    Details (Dataset B) of a single Khewat number inside a District ->
+    Tehsil -> Qanoongoi -> Mauza hierarchy (Naqsha module, step 1).
+    """
+
+    __tablename__ = "naqsha_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "district", "tehsil", "qanoongoi", "mauza", "khewat_no",
+            name="uq_naqsha_khewat_location",
+        ),
+        Index("ix_naqsha_mauza_khewat", "mauza", "district", "tehsil"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The location hierarchy is saved as a snapshot: a Naqsha record stays
+    # addressable even when schedule rows describing the same mauza change.
+    province: Mapped[str] = mapped_column(String(120), default="", server_default="", nullable=False)
+    district: Mapped[str] = mapped_column(String(120), default="", server_default="", nullable=False)
+    tehsil: Mapped[str] = mapped_column(String(120), default="", server_default="", nullable=False)
+    qanoongoi: Mapped[str] = mapped_column(String(200), default="", server_default="", nullable=False)
+    mauza: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Khewat/Khatoni numbers are identifiers, not quantities; keep them as
+    # text so values like 30/2/1 are preserved.
+    khewat_no: Mapped[str] = mapped_column(String(100), nullable=False)
+    khatoni_no: Mapped[str] = mapped_column(String(100), default="", server_default="", nullable=False)
+    source_note: Mapped[str] = mapped_column(String(200), default="", server_default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    land_rows: Mapped[list["NaqshaLandRow"]] = relationship(
+        back_populates="record", cascade="all, delete-orphan", passive_deletes=True
+    )
+    owner_rows: Mapped[list["NaqshaOwnerRow"]] = relationship(
+        back_populates="record", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class NaqshaLandRow(Base):
+    """One land entry (Square/Killa with its Qism-e-Arazi and area)."""
+
+    __tablename__ = "naqsha_land_rows"
+    __table_args__ = (
+        UniqueConstraint(
+            "record_id", "square_no", "killa_no", "land_type",
+            name="uq_naqsha_land_row",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    record_id: Mapped[int] = mapped_column(
+        ForeignKey("naqsha_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Row texts are snapshots of the imported table (khewat/khatoni repeat
+    # per row in portal copies; the record groups them).
+    khewat_no: Mapped[str] = mapped_column(String(100), default="", server_default="", nullable=False)
+    khatoni_no: Mapped[str] = mapped_column(String(100), default="", server_default="", nullable=False)
+    square_no: Mapped[str] = mapped_column(String(100), default="", server_default="", nullable=False)
+    killa_no: Mapped[str] = mapped_column(String(100), default="", server_default="", nullable=False)
+    land_type: Mapped[str] = mapped_column(String(200), default="", server_default="", nullable=False)
+    area_text: Mapped[str] = mapped_column(String(60), default="", server_default="", nullable=False)
+    # Normalized area in exact decimal marla (smallest shared unit for the
+    # checkage and share math; the raw text stays untouched above).
+    area_marla: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+
+    record: Mapped["NaqshaRecord"] = relationship(back_populates="land_rows")
+
+
+class NaqshaOwnerRow(Base):
+    """One owner entry: name/parentage, caste, share, and area by share."""
+
+    __tablename__ = "naqsha_owner_rows"
+    __table_args__ = (
+        UniqueConstraint(
+            "record_id", "owner_name", "parent_name", "caste", "share_text",
+            "area_text",
+            name="uq_naqsha_owner_row",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    record_id: Mapped[int] = mapped_column(
+        ForeignKey("naqsha_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    owner_name: Mapped[str] = mapped_column(String(200), default="", server_default="", nullable=False)
+    relation: Mapped[str] = mapped_column(String(20), default="", server_default="", nullable=False)
+    parent_name: Mapped[str] = mapped_column(String(200), default="", server_default="", nullable=False)
+    caste: Mapped[str] = mapped_column(String(100), default="", server_default="", nullable=False)
+    share_text: Mapped[str] = mapped_column(String(60), default="", server_default="", nullable=False)
+    area_text: Mapped[str] = mapped_column(String(60), default="", server_default="", nullable=False)
+    area_marla: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    # Share normalization (Hissa correction): recomputed from the owner's
+    # area against the khewat's total area, stored as an exact fraction.
+    share_numerator: Mapped[Optional[int]] = mapped_column(Integer)
+    share_denominator: Mapped[Optional[int]] = mapped_column(Integer)
+    share_text_corrected: Mapped[str] = mapped_column(String(60), default="", server_default="", nullable=False)
+
+    record: Mapped["NaqshaRecord"] = relationship(back_populates="owner_rows")

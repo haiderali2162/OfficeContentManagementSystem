@@ -48,6 +48,10 @@ from services.estimate_service import (
     list_estimates,
     save_estimate,
 )
+from services.naqsha_service import (
+    list_naqsha_records,
+    naqsha_land_rows_for_valuation,
+)
 from services.schedule_lookup_service import (
     ScheduleLookupError,
     delete_schedule_lookup,
@@ -2230,6 +2234,9 @@ def build_valuation_page(
     khewat_save_button = ft.OutlinedButton("Save current schedule")
     khewat_load_button = ft.OutlinedButton("Load from khewat no.")
     khewat_view_button = ft.OutlinedButton("View all khewats")
+    khewat_naqsha_button = ft.OutlinedButton(
+        "Load from Naqsha", tooltip="Load land data saved in the Naqsha module",
+    )
     khewat_pick = ft.Dropdown(
         label="Schedule rows under this khewat", expand=True, options=[],
         visible=False, menu_height=180,
@@ -2245,7 +2252,7 @@ def build_valuation_page(
             size=12, color="#64748B",
         ),
         ft.Row([khewat_no_field, khewat_mauza_col, khewat_save_button,
-                khewat_load_button, khewat_view_button],
+                khewat_load_button, khewat_view_button, khewat_naqsha_button],
                wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         khewat_pick,
         khewat_status,
@@ -2901,9 +2908,139 @@ def build_valuation_page(
             ],
         ))
 
+    # Naqsha loader (developer request 4): pick a khewat saved in the
+    # Naqsha module and fill the location/square/kila fields from its land
+    # data; owner details are filtered out automatically.
+    naqsha_search_state = {"khewat_no": "", "mauza": ""}
+
+    def open_naqsha_loader(_=None):
+        naqsha_no_field = ft.TextField(
+            label="Khewat No.", value=naqsha_search_state["khewat_no"], width=140,
+        )
+        naqsha_mauza_field = ft.TextField(
+            label="Mauza", value=naqsha_search_state["mauza"], width=160,
+        )
+        naqsha_status = ft.Text("", size=11, color="#64748B")
+        naqsha_results = ft.Column(spacing=8)
+
+        def use_naqsha_row(record: dict[str, Any], land_row: dict[str, Any]):
+            page.pop_dialog()
+            property_profile.value = "rural"
+            field_map = {
+                "district": district, "tehsil": tehsil, "qanoongoi": qanoongoi,
+                "mauza": mauza, "square_no": square_no, "kila_no": kila_no,
+            }
+            for key, control in field_map.items():
+                control.value = str(land_row.get(key) or "")
+            khewat_no_field.value = str(record.get("khewat_no") or "")
+            khewat_mauza_scope.value = str(record.get("mauza") or "")
+            switch_property_profile()
+            refresh_khewat_mauza_hints()
+            khewat_status.value = (
+                f"Loaded from Naqsha: khewat {record['khewat_no']} in "
+                f"{record['mauza']}"
+                + (f", Square {land_row['square_no']}" if land_row.get("square_no") else "")
+                + (f", Kila {land_row['killa_no']}" if land_row.get("killa_no") else "")
+                + (f" ({land_row['land_type']})" if land_row.get("land_type") else "")
+                + ". The matching rates appear below."
+            )
+            refresh_rate_matches()
+            page.update()
+
+        def render_naqsha_records(records: list[dict[str, Any]]) -> list[ft.Control]:
+            blocks: list[ft.Control] = []
+            for record in records:
+                land_rows = naqsha_land_rows_for_valuation(record)
+                blocks.append(ft.Container(
+                    ft.Column([
+                        ft.Text(
+                            f"{record['mauza']} · Khewat {record['khewat_no']}"
+                            + (f" · Khatoni {record['khatoni_no']}"
+                               if record["khatoni_no"] else ""),
+                            size=13, weight=ft.FontWeight.BOLD, color="#1E293B",
+                        ),
+                        *([ft.Container(
+                            ft.TextButton(
+                                f"Use Square {row['square_no'] or '—'} · "
+                                f"Kila {row['killa_no'] or '—'}"
+                                + (f" · {row['land_type']}" if row["land_type"] else "")
+                                + (f" · {row['area_text']}" if row["area_text"] else ""),
+                                on_click=lambda _, r=record, w=row: use_naqsha_row(r, w),
+                            ),
+                            padding=ft.Padding(left=12),
+                        ) for row in land_rows] or [ft.Text(
+                            "This record has no land rows.", size=12,
+                            color="#B91C1C",
+                        )]),
+                    ], spacing=2),
+                    padding=10,
+                    bgcolor="#FFFFFF",
+                    border=ft.Border.all(1, "#E2E8F0"),
+                    border_radius=8,
+                ))
+            if not blocks:
+                blocks.append(ft.Text(
+                    "No saved Naqsha khewat matches this search.", size=12,
+                    color="#64748B",
+                ))
+            return blocks
+
+        def run_naqsha_search(_=None):
+            naqsha_search_state.update({
+                "khewat_no": naqsha_no_field.value or "",
+                "mauza": naqsha_mauza_field.value or "",
+            })
+
+            async def load():
+                try:
+                    records = await asyncio.to_thread(
+                        list_naqsha_records,
+                        khewat_no=naqsha_search_state["khewat_no"],
+                        mauza=naqsha_search_state["mauza"],
+                    )
+                except Exception as exc:
+                    naqsha_status.value = f"Could not load Naqsha records: {exc}"
+                    page.update()
+                    return
+                naqsha_results.controls = render_naqsha_records(records)
+                page.update()
+
+            if hasattr(page, "run_task"):
+                page.run_task(load)
+            else:
+                records = list_naqsha_records(
+                    khewat_no=naqsha_search_state["khewat_no"],
+                    mauza=naqsha_search_state["mauza"],
+                )
+                naqsha_results.controls = render_naqsha_records(records)
+
+        naqsha_no_field.on_submit = run_naqsha_search
+        naqsha_mauza_field.on_submit = run_naqsha_search
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Load from Naqsha"),
+            content=ft.Column([
+                ft.Text(
+                    "Saved Naqsha khewats (land data only; owner details "
+                    "stay in the Naqsha module). Pick a land row to fill "
+                    "the fields, then the matching rates appear below.",
+                    size=11, color="#64748B",
+                ),
+                ft.Row([naqsha_no_field, naqsha_mauza_field,
+                        ft.OutlinedButton("Search", on_click=run_naqsha_search)],
+                       wrap=True, spacing=8,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                naqsha_status,
+                naqsha_results,
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[ft.TextButton("Close", on_click=lambda _: page.pop_dialog())],
+        ))
+        run_naqsha_search(None)
+
     khewat_save_button.on_click = save_current_to_khewat
     khewat_load_button.on_click = load_from_khewat
     khewat_view_button.on_click = open_khewat_overview
+    khewat_naqsha_button.on_click = open_naqsha_loader
     khewat_pick.on_select = pick_saved_khewat_row
     khewat_pick.on_change = pick_saved_khewat_row
     refresh_khewat_mauza_hints()

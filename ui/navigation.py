@@ -33,6 +33,7 @@ responsible for navigation
 """
 def build_navigation() -> list[NavigationItem]:
     from ui.pages.dashboard import build_dashboard
+    from ui.pages.naqsha import build_naqsha_page
     from ui.pages.placeholder import build_placeholder
     from ui.pages.clients import build_clients_page
     from ui.pages.settings import build_settings_page
@@ -85,10 +86,7 @@ def build_navigation() -> list[NavigationItem]:
             title="Naqsha Alif / Bay / Jeem",
             description="Prepare land-related tables",
             icon=get_icon("TABLE_CHART"),
-            page_builder=placeholder(
-                "Naqsha Alif / Bay / Jeem",
-                "Data imports and document preparation are planned.",
-            ),
+            page_builder=build_naqsha_page,
         ),
         NavigationItem(
             key="inheritance",

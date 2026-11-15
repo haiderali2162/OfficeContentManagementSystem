@@ -15,6 +15,10 @@ from services.dc_rate_duplicate_service import (
     MATCH_FIELD_GROUPS,
     MATCH_FIELD_LABELS,
 )
+from services.naqsha_service import (
+    naqsha_land_rows_for_valuation,
+    list_naqsha_records,
+)
 from services.dc_rate_service import (
     DCRateServiceError,
     MAUZA_CONTEXT_FIELDS,
@@ -2792,6 +2796,133 @@ def build_dc_rates_page(
             summary_text.value = "Selection cleared."
             page.update()
 
+        def import_from_naqsha(_=None):
+            """Add Square/Kila references from a saved Naqsha khewat."""
+            try:
+                context = selected_context()
+            except Exception as exc:
+                summary_text.value = str(exc)
+                page.update()
+                return
+            dialog_mauza = str(context.get("mauza_name") or "").strip()
+            naqsha_no_field = ft.TextField(label="Khewat No.", width=140)
+            naqsha_status = ft.Text("", size=11, color="#64748B")
+            naqsha_results = ft.Column(spacing=8)
+
+            def apply_record(record: dict[str, Any]):
+                land_rows = naqsha_land_rows_for_valuation(record)
+                record_mauza = str(record.get("mauza") or "").strip()
+                if record_mauza.casefold() != dialog_mauza.casefold():
+                    naqsha_status.value = (
+                        f"Khewat {record['khewat_no']} belongs to mauza "
+                        f"'{record_mauza}', not '{dialog_mauza}'. Change the "
+                        "selected Mauza first."
+                    )
+                    page.update()
+                    return
+                added_squares, added_kilas = set(), set()
+                for row in land_rows:
+                    if row["square_no"] and row["square_no"] not in selected_values["square"]:
+                        selected_values["square"].add(row["square_no"])
+                        added_squares.add(row["square_no"])
+                    if row["killa_no"] and row["killa_no"] not in selected_values["kila"]:
+                        selected_values["kila"].add(row["killa_no"])
+                        added_kilas.add(row["killa_no"])
+                    if row["square_no"] and row["square_no"] not in available_values["square"]:
+                        available_values["square"].append(row["square_no"])
+                    if row["killa_no"] and row["killa_no"] not in available_values["kila"]:
+                        available_values["kila"].append(row["killa_no"])
+                render_reference_checks("square")
+                render_reference_checks("kila")
+                render_khewat_summary()
+                update_selection_count()
+                page.pop_dialog()
+                assignment_status.value = (
+                    f"Imported from Naqsha: "
+                    f"{len(added_squares)} square(s), {len(added_kilas)} "
+                    f"Kila(s) from Khewat {record['khewat_no']}. Review the "
+                    "selection, then save the Khewat."
+                )
+                page.update()
+
+            def render_records(records: list[dict[str, Any]]) -> list[ft.Control]:
+                blocks: list[ft.Control] = []
+                for record in records:
+                    land_rows = naqsha_land_rows_for_valuation(record)
+                    squares = sorted({row["square_no"] for row in land_rows if row["square_no"]})
+                    kilas = sorted({row["killa_no"] for row in land_rows if row["killa_no"]})
+                    blocks.append(ft.Container(
+                        ft.Column([
+                            ft.Text(
+                                f"Khewat {record['khewat_no']} in "
+                                f"{record['mauza']} · {len(squares)} square(s) "
+                                f"/ {len(kilas)} kila(s)",
+                                size=12, weight=ft.FontWeight.W_600,
+                            ),
+                            ft.TextButton(
+                                "Add this khewat's Square/Kila",
+                                on_click=lambda _, r=record: apply_record(r),
+                            ),
+                        ], spacing=2),
+                        padding=8,
+                        bgcolor="#FFFFFF",
+                        border=ft.Border.all(1, "#E2E8F0"),
+                        border_radius=8,
+                    ))
+                if not blocks:
+                    blocks.append(ft.Text(
+                        "No saved Naqsha khewat matches in this Mauza.",
+                        size=12, color="#64748B",
+                    ))
+                return blocks
+
+            def run_search(_=None):
+                async def load():
+                    try:
+                        records = await asyncio.to_thread(
+                            list_naqsha_records,
+                            khewat_no=naqsha_no_field.value or "",
+                            mauza=dialog_mauza,
+                        )
+                    except Exception as exc:
+                        naqsha_status.value = (
+                            f"Could not load Naqsha records: {exc}"
+                        )
+                        page.update()
+                        return
+                    naqsha_results.controls = render_records(records)
+                    page.update()
+
+                if hasattr(page, "run_task"):
+                    page.run_task(load)
+                else:
+                    records = list_naqsha_records(
+                        khewat_no=naqsha_no_field.value or "",
+                        mauza=dialog_mauza,
+                    )
+                    naqsha_results.controls = render_records(records)
+
+            naqsha_no_field.on_submit = run_search
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Import from Naqsha"),
+                content=ft.Column([
+                    ft.Text(
+                        f"Saved Naqsha khewats in mauza '{dialog_mauza}'. "
+                        "Their Square/Kila values are added to the "
+                        "selection.", size=11, color="#64748B",
+                    ),
+                    ft.Row([naqsha_no_field,
+                            ft.OutlinedButton("Search", on_click=run_search)],
+                           wrap=True, spacing=8),
+                    naqsha_status,
+                    naqsha_results,
+                ], spacing=8, scroll=ft.ScrollMode.AUTO),
+                actions=[ft.TextButton("Close",
+                                       on_click=lambda _: page.pop_dialog())],
+            ))
+            run_search(None)
+
         def show_selection_summary(_=None):
             try:
                 raw_year = (published_year_filter.value or "").strip()
@@ -3025,6 +3156,8 @@ def build_dc_rates_page(
                        vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Row([
                     ft.OutlinedButton("Import Khewats (CSV / Excel / ODS)", on_click=import_khewat_file),
+                    ft.OutlinedButton("Import from Naqsha", on_click=import_from_naqsha,
+                                      tooltip="Add Square/Kila from a saved Naqsha khewat"),
                     ft.TextButton("Download Excel template", on_click=save_khewat_template),
                 ], wrap=True),
                 ft.Button(
