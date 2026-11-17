@@ -1881,3 +1881,70 @@ def test_clear_all_fields_resets_everything(monkeypatch):
              if isinstance(control, ft.Text) and control.value]
     assert any("All fields cleared" in text for text in texts)
 
+
+
+def test_calculate_fetches_schedules_outside_the_transaction_window(monkeypatch):
+    """A schedule the rates tab shows must be fetched on Calculate too.
+
+    Rows whose effective window does not cover today used to be filtered
+    out silently; they are now fetched with an explicit warning
+    (developer report 2).
+    """
+    matches = [_location_row(7)]
+    rates = {"dc": [dict(_dc_rate(11, 7), effective_from=valuation.date(2030, 1, 1))]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    rate = _dropdown(controls, "Matched DC rate")
+    assert rate.options, "The out-of-window schedule row was not fetched."
+    assert rate.value == "11"
+    warnings = [control.value for control in walk_controls(root)
+                if isinstance(control, ft.Text) and control.value
+                and "is effective on" in control.value]
+    assert warnings, "The out-of-window warning was not shown."
+    assert "2030-01-01" in warnings[0]
+
+
+def test_fetch_lowest_and_highest_dc_rate_by_unit(monkeypatch):
+    """The fetch buttons pick the cheapest/dearest fetched DC rate."""
+    matches = [_location_row(7)]
+    rates = {"dc": [
+        _dc_rate(11, 7),
+        dict(_dc_rate(12, 7), rate_value="50"),
+        dict(_dc_rate(13, 7), rate_value="250"),
+    ]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    rate = _dropdown(controls, "Matched DC rate")
+    assert rate.value == "11"  # auto-picked first row
+
+    lowest = next(control for control in walk_controls(root)
+                  if isinstance(control, ft.OutlinedButton)
+                  and control.content == "Lowest rate")
+    lowest.on_click(SimpleNamespace(control=lowest))
+    assert rate.value == "12"  # Rs. 50 is the lowest fetched rate
+
+    highest = next(control for control in walk_controls(root)
+                   if isinstance(control, ft.OutlinedButton)
+                   and control.content == "Highest rate")
+    highest.on_click(SimpleNamespace(control=highest))
+    assert rate.value == "13"  # Rs. 250 is the highest fetched rate

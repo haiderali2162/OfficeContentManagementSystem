@@ -640,10 +640,15 @@ def build_valuation_page(
             suggestions_status.value = ""
 
     def matching_locations():
+        # The DC / FBR rates tab searches without a candidate cap; the
+        # calculator previously stopped at 200 locations, so a matching
+        # schedule could be found there but "not fetched" here (developer
+        # report 2). 1000 keeps the dropdown usable while matching the
+        # rates-tab reach for real office data.
         return find_schedule_location_matches(
             land_type=property_profile.value,
             context=_location_context(),
-            limit=200,
+            limit=1000,
         )
 
     def _rate_label(rate: dict[str, Any]) -> str:
@@ -685,6 +690,27 @@ def build_valuation_page(
                 parts.append(f"Khasra {khasra}")
         return " · ".join(parts) or "Schedule location"
 
+    def _rate_effective_on(row: dict[str, Any]) -> bool:
+        """True when a rate row covers the transaction date.
+
+        Mirrors the SQL effective-window condition; unparsable dates are
+        kept (they were visible before this check existed).
+        """
+        start = row.get("effective_from")
+        end = row.get("effective_to")
+        try:
+            if isinstance(start, str) and start:
+                start = date.fromisoformat(str(start)[:10])
+            if isinstance(end, str) and end:
+                end = date.fromisoformat(str(end)[:10])
+        except ValueError:
+            return True
+        if isinstance(start, date) and start > transaction_date:
+            return False
+        if isinstance(end, date) and end < transaction_date:
+            return False
+        return True
+
     def refresh_rate_matches(_=None):
         """Fetch active schedule rows and preselect unique unit/rate matches."""
         # Cache the current location inputs so page rebuilds (tab switches)
@@ -707,10 +733,20 @@ def build_valuation_page(
         )
         candidates = matching_locations() if lookup_value else []
         candidate_ids = [int(item["id"]) for item in candidates]
+        # The rates tab shows schedule rows regardless of their effective
+        # window; the calculator filtered them by the transaction date, so a
+        # schedule fetched successfully there was "not fetched" here
+        # (developer report 2). All rows of the matched locations are
+        # fetched now; rows effective on the transaction date are preferred,
+        # and when only out-of-window rows exist they stay selectable with a
+        # clear warning instead of vanishing.
         all_rates = [row for schedule in ("dc", "fbr")
                      for row in list_dc_rates(location_ids=candidate_ids,
-                                              schedule_type=schedule,
-                                              effective_on=transaction_date)]
+                                              schedule_type=schedule)]
+        effective_rates = [row for row in all_rates if _rate_effective_on(row)]
+        rates_out_of_window = bool(all_rates) and not effective_rates
+        if effective_rates:
+            all_rates = effective_rates
         typed_classification = (
             classification.value if classification.value not in (None, "", "none") else None
         )
@@ -974,15 +1010,85 @@ def build_valuation_page(
             classification.value = classes[0]
         selected_dc = next((row for row in rate_records["dc"]
                             if str(row["id"]) == dc_rate_choice.value), None)
+        window_note = ""
+        if rates_out_of_window:
+            windows = sorted({
+                f"{row.get('effective_from')} to {row.get('effective_to') or 'open'}"
+                for row in all_rates
+            })
+            window_note = (
+                f" Note: none of these rows is effective on "
+                f"{transaction_date.isoformat()} (window(s): "
+                f"{'; '.join(windows[:3])}). Check the schedule dates "
+                "before relying on the result."
+            )
         if selected_dc:
-            rate_match_status.value = f"DC rate found: {_rate_label(selected_dc)}"
+            rate_match_status.value = (
+                f"DC rate found: {_rate_label(selected_dc)}" + window_note
+            )
+        elif rate_records["dc"]:
+            rate_match_status.value = (
+                f"{len(rate_records['dc'])} DC rate(s) found. Choose a unit "
+                "and rate to continue." + window_note
+            )
         else:
             rate_match_status.value = (
                 "The location matches, but no active DC rate was found for today's date."
-                if not rate_records["dc"] else
-                f"{len(rate_records['dc'])} DC rate(s) found. Choose a unit and rate to continue."
             )
         page.update()
+
+    def fetch_extreme_dc_rate(_=None, *, highest: bool = False):
+        """Select the lowest/highest fetched DC rate (developer request 1).
+
+        The search runs on the rows of the selected DC rate unit (marla,
+        kanal, foot, acre, ...); the estimate then calculates against the
+        fetched value like any manually picked rate.
+        """
+        rows = list(rate_records["dc"])
+        if not rows:
+            rate_match_status.value = (
+                "Fetch a schedule first — there is no DC rate row to pick from."
+            )
+            page.update()
+            return
+
+        def amount(row: dict[str, Any]) -> Decimal | None:
+            try:
+                return Decimal(str(row.get("rate_value")))
+            except (InvalidOperation, ValueError, TypeError):
+                return None
+
+        candidates = [row for row in rows if amount(row) is not None]
+        if not candidates:
+            rate_match_status.value = (
+                "None of the fetched DC rows carries a numeric rate value."
+            )
+            page.update()
+            return
+        target = (max if highest else min)(candidates, key=amount)
+        word = "highest" if highest else "lowest"
+        if dc_rate_unit.value != target["rate_unit"]:
+            # The unit menu follows the fetched row so the option list
+            # matches what is selected.
+            dc_rate_unit.value = target["rate_unit"]
+            unit_rows = [row for row in rows if row["rate_unit"] == dc_rate_unit.value]
+            dc_rate_choice.options = [
+                ft.dropdown.Option(str(row["id"]), _rate_label(row))
+                for row in unit_rows
+            ]
+        dc_rate_choice.value = str(target["id"])
+        unit_label = RATE_UNITS.get(dc_rate_unit.value, dc_rate_unit.value or "")
+        rate_match_status.value = (
+            f"Fetched the {word} DC rate for {unit_label}: {_rate_label(target)}. "
+            "The estimate calculates against it."
+        )
+        page.update()
+
+    def fetch_lowest_dc_rate(_=None):
+        fetch_extreme_dc_rate(_=None, highest=False)
+
+    def fetch_highest_dc_rate(_=None):
+        fetch_extreme_dc_rate(_=None, highest=True)
 
     def refresh_location_state(_=None):
         # Any location change starts a new search context: a previously
@@ -3076,6 +3182,13 @@ def build_valuation_page(
                 ft.Container(registry_written_value, col={"xs": 12, "md": 5}),
                 ft.Container(written_fbr_toggle, col={"xs": 12, "md": 3}),
             ], run_spacing=8),
+            # Fetch the cheapest/dearest fetched DC rate for the selected
+            # unit and calculate against it (developer request).
+            ft.Row([
+                ft.Text("Fetch schedule by amount:", size=12, color="#64748B"),
+                ft.OutlinedButton("Lowest rate", on_click=fetch_lowest_dc_rate),
+                ft.OutlinedButton("Highest rate", on_click=fetch_highest_dc_rate),
+            ], wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         ]),
         fbr_search_section,
         make_collapsible_card("Buyers & sellers (deed parties)", [

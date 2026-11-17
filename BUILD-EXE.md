@@ -114,7 +114,7 @@ cd D:\Projects\Python\LandOffice
 - The result is the single file `dist_new\LandOfficeManager.exe`.
 - Build time: roughly 1–2 minutes (analysis is cached in `build_new\`, so
   rebuilds after small changes are faster).
-- Diagnostics land in `build_new\LandOfficeManager\warn-app.txt` — search it
+- Diagnostics land in `build_new\app\warn-app.txt` — search it
   for `missing module named` when something misbehaves at runtime.
 
 ### 4.3 Test the portable exe
@@ -160,8 +160,8 @@ with its data, copy the exe **and** the `data\` folder.
 
 | Symptom | Check / fix |
 |---------|-------------|
-| `No module named '<name>'` at runtime | The module is missing from the bundle. Add `<name>` to `hiddenimports` in `app.spec` and rebuild. Check `build_new\LandOfficeManager\warn-app.txt` for `missing module named '<name>'`. |
-| Exe exits immediately with code 1, no window | An import failed at startup. Read `build_new\LandOfficeManager\warn-app.txt`; look for `excluded module named X` — never exclude a module that is imported at top level (this was the `PIL` crash). Temporarily switch `console=False` → `console=True` in the spec to see the traceback in a console window. |
+| `No module named '<name>'` at runtime | The module is missing from the bundle. Add `<name>` to `hiddenimports` in `app.spec` and rebuild. Check `build_new\app\warn-app.txt` for `missing module named '<name>'`. |
+| Exe exits immediately with code 1, no window | An import failed at startup. Read `build_new\app\warn-app.txt`; look for `excluded module named X` — never exclude a module that is imported at top level (this was the `PIL` crash). Temporarily switch `console=False` → `console=True` in the spec to see the traceback in a console window. |
 | `python313.dll not found` after copying the exe | You copied the exe of an **onedir** build. Either copy the whole folder, or rebuild with the current one-file `app.spec`. |
 | The window opens but the exe downloads something on first start | The Flet client zip was not bundled — repeat §3.2 and rebuild. |
 | Antivirus flags or deletes the exe | Normal false positive for PyInstaller onefile apps; restore/exclude it. Renaming the exe does not help. |
