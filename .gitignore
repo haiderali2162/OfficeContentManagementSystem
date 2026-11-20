@@ -3,7 +3,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest_temp/
-dist_new
+
+# Build outputs (PyInstaller artefacts are huge and must never be pushed).
+build/
+dist/
+dist_new/
+build_new/
 
 data/
 .env
@@ -11,4 +16,3 @@ data/
 
 # Local generated implementation notes and plans.
 change-notes/
-build/

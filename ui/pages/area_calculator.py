@@ -18,6 +18,7 @@ from core.area_engine import (
     AreaSettings,
     LandArea,
     average_area,
+    parse_area_expression,
     sum_areas,
     subtract_areas,
 )
@@ -83,27 +84,28 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
         expand=True,
     )
 
-    # Area inputs use K, K-M, or K-M-F. Multiplication and division use B as
-    # a numeric factor; area arithmetic writes a normalized K-M-F value to A.
+    # Area inputs use K, K-M, K-M-F, or shorthand (1k, 10m, 100f,
+    # 10k10m20f). Multiplication and division use B as a numeric factor;
+    # area arithmetic writes a normalized K-M-F value to A.
     value_a = ft.TextField(
         label="A",
-        hint_text="Examples: 3-10-120, 12 kilas, or 3 acres",
+        hint_text="Examples: 3-10-120, 1k10m20f, 10m20f, 12 kilas, 3 acres",
         expand=True,
         autofocus=True,
     )
     value_b = ft.TextField(
         label="B",
-        hint_text="Area: K, K-M, or K-M-F",
+        hint_text="Area: K-M-F or shorthand (10k5m)",
         expand=True,
     )
     preview_a = ft.Text(
-        "Enter an area as K, K-M, or K-M-F to preview its units.",
+        "Enter an area as K-M-F or shorthand (1k, 10m, 100f, 10k10m20f) to preview its units.",
         size=12,
         selectable=True,
         color="#475569",
     )
     preview_b = ft.Text(
-        "Enter an area as K, K-M, or K-M-F to preview its units.",
+        "Enter an area as K-M-F or shorthand (1k, 10m, 100f, 10k10m20f) to preview its units.",
         size=12,
         selectable=True,
         color="#475569",
@@ -136,7 +138,7 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
     clear_button = ft.OutlinedButton("Clear")
     status_text = ft.Text("", color="#B91C1C", size=12)
     result_text = ft.Text(
-        "Enter K, K-M, or K-M-F in A and choose an operation.",
+        "Enter K-M-F or shorthand (10k5m) in A and choose an operation.",
         selectable=True,
     )
     details_text = ft.Text("", selectable=True, size=12, color="#475569")
@@ -182,7 +184,13 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
         )
 
     def parse_area(raw_value: str, label: str, settings: AreaSettings) -> LandArea:
-        """Accept K-M-F input or an amount explicitly labeled acres or kilas."""
+        """Accept K-M-F input, acres/kilas labels, or shorthand like 10k5m.
+
+        The dashed K, K-M, and K-M-F forms keep their previous behaviour;
+        the shorthand expressions (1k, 10m, 100f, 10k10m20f, 10m20f — a
+        plain number means kanal) reuse the exact engine parser already
+        used by the deed parties and the Naqsha module.
+        """
         raw = (raw_value or "").strip()
         unit_value = re.fullmatch(
             r"(\d+(?:\.\d+)?)\s*(acres?|kilas?)", raw, flags=re.IGNORECASE
@@ -192,19 +200,33 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
             if unit.lower().startswith("acre"):
                 return LandArea.from_acres(amount, settings)
             return LandArea.from_kila(amount, settings)
-        parts = raw.split("-")
-        if not raw or len(parts) not in {1, 2, 3}:
+        if not raw:
             raise AreaError(
                 f"{label} must use K, K-M, or K-M-F format, such as 2-5-100."
             )
+        if "-" in raw:
+            parts = raw.split("-")
+            if len(parts) not in {1, 2, 3}:
+                raise AreaError(
+                    f"{label} must use K, K-M, or K-M-F format, such as 2-5-100."
+                )
+            try:
+                values = [int(part.strip()) for part in parts]
+            except (ValueError, TypeError):
+                raise AreaError(
+                    f"{label} must use whole-number K, M, and F components."
+                ) from None
+            values.extend([0] * (3 - len(values)))
+            return LandArea.from_kmf(*values, settings=settings)
+        # Shorthand unit expression (developer request 2026-11-20).
         try:
-            values = [int(part.strip()) for part in parts]
-        except (ValueError, TypeError):
+            marlas = parse_area_expression(raw, settings=settings)
+        except AreaError as exc:
             raise AreaError(
-                f"{label} must use whole-number K, M, and F components."
+                f"{label} must use K-M-F (2-5-100), shorthand such as "
+                f"10k5m or 100f, or 3 acres: {exc}"
             ) from None
-        values.extend([0] * (3 - len(values)))
-        return LandArea.from_kmf(*values, settings=settings)
+        return LandArea(Decimal(marlas) * Decimal(settings.square_feet_per_marla))
 
     def parse_number(raw_value: str, label: str) -> Decimal:
         """Validate a scalar B operand as a finite, non-negative decimal."""
@@ -235,15 +257,15 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
         return percentage
 
     def format_area_preview(raw_value: str, settings: AreaSettings) -> str:
-        """Build live unit details for one syntactically complete K-M-F value."""
+        """Build live unit details for one syntactically complete area value."""
         if not (raw_value or "").strip():
-            return "Type K, K-M, or K-M-F to see its area conversions."
+            return "Type K-M-F or shorthand (1k, 10m, 100f, 10k10m20f) to see its area conversions."
         try:
             area = parse_area(raw_value, "Area", settings)
         except AreaError:
             # While users are midway through typing a hyphenated value, keep
             # the preview calm and descriptive instead of showing an error.
-            return "Complete the value as K, K-M, or K-M-F to see conversions."
+            return "Complete the value as K-M-F (2-5-100) or shorthand (10k5m) to see conversions."
 
         total_marlas = area.square_feet / Decimal(settings.square_feet_per_marla)
         total_sarsahi = total_marlas * Decimal(settings.sarsahi_per_marla)
@@ -598,7 +620,7 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
             }
             detail_lines = [
                 f"Operation: {operation}",
-                "Input format: K, K-M, K-M-F, acres, or kilas",
+                "Input format: K-M-F, shorthand (10k5m), acres, or kilas",
                 f"Result display: {display_unit}",
                 f"Square feet per marla: {settings.square_feet_per_marla}",
                 "Acre: 8 kanals",
@@ -693,7 +715,7 @@ def build_area_calculator_page(page: ft.Page) -> ft.Control:
         """Clear operands and results without changing regional settings."""
         value_a.value = ""
         value_b.value = ""
-        result_text.value = "Enter K, K-M, or K-M-F in A and choose an operation."
+        result_text.value = "Enter K-M-F or shorthand (10k5m) in A and choose an operation."
         details_text.value = ""
         status_text.value = ""
         update_area_previews()
