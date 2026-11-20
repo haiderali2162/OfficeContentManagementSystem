@@ -1,3 +1,6 @@
-on calculate tab of the "valuation & taxes" page fix the following:
- 	1. make an option to to fetch fetch minimum or maximum schedule based on the "dc rate unit" like marla, kanal, foot, acre etc. and allow fees calculation against that fetched value.
-	2. also make search option work better as i searched a schedule on the "dc / fbr rate" tab and i fetched it successfully but on the calculate tab for some reason it was not fetching the same schedule even though it was working on the other page.
+On the "Valuation & taxes" calculate tab:
+	1. while saving a khewat it picks and stores the info from the input fields which is not desirable. i want it to store the info from the row and only requires the khewat no from the user.
+	2. also make sure if the same row is already stored in a khewat of a muaza, it should not store the duplicate one without warning the user.
+	3. also allow user to remove the duplicate rows from the khewat. make an option to find duplicates in a specific khewat and allow user to select to remove from duplicates.
+
+do not mess with any other working code.

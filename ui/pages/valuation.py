@@ -55,8 +55,10 @@ from services.naqsha_service import (
 from services.schedule_lookup_service import (
     ScheduleLookupError,
     delete_schedule_lookup,
+    find_duplicate_schedule_lookups,
     list_all_schedule_lookups,
     list_schedule_lookups,
+    remove_saved_lookup_rows,
     row_fingerprint,
     row_reference_label,
     save_schedule_lookup,
@@ -2340,6 +2342,10 @@ def build_valuation_page(
     khewat_save_button = ft.OutlinedButton("Save current schedule")
     khewat_load_button = ft.OutlinedButton("Load from khewat no.")
     khewat_view_button = ft.OutlinedButton("View all khewats")
+    khewat_duplicates_button = ft.OutlinedButton(
+        "Find duplicate rows",
+        tooltip="Find and remove rows stored twice in one khewat",
+    )
     khewat_naqsha_button = ft.OutlinedButton(
         "Load from Naqsha", tooltip="Load land data saved in the Naqsha module",
     )
@@ -2358,7 +2364,8 @@ def build_valuation_page(
             size=12, color="#64748B",
         ),
         ft.Row([khewat_no_field, khewat_mauza_col, khewat_save_button,
-                khewat_load_button, khewat_view_button, khewat_naqsha_button],
+                khewat_load_button, khewat_view_button, khewat_duplicates_button,
+                khewat_naqsha_button],
                wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         khewat_pick,
         khewat_status,
@@ -2367,36 +2374,52 @@ def build_valuation_page(
 
     # Khewat schedule lookup handlers (developer request 3).
     def _current_schedule_entry() -> dict[str, Any]:
-        """Snapshot the currently searched schedule for khewat storage."""
+        """Snapshot the selected schedule ROW for khewat storage.
+
+        The stored details come from the fetched schedule row (the selected
+        DC rate row carries the full location snapshot; the individual
+        Square/Kila pair comes from the selected location option) — not
+        from whatever happens to be typed in the input fields. Only the
+        khewat number is asked from the user (developer request
+        2026-11-20).
+        """
         selected_dc = next((row for row in rate_records["dc"]
                             if str(row["id"]) == dc_rate_choice.value), None)
         selected_fbr = next((row for row in rate_records["fbr"]
                              if str(row["id"]) == fbr_rate_choice.value), None)
         if selected_dc is None:
             raise ValueError(
-                "Calculate or select a DC schedule before saving it to a khewat."
+                "Calculate or select a DC schedule row before saving it to "
+                "a khewat — the stored details come from the row itself."
             )
+        row = selected_dc
+        # A selected individual Square/Kila pair (option key "id:sq:kila")
+        # is part of the row's own expansion; trust it when it belongs to
+        # this row's location.
+        pair_square = pair_kila = None
+        selected_key = str(location_match.value or "")
+        key_parts = selected_key.split(":")
+        if (len(key_parts) == 3
+                and key_parts[0] == str(row.get("location_id"))):
+            pair_square, pair_kila = key_parts[1], key_parts[2]
         return {
-            "land_type": property_profile.value,
-            "district": _text_value(district) or selected_dc.get("district"),
-            "tehsil": _text_value(tehsil) or selected_dc.get("tehsil"),
-            "qanoongoi": _text_value(qanoongoi) or selected_dc.get("qanoongoi"),
-            "mauza": _text_value(mauza) or selected_dc.get("mauza"),
-            "square_no": (square_no.value or "").strip() or None,
-            "kila_no": (kila_no.value or "").strip() or None,
-            "locality": _text_value(schedule_location) or selected_dc.get("locality"),
-            "committee_town": _text_value(town) or selected_dc.get("committee_town"),
-            "revenue_circle": (
-                _text_value(revenue_circle) or selected_dc.get("revenue_circle")
-                or (selected_fbr or {}).get("revenue_circle")
-            ),
-            "property_area": (
-                _text_value(property_area) or selected_dc.get("property_area")
-                or (selected_fbr or {}).get("property_area")
-            ),
-            "classification": effective_classification_value(),
-            "dc_rate_id": int(selected_dc["id"]) if selected_dc else None,
-            "dc_rate_label": _rate_label(selected_dc) if selected_dc else None,
+            "land_type": row.get("land_type") or property_profile.value,
+            "district": row.get("district"),
+            "tehsil": row.get("tehsil"),
+            "qanoongoi": row.get("qanoongoi"),
+            "mauza": row.get("mauza"),
+            "square_no": (pair_square or row.get("square_no")) or None,
+            "kila_no": (pair_kila or row.get("kila_no")) or None,
+            "locality": row.get("locality"),
+            "committee_town": row.get("committee_town"),
+            "revenue_circle": row.get("revenue_circle")
+            or (selected_fbr or {}).get("revenue_circle"),
+            "property_area": row.get("property_area")
+            or (selected_fbr or {}).get("property_area"),
+            "classification": row.get("classification")
+            or effective_classification_value(),
+            "dc_rate_id": int(row["id"]),
+            "dc_rate_label": _rate_label(row),
             "fbr_rate_id": int(selected_fbr["id"]) if selected_fbr else None,
             "fbr_rate_label": _rate_label(selected_fbr) if selected_fbr else None,
         }
@@ -2444,7 +2467,7 @@ def build_valuation_page(
                 for value in dict.fromkeys([*saved, *names])
             ]
 
-    def save_current_to_khewat(_=None):
+    def save_current_to_khewat(_=None, *, allow_duplicate: bool = False):
         number = (khewat_no_field.value or "").strip()
         try:
             entry = _current_schedule_entry()
@@ -2457,9 +2480,46 @@ def build_valuation_page(
         if not (khewat_mauza_scope.value or "").strip():
             khewat_mauza_scope.value = str(entry.get("mauza") or "")
         try:
-            result = save_schedule_lookup(number, entry)
+            result = save_schedule_lookup(number, entry,
+                                          allow_duplicate=allow_duplicate)
         except ScheduleLookupError as exc:
             khewat_status.value = str(exc)
+            page.update()
+            return
+        if str(result.get("status")) == "duplicate_in_mauza":
+            # The same schedule row already exists under another khewat of
+            # this mauza: warn with a dialog before storing anything
+            # (developer request 2026-11-20).
+            existing = ", ".join(
+                f"khewat {item}" for item in result.get("existing_in") or []
+            ) or "another khewat of this mauza"
+
+            def save_anyway(_=None):
+                page.pop_dialog()
+                save_current_to_khewat(allow_duplicate=True)
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Duplicate schedule row"),
+                content=ft.Column([
+                    ft.Text(
+                        f"This schedule row is already stored under "
+                        f"{existing}. Nothing was added yet.",
+                        size=13,
+                    ),
+                    ft.Text(
+                        f"Save it again under khewat "
+                        f"{result.get('khewat_no')} anyway? (Shared squares "
+                        "and kilas can legitimately belong to several "
+                        "khewats.)",
+                        size=12, color="#64748B",
+                    ),
+                ], tight=True, spacing=8),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.TextButton("Save anyway", on_click=save_anyway),
+                ],
+            ))
             page.update()
             return
         stored_number = str(result.get("khewat_no") or number)
@@ -3143,9 +3203,167 @@ def build_valuation_page(
         ))
         run_naqsha_search(None)
 
+    # Duplicate finder (developer request 2026-11-20): find rows stored
+    # twice in one khewat and let the user pick which copies to remove.
+    def open_duplicate_finder(_=None):
+        dup_khewat_field = ft.TextField(
+            label="Khewat No.",
+            value=str(khewat_no_field.value or ""), width=140,
+        )
+        dup_mauza_field = ft.TextField(
+            label="Mauza (optional)",
+            value=str(khewat_mauza_scope.value or ""), width=160,
+        )
+        dup_status = ft.Text("", size=11, color="#64748B")
+        dup_results = ft.Column(spacing=8)
+        checked: dict[str, dict[str, Any]] = {}
+
+        def render_groups(groups: list[list[dict[str, Any]]]) -> list[ft.Control]:
+            checked.clear()
+            blocks: list[ft.Control] = []
+            for group_index, group in enumerate(groups):
+                rows_controls: list[ft.Control] = []
+                for row_index, record in enumerate(group):
+                    checkbox = ft.Checkbox(value=False)
+
+                    def on_toggle(e, record=record, checkbox=checkbox):
+                        if checkbox.value:
+                            checked[str(id(record))] = record
+                        else:
+                            checked.pop(str(id(record)), None)
+
+                    checkbox.on_change = on_toggle
+                    rows_controls.append(ft.Row([
+                        checkbox,
+                        ft.Text(_describe_saved_row(record), size=12,
+                                expand=True),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER))
+                blocks.append(ft.Container(
+                    ft.Column([
+                        ft.Text(
+                            f"{len(group)} identical copies: "
+                            f"{row_reference_label(group[0])}",
+                            size=13, weight=ft.FontWeight.BOLD,
+                            color="#1E293B",
+                        ),
+                        *rows_controls,
+                    ], spacing=4),
+                    padding=10,
+                    bgcolor="#FFFFFF",
+                    border=ft.Border.all(1, "#E2E8F0"),
+                    border_radius=8,
+                ))
+            if not blocks:
+                blocks.append(ft.Text(
+                    "No duplicate rows found in this khewat — every stored "
+                    "schedule row is unique.", size=12, color="#64748B",
+                ))
+            return blocks
+
+        def run_dup_search(_=None):
+            async def load():
+                try:
+                    groups = await asyncio.to_thread(
+                        find_duplicate_schedule_lookups,
+                        dup_khewat_field.value or "",
+                        mauza=dup_mauza_field.value or "",
+                    )
+                except ScheduleLookupError as exc:
+                    dup_status.value = str(exc)
+                    page.update()
+                    return
+                except Exception as exc:
+                    dup_status.value = f"Could not search duplicates: {exc}"
+                    page.update()
+                    return
+                dup_results.controls = render_groups(groups)
+                total = sum(len(group) - 1 for group in groups)
+                dup_status.value = (
+                    f"{len(groups)} duplicate group(s) found "
+                    f"({total} extra row(s))."
+                    if groups else ""
+                )
+                page.update()
+
+            if hasattr(page, "run_task"):
+                page.run_task(load)
+            else:
+                groups = find_duplicate_schedule_lookups(
+                    dup_khewat_field.value or "",
+                    mauza=dup_mauza_field.value or "",
+                )
+                dup_results.controls = render_groups(groups)
+
+        def remove_selected(_=None):
+            if not checked:
+                dup_status.value = "Tick the copies to remove first."
+                page.update()
+                return
+            selected = list(checked.values())
+
+            def do_remove(_=None):
+                try:
+                    removed = remove_saved_lookup_rows(
+                        dup_khewat_field.value or "", selected,
+                    )
+                except ScheduleLookupError as exc:
+                    page.pop_dialog()
+                    dup_status.value = str(exc)
+                    page.update()
+                    return
+                page.pop_dialog()
+                khewat_status.value = (
+                    f"Removed {removed} duplicate row(s) from khewat "
+                    f"{dup_khewat_field.value or ''}."
+                )
+                refresh_khewat_mauza_hints()
+                page.update()
+                run_dup_search(None)
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Remove selected duplicate rows?"),
+                content=ft.Text(
+                    f"Remove {len(selected)} selected row copy/copies from "
+                    f"khewat {dup_khewat_field.value or ''}? The remaining "
+                    "copies keep the schedule usable.",
+                    size=13,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.TextButton("Remove", on_click=do_remove),
+                ],
+            ))
+
+        dup_khewat_field.on_submit = run_dup_search
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Find duplicate rows in a khewat"),
+            content=ft.Column([
+                ft.Text(
+                    "Rows with identical schedule details stored twice in "
+                    "one khewat (for example saved twice before duplicate "
+                    "protection existed). Tick the copies to remove; at "
+                    "least one copy of each row should stay.",
+                    size=11, color="#64748B",
+                ),
+                ft.Row([dup_khewat_field, dup_mauza_field,
+                        ft.OutlinedButton("Search", on_click=run_dup_search),
+                        ft.OutlinedButton("Remove selected",
+                                          on_click=remove_selected)],
+                       wrap=True, spacing=8,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                dup_status,
+                dup_results,
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[ft.TextButton("Close", on_click=lambda _: page.pop_dialog())],
+        ))
+        run_dup_search(None)
+
     khewat_save_button.on_click = save_current_to_khewat
     khewat_load_button.on_click = load_from_khewat
     khewat_view_button.on_click = open_khewat_overview
+    khewat_duplicates_button.on_click = open_duplicate_finder
     khewat_naqsha_button.on_click = open_naqsha_loader
     khewat_pick.on_select = pick_saved_khewat_row
     khewat_pick.on_change = pick_saved_khewat_row

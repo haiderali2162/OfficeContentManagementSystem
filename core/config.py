@@ -23,4 +23,4 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Application information.
 APP_NAME = "Land Office Manager"
-APP_VERSION = "0.2.8"
+APP_VERSION = "0.2.9"

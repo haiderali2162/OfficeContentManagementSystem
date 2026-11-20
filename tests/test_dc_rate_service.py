@@ -2473,6 +2473,98 @@ def test_saved_schedule_lookup_round_trip_and_multi_row(monkeypatch, tmp_path):
         schedule_lookup_service.list_schedule_lookups("")
 
 
+def test_saved_lookup_warns_on_mauza_wide_duplicate(monkeypatch, tmp_path):
+    """The same row under another khewat of the same mauza needs a warning."""
+    from services import schedule_lookup_service
+
+    saved = {}
+    monkeypatch.setattr(schedule_lookup_service, "get_setting", lambda key, default=None: saved.get(key, default))
+    monkeypatch.setattr(schedule_lookup_service, "set_setting",
+                        lambda key, value: saved.__setitem__(key, value))
+
+    entry = {
+        "land_type": "rural", "mauza": "Anmba", "square_no": "23",
+        "kila_no": "6", "dc_rate_id": 1, "fbr_rate_id": None,
+    }
+    schedule_lookup_service.save_schedule_lookup("K-101", entry)
+
+    # Same row, different khewat number, same mauza: refused with a report
+    # naming where it already lives — nothing is stored before the user
+    # confirms (developer request 2026-11-20).
+    result = schedule_lookup_service.save_schedule_lookup("K-102", entry)
+    assert result["status"] == "duplicate_in_mauza"
+    assert result["existing_in"] == ["K-101"]
+    assert result["rows"] == 0
+    assert schedule_lookup_service.list_schedule_lookups("K-102") == []
+
+    # Confirming the warning stores it deliberately.
+    result = schedule_lookup_service.save_schedule_lookup(
+        "K-102", entry, allow_duplicate=True,
+    )
+    assert result["status"] == "saved"
+    assert result["rows"] == 1
+
+    # A different row saves without any warning.
+    other = dict(entry, square_no="24")
+    result = schedule_lookup_service.save_schedule_lookup("K-102", other)
+    assert result["status"] == "saved"
+
+    # Rows in another mauza are unaffected by the scope.
+    result = schedule_lookup_service.save_schedule_lookup(
+        "K-103", dict(entry, mauza="Model Town", locality="Bazar"),
+    )
+    assert result["status"] == "saved"
+
+
+def test_duplicate_finder_and_exact_row_removal(monkeypatch, tmp_path):
+    """Duplicates in one khewat can be found and removed copy by copy."""
+    from services import schedule_lookup_service
+
+    saved = {}
+    monkeypatch.setattr(schedule_lookup_service, "get_setting", lambda key, default=None: saved.get(key, default))
+    monkeypatch.setattr(schedule_lookup_service, "set_setting",
+                        lambda key, value: saved.__setitem__(key, value))
+
+    entry = {
+        "land_type": "rural", "mauza": "Anmba", "square_no": "23",
+        "kila_no": "6", "dc_rate_id": 1, "fbr_rate_id": None,
+    }
+    # Duplicate protection makes the service refuse same-khewat doubles,
+    # so legacy duplicates (saved before fingerprints) are seeded directly.
+    fingerprint = schedule_lookup_service.row_fingerprint(entry)
+    twin_a = {"khewat_no": "K-201", "saved_at": "2026-11-20T10:00:00+00:00",
+              "row_fingerprint": fingerprint, **entry}
+    twin_b = {"khewat_no": "K-201", "saved_at": "2026-11-20T10:05:00+00:00",
+              "row_fingerprint": fingerprint, **entry}
+    schedule_lookup_service.set_setting(
+        schedule_lookup_service._STORE_KEY, [twin_a, twin_b],
+    )
+    groups = schedule_lookup_service.find_duplicate_schedule_lookups("K-201")
+    assert len(groups) == 1 and len(groups[0]) == 2
+    # The mauza scope narrows the khewat lookup itself.
+    assert len(schedule_lookup_service.find_duplicate_schedule_lookups(
+        "K-201", mauza="Anmba",
+    )) == 1
+    assert schedule_lookup_service.find_duplicate_schedule_lookups(
+        "K-201", mauza="Other Mauza",
+    ) == []
+
+    # Removing one exact copy keeps the row usable.
+    removed = schedule_lookup_service.remove_saved_lookup_rows(
+        "K-201", [groups[0][0]],
+    )
+    assert removed == 1
+    assert schedule_lookup_service.find_duplicate_schedule_lookups("K-201") == []
+    rows = schedule_lookup_service.list_schedule_lookups("K-201")
+    assert len(rows) == 1 and rows[0]["square_no"] == "23"
+
+    # Nothing is removed when the row belongs to another khewat.
+    removed = schedule_lookup_service.remove_saved_lookup_rows(
+        "K-999", list(rows),
+    )
+    assert removed == 0
+
+
 def test_saved_schedule_lookup_edit_delete_and_mauza_summary(monkeypatch, tmp_path):
     """Saved rows can be edited and deleted; summaries group mauza-wise."""
     from services import schedule_lookup_service

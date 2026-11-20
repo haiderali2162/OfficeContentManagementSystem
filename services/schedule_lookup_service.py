@@ -93,7 +93,12 @@ def _stored_fingerprint(record: dict[str, Any]) -> str:
     return row_fingerprint(record)
 
 
-def save_schedule_lookup(khewat_no: Any, entry: dict[str, Any]) -> dict[str, Any]:
+def save_schedule_lookup(
+    khewat_no: Any,
+    entry: dict[str, Any],
+    *,
+    allow_duplicate: bool = False,
+) -> dict[str, Any]:
     """Store one schedule entry under the khewat number — never duplicated.
 
     The schedule-identity fingerprint decides the outcome:
@@ -102,10 +107,16 @@ def save_schedule_lookup(khewat_no: Any, entry: dict[str, Any]) -> dict[str, Any
     * an identical row that is already stored is left untouched
       (status ``duplicate``);
     * a row whose schedule identity exists but whose stored rate selection
-      differs is refreshed in place (status ``updated``).
+      differs is refreshed in place (status ``updated``);
+    * a row that already exists under another khewat number of the same
+      mauza is NOT stored again unless the caller passes
+      ``allow_duplicate=True`` — instead status ``duplicate_in_mauza`` is
+      returned with ``existing_in`` naming the khewat numbers, so the UI
+      can warn before storing (developer request 2026-11-20).
 
-    Returns ``{"status", "khewat_no", "rows", "record"}`` where ``rows`` is
-    the number of schedule rows now stored under that khewat number.
+    Returns ``{"status", "khewat_no", "rows", "record", "existing_in"}``
+    where ``rows`` is the number of schedule rows now stored under that
+    khewat number.
     """
     number = _normalize_khewat(khewat_no)
     if not isinstance(entry, dict) or not entry:
@@ -122,6 +133,31 @@ def save_schedule_lookup(khewat_no: Any, entry: dict[str, Any]) -> dict[str, Any
             existing_index = index
             break
     if existing_index is None:
+        # Same schedule row under another khewat of the same mauza? Warn
+        # (and refuse) before storing, unless the user confirmed it.
+        mauza_key = str(entry.get("mauza") or "").strip().casefold()
+        existing_in: list[str] = []
+        if mauza_key:
+            existing_in = [
+                str(record.get("khewat_no") or "").strip()
+                for record in store
+                if str(record.get("khewat_no") or "").strip().casefold()
+                != number.casefold()
+                and str(record.get("mauza") or "").strip().casefold() == mauza_key
+                and _stored_fingerprint(record) == fingerprint
+            ]
+        if existing_in and not allow_duplicate:
+            return {
+                "status": "duplicate_in_mauza",
+                "khewat_no": number,
+                "rows": sum(
+                    1 for item in store
+                    if str(item.get("khewat_no") or "").strip().casefold()
+                    == number.casefold()
+                ),
+                "record": None,
+                "existing_in": list(dict.fromkeys(existing_in)),
+            }
         record = {
             "khewat_no": number,
             "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -156,6 +192,8 @@ def save_schedule_lookup(khewat_no: Any, entry: dict[str, Any]) -> dict[str, Any
         "status": status,
         "khewat_no": number,
         "rows": rows,
+        "record": record,
+        "existing_in": [],
         "record": record,
     }
 
@@ -229,6 +267,59 @@ def delete_schedule_lookup(khewat_no: Any, fingerprint: str) -> bool:
         return False
     set_setting(_STORE_KEY, keep)
     return True
+
+
+def find_duplicate_schedule_lookups(
+    khewat_no: Any,
+    *,
+    mauza: str = "",
+) -> list[list[dict[str, Any]]]:
+    """Groups of identical rows stored twice in one khewat.
+
+    Rows sharing the same schedule-identity fingerprint inside the khewat
+    are duplicates (older saves could add the same schedule row twice
+    before fingerprint protection existed). The optional mauza scopes the
+    khewat number lookup. Groups with a single row are not returned.
+    """
+    rows = list_schedule_lookups(khewat_no, mauza=mauza)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in rows:
+        groups.setdefault(_stored_fingerprint(record), []).append(record)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+def remove_saved_lookup_rows(
+    khewat_no: Any,
+    records: list[dict[str, Any]],
+) -> int:
+    """Remove exactly the given saved rows (matched by full record equality).
+
+    Used by the duplicate finder: the user selects which duplicate copies
+    to drop. Truly identical copies are indistinguishable, so removing one
+    of two identical twins drops one occurrence. Returns the removed count.
+    """
+    number = _normalize_khewat(khewat_no)
+    targets = [
+        record for record in (records or [])
+        if isinstance(record, dict)
+        and str(record.get("khewat_no") or "").strip().casefold()
+        == number.casefold()
+    ]
+    if not targets:
+        return 0
+    store = _load_store()
+    remaining: list[dict[str, Any]] = []
+    removed = 0
+    pending = list(targets)
+    for record in store:
+        if record in pending:
+            pending.remove(record)
+            removed += 1
+            continue
+        remaining.append(record)
+    if removed:
+        set_setting(_STORE_KEY, remaining)
+    return removed
 
 
 def list_all_schedule_lookups() -> list[dict[str, Any]]:
