@@ -7,8 +7,8 @@ from decimal import Decimal
 import json
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy import func
+from sqlalchemy import select, func
+# from sqlalchemy import func
 from sqlalchemy.orm import joinedload
 
 from core.database import SessionLocal

@@ -150,9 +150,12 @@ def build_naqsha_page(page: ft.Page) -> ft.Control:
             allow_multiple=False,
             with_data=True,
         )
-        if not result or not result.files:
+        # flet 1.0.4 returns the chosen files as a plain list here; older
+        # shapes returned a result object with a ``files`` attribute.
+        chosen_files = getattr(result, "files", result)
+        if not chosen_files:
             return None
-        chosen = result.files[0]
+        chosen = chosen_files[0]
         return chosen.bytes, chosen.name
 
     def _load_dataset(dataset: str, text: str, file_bytes: bytes | None,

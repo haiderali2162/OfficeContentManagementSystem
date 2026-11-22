@@ -9,6 +9,7 @@ from core.database import (
     check_database_connection,
     initialize_database,
 )
+from services.backup_service import start_backup_scheduler
 from ui.app_shell import AppShell
 
 
@@ -38,6 +39,10 @@ def main(page: ft.Page) -> None:
 
     # Initialize the database before displaying the UI.
     initialize_database()
+
+    # The backup scheduler is a daemon thread checking once per minute
+    # whether an automatic SQLite backup is due (Settings page controls it).
+    start_backup_scheduler()
 
     if not check_database_connection():
         page.title = APP_NAME

@@ -1,6 +1,3 @@
-On the "Valuation & taxes" calculate tab:
-	1. while saving a khewat it picks and stores the info from the input fields which is not desirable. i want it to store the info from the row and only requires the khewat no from the user.
-	2. also make sure if the same row is already stored in a khewat of a muaza, it should not store the duplicate one without warning the user.
-	3. also allow user to remove the duplicate rows from the khewat. make an option to find duplicates in a specific khewat and allow user to select to remove from duplicates.
-
-do not mess with any other working code.
+on the fbr clients page:
+	1. got the following error while importing "The application encountered an error: name 'status_text' is not defined"
+	2. as i earlier said, the data in the file is not properly formatted so either allow user to fix it while importing or output a new excel file with the rows which has issue. let user choose.

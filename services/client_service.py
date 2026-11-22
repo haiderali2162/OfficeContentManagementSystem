@@ -257,44 +257,109 @@ def _parse_amount(
 
 def _validate_client_data(
     *, name, cnic, ntn_number, cnic_expiry_date, phone_number, email, referred_by,
-    payment_amount, amount_received,
+    payment_amount, amount_received, required: dict[str, bool] | None = None,
+    father_name: str = "", tehsil: str = "", district: str = "",
+    city: str = "", province: str = "",
 ):
+    """Validate one client's core values.
+
+    ``required`` optionally overrides which identity/contact fields are
+    mandatory (the client import lets the user mark fields optional). When
+    it is ``None`` — every manual form path — the original rules apply:
+    a CNIC or NTN is needed, and phone, e-mail, and referrer are required.
+    """
     normalized_name = (name or "").strip()
     if not normalized_name:
         raise ClientServiceError("Client name is required.")
 
-    normalized_cnic = (cnic or "").strip()
+    # CNIC cells from spreadsheets arrive with or without dashes (and
+    # sometimes with stray spaces); normalize any 13-digit value to the
+    # stored 00000-0000000-0 shape before the format check.
+    normalized_cnic = re.sub(r"\D", "", str(cnic or ""))
+    if normalized_cnic and re.fullmatch(r"\d{13}", normalized_cnic):
+        normalized_cnic = (
+            f"{normalized_cnic[:5]}-{normalized_cnic[5:12]}-{normalized_cnic[12]}"
+        )
+    else:
+        normalized_cnic = str(cnic or "").strip()
     normalized_ntn = (ntn_number or "").strip()
     if normalized_cnic and not re.fullmatch(r"\d{5}-\d{7}-\d", normalized_cnic):
-        raise ClientServiceError("CNIC must use 00000-0000000-0 format.")
+        raise ClientServiceError(
+            "CNIC must use 00000-0000000-0 format (dashes optional)."
+        )
     if len(normalized_ntn) > 30:
         raise ClientServiceError("NTN number cannot exceed 30 characters.")
-    if not normalized_cnic and not normalized_ntn:
-        raise ClientServiceError("Enter a CNIC number, an NTN number, or both.")
+    if required is None:
+        if not normalized_cnic and not normalized_ntn:
+            raise ClientServiceError("Enter a CNIC number, an NTN number, or both.")
+    else:
+        if required.get("cnic") and not normalized_cnic:
+            raise ClientServiceError("CNIC is marked mandatory but missing.")
+        if required.get("ntn_number") and not normalized_ntn:
+            raise ClientServiceError("NTN number is marked mandatory but missing.")
 
     normalized_referrer = (referred_by or "").strip()
-    if not normalized_referrer:
+    if required is None and not normalized_referrer:
         raise ClientServiceError("Referred by is required.")
+    if required is not None and required.get("referred_by") and not normalized_referrer:
+        raise ClientServiceError("Referred by is marked mandatory but missing.")
 
     normalized_phone = (phone_number or "").strip()
     digits = re.sub(r"\D", "", normalized_phone)
-    if (
+    if normalized_phone and (
         not 7 <= len(digits) <= 15
         or not re.fullmatch(r"\+?[0-9 ().-]+", normalized_phone)
     ):
         raise ClientServiceError("Enter a valid phone number (7 to 15 digits).")
+    if required is None and not normalized_phone:
+        raise ClientServiceError("Enter a valid phone number (7 to 15 digits).")
+    if required is not None and required.get("phone_number") and not normalized_phone:
+        raise ClientServiceError("Phone number is marked mandatory but missing.")
 
     normalized_email = (email or "").strip()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized_email):
+    if normalized_email and not re.fullmatch(
+        r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized_email
+    ):
         raise ClientServiceError("Enter a valid email address.")
+    if required is None and not normalized_email:
+        raise ClientServiceError("Enter a valid email address.")
+    if required is not None and required.get("email") and not normalized_email:
+        raise ClientServiceError("Email is marked mandatory but missing.")
+
+    # Plain address/location fields: never required in the manual forms;
+    # the import may mark them mandatory (father/husband name generates
+    # from the name split when it is optional and a parentage is given).
+    if required is not None:
+        plain_specs = {
+            "father_name": ("Father/husband name", father_name),
+            "tehsil": ("Tehsil", tehsil),
+            "district": ("District", district),
+            "city": ("City", city),
+            "province": ("Province", province),
+        }
+        missing_plain = [
+            label for field, (label, value) in plain_specs.items()
+            if required.get(field) and not str(value or "").strip()
+        ]
+        if missing_plain:
+            raise ClientServiceError(
+                "Marked mandatory but missing: " + ", ".join(missing_plain)
+            )
 
     # CNIC expiry applies only when the record includes a CNIC identifier.
+    # The import's optional-fields choice also relaxes it (the manual
+    # forms keep the original rule).
     expiry = _parse_date(
         cnic_expiry_date,
         "CNIC expiry date",
-        required=bool(normalized_cnic),
+        required=bool(normalized_cnic) and required is None,
     )
-    total = _parse_amount(payment_amount, "Payment")
+    # The payment total is required in the manual forms; the import's
+    # optional-fields choice relaxes it (empty totals default to zero).
+    total = _parse_amount(
+        payment_amount, "Payment",
+        default=None if required is None else "0",
+    )
     received = _parse_amount(amount_received, "Amount received", default="0")
     if received > total:
         raise ClientServiceError("Amount received cannot exceed the payment amount.")
@@ -302,7 +367,7 @@ def _validate_client_data(
     return (
         normalized_name, normalized_cnic or None, normalized_ntn or None,
         expiry, normalized_referrer,
-        normalized_phone, normalized_email, total, received,
+        normalized_phone or None, normalized_email or None, total, received,
     )
 
 
@@ -370,19 +435,22 @@ def create_client(
     password: str = "",
     pin: str = "",
     custom_values: dict[int, str] | None = None,
+    field_requirements: dict[str, bool] | None = None,
+    allow_missing_password: bool = False,
 ) -> int:
     values = _validate_client_data(
         name=name, cnic=cnic, ntn_number=ntn_number,
         cnic_expiry_date=cnic_expiry_date,
         phone_number=phone_number, email=email, referred_by=referred_by,
         payment_amount=payment_amount, amount_received=amount_received,
+        required=field_requirements,
     )
     (
         name, cnic, ntn_number, expiry, referred_by,
         phone_number, email, total, received,
     ) = values
     password = (password or "").strip()
-    if not password:
+    if not password and not allow_missing_password:
         raise ClientServiceError("Password is required.")
 
     with SessionLocal.begin() as session:
@@ -406,7 +474,9 @@ def create_client(
             amount_received=received,
             current_status=current_status.strip() or None,
             referred_by=referred_by,
-            password_ciphertext=encrypt_secret(password),
+            # No password given (relaxed import): no credentials are
+            # stored at all — the column stays NULL, never plain text.
+            password_ciphertext=encrypt_secret(password) if password else None,
             pin_ciphertext=_encrypt_optional(pin),
         )
         session.add(client)

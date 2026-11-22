@@ -26,6 +26,14 @@ from core import database_config
 from core import database as core_database
 from core.database import initialize_database, reconfigure_database
 from core.database_copy import DatabaseCopyError, copy_sqlite_database
+from services.backup_service import (
+    BackupServiceError,
+    create_backup_now,
+    get_backup_settings,
+    get_last_backup_time,
+    list_backups,
+    save_backup_settings,
+)
 from services.settings_service import (
     CARD_BODY_FIELD_LABELS,
     CARD_COLOR_FIELDS,
@@ -622,6 +630,174 @@ def build_settings_page(page: ft.Page) -> ft.Control:
         tight=True,
     )
 
+    # Automatic backups (developer request 2026-11-20): on/off, frequency,
+    # folder, retention count, and a quick manual backup. Preferences live
+    # in the app-setting store; snapshots come from core.database_copy.
+    backup_settings = get_backup_settings()
+    backup_enabled = ft.Checkbox(
+        label="Enable automatic backups (SQLite databases)",
+        value=backup_settings["enabled"],
+    )
+    backup_frequency = ft.Dropdown(
+        label="Back up every",
+        width=160,
+        value=str(backup_settings["frequency_hours"]),
+        options=[
+            ft.dropdown.Option("1", "1 hour"),
+            ft.dropdown.Option("2", "2 hours"),
+            ft.dropdown.Option("4", "4 hours"),
+            ft.dropdown.Option("6", "6 hours"),
+            ft.dropdown.Option("12", "12 hours"),
+            ft.dropdown.Option("24", "24 hours"),
+            ft.dropdown.Option("168", "1 week"),
+        ],
+    )
+    backup_location = ft.TextField(
+        label="Backup folder",
+        value=backup_settings["location"],
+        hint_text="Absolute folder path, e.g. D:\\Backups\\LandOffice",
+        width=430,
+    )
+    backup_keep = ft.TextField(
+        label="Keep this many old backups",
+        value=str(backup_settings["keep_count"]),
+        width=220,
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+    backup_status = ft.Text("", size=12, color="#475569", selectable=True)
+    backup_list_label = ft.Text("", size=12, color="#64748B", selectable=True)
+
+    async def browse_backup_folder(_=None):
+        try:
+            selected = await file_picker.get_directory_path(
+                dialog_title="Choose the backup folder",
+                initial_directory=backup_location.value or None,
+            )
+        except Exception as exc:
+            backup_status.value = f"Could not open the folder picker: {exc}"
+            backup_status.color = "#B91C1C"
+        else:
+            if selected:
+                backup_location.value = selected
+                backup_status.value = (
+                    "Folder selected. Save the backup settings to apply it."
+                )
+                backup_status.color = "#475569"
+        page.update()
+
+    def refresh_backup_list():
+        backups = list_backups(backup_location.value or "")
+        backup_list_label.value = (
+            f"{len(backups)} backup file(s) in the folder"
+            + (
+                f"; newest: {backups[0]['name']} ({backups[0]['modified']})"
+                if backups else ""
+            )
+        )
+
+    def save_backup_prefs(_=None):
+        try:
+            saved = save_backup_settings(
+                enabled=bool(backup_enabled.value),
+                frequency_hours=int(backup_frequency.value or 24),
+                location=backup_location.value or "",
+                keep_count=backup_keep.value or 5,
+            )
+        except (BackupServiceError, ValueError) as exc:
+            backup_status.value = str(exc)
+            backup_status.color = "#B91C1C"
+        except Exception as exc:
+            backup_status.value = f"Could not save backup settings: {exc}"
+            backup_status.color = "#B91C1C"
+        else:
+            backup_status.value = (
+                "Automatic backups "
+                + ("enabled" if saved["enabled"] else "disabled")
+                + f" — every {saved['frequency_hours']} hour(s), keeping "
+                f"the newest {saved['keep_count']}."
+            )
+            backup_status.color = "#15803D"
+            refresh_backup_list()
+        page.update()
+
+    def manual_backup(_=None):
+        async def run():
+            try:
+                summary = await asyncio.to_thread(create_backup_now)
+            except BackupServiceError as exc:
+                backup_status.value = str(exc)
+                backup_status.color = "#B91C1C"
+            except Exception as exc:
+                backup_status.value = f"Backup failed: {exc}"
+                backup_status.color = "#B91C1C"
+            else:
+                removed = ", ".join(summary.get("removed_old") or []) or "none"
+                backup_status.value = (
+                    "Backup created: "
+                    f"{Path(str(summary.get('target', ''))).name} "
+                    f"(old backups removed: {removed})."
+                )
+                backup_status.color = "#15803D"
+            refresh_backup_list()
+            page.update()
+
+        if hasattr(page, "run_task"):
+            page.run_task(run)
+        else:
+            backup_status.value = (
+                "Back up now works in the running application."
+            )
+            page.update()
+
+    last_backup = get_last_backup_time()
+    backup_status.value = (
+        f"Last backup: {last_backup}." if last_backup else "No backup yet."
+    )
+    refresh_backup_list()
+    backup_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Automatic backups snapshot the whole SQLite database "
+                "(verified copy) into the chosen folder, then keep only "
+                "the newest files. The app checks once per minute while "
+                "it runs; the frequency decides when the next snapshot is "
+                "due. PostgreSQL/MySQL databases need their own backup "
+                "tooling.",
+                size=12,
+                color="#64748B",
+            ),
+            backup_enabled,
+            ft.Row(
+                controls=[backup_frequency, backup_keep],
+                spacing=8,
+                wrap=True,
+            ),
+            ft.Row(
+                controls=[
+                    backup_location,
+                    ft.OutlinedButton(
+                        "Browse folder", on_click=browse_backup_folder
+                    ),
+                ],
+                spacing=8,
+                wrap=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            ft.Row(
+                controls=[
+                    ft.Button("Save backup settings", on_click=save_backup_prefs),
+                    ft.OutlinedButton("Back up now", on_click=manual_backup),
+                ],
+                spacing=8,
+                wrap=True,
+            ),
+            backup_status,
+            backup_list_label,
+        ],
+        spacing=10,
+        tight=True,
+    )
+
     heading_field = ft.TextField(
         label="Card heading template",
         value=appearance["heading_template"],
@@ -1110,6 +1286,12 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Where exports go by default, and whether the app asks "
                 "before every import/export action.",
                 location_card,
+            ),
+            _category_tile(
+                "Automatic backups",
+                "On/off, backup frequency, folder, how many old backups to "
+                "keep, and a quick manual backup (SQLite databases).",
+                backup_card,
             ),
             _category_tile(
                 "Rate cards — appearance",

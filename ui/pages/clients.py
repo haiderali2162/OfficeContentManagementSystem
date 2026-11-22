@@ -1,6 +1,8 @@
 
+import asyncio
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from typing import Any, Callable
 
 import flet as ft
 from core.config import DATABASE_PATH
@@ -27,6 +29,22 @@ from services.client_service import (
 )
 from core.security import generate_secure_password
 from core.security import decrypt_secret
+from services.client_import_service import (
+    CLIENT_FIELD_LABELS,
+    REQUIREMENT_DEFAULTS,
+    ClientImportError,
+    apply_saved_column_swap,
+    build_client_import_preview,
+    export_clients,
+    import_clients,
+    preview_saved_column_swap,
+    read_client_table,
+    suggest_client_column_mapping,
+    swap_import_row_fields,
+)
+from services.client_import_service import (
+    SWAPPABLE_CLIENT_FIELDS as _SWAPPABLE_FIELDS,
+)
 
 
 def open_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
@@ -1262,6 +1280,927 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         open_dialog(page, dialog)
         dialog_mounted = True
 
+    def open_export_clients_dialog(e=None):
+        """Export clients to CSV/XLSX/ODS (passwords are never exported)."""
+        export_picker = ft.FilePicker()
+        if not any(
+            isinstance(service, ft.FilePicker) for service in page.services
+        ):
+            page.services.append(export_picker)
+        else:
+            export_picker = next(
+                service for service in page.services
+                if isinstance(service, ft.FilePicker)
+            )
+        format_dropdown = ft.Dropdown(
+            label="File format", width=160, value="xlsx",
+            options=[
+                ft.dropdown.Option("xlsx", "Excel (.xlsx)"),
+                ft.dropdown.Option("csv", "CSV (.csv)"),
+                ft.dropdown.Option("ods", "OpenDocument (.ods)"),
+            ],
+        )
+        scope_dropdown = ft.Dropdown(
+            label="Which clients", width=260, value="filtered",
+            options=[
+                ft.dropdown.Option(
+                    "filtered", "Only the currently filtered clients"),
+                ft.dropdown.Option("all", "All clients"),
+            ],
+        )
+        export_status = ft.Text("", size=12, color="#475569")
+
+        async def run_export(_=None):
+            file_format = format_dropdown.value or "xlsx"
+            try:
+                if (scope_dropdown.value or "filtered") == "filtered":
+                    records = list_clients(
+                        search=search_field.value or "",
+                        status=status_filter.value or "",
+                        sort_by=sort_filter.value or "name",
+                        sort_direction=(
+                            sort_direction_filter.value or "asc"
+                        ),
+                    )
+                else:
+                    records = list_clients()
+                if not records:
+                    export_status.value = "No clients to export."
+                    export_status.color = "#B45309"
+                    page.update()
+                    return
+                payload = await asyncio.to_thread(
+                    export_clients, records, file_format,
+                )
+            except Exception as exc:
+                export_status.value = f"Could not build the export: {exc}"
+                export_status.color = "#B91C1C"
+                page.update()
+                return
+            stamp = date.today().isoformat()
+            try:
+                destination = await export_picker.save_file(
+                    dialog_title="Save the client export",
+                    file_name=f"clients_{stamp}.{file_format}",
+                    allowed_extensions=[file_format],
+                    src_bytes=payload,
+                )
+            except Exception as exc:
+                export_status.value = f"Could not save the file: {exc}"
+                export_status.color = "#B91C1C"
+                page.update()
+                return
+            export_status.value = (
+                f"Exported {len(records)} client(s) to {destination}."
+                if destination
+                else "Export prepared; save dialog cancelled."
+            )
+            export_status.color = "#15803D"
+            page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Export clients"),
+            content=ft.Column([
+                ft.Text(
+                    "Exports the client columns exactly as stored (CSV, "
+                    "Excel, or OpenDocument). Passwords and PINs are "
+                    "never included.",
+                    size=11, color="#64748B",
+                ),
+                ft.Row([format_dropdown, scope_dropdown], wrap=True,
+                       spacing=8),
+                export_status,
+            ], spacing=8, tight=True),
+            actions=[
+                ft.TextButton("Close", on_click=lambda _: page.pop_dialog()),
+                ft.Button("Export", on_click=run_export),
+            ],
+        ))
+
+    def open_import_clients_dialog(e=None):
+        """Import clients from a spreadsheet, CSV/ODS file, or a paste.
+
+        Google Sheets exports (xlsx/csv/ods) and direct copies (tab-
+        separated paste) both work; columns are auto-mapped with manual
+        override, and a default password (stored encrypted like manual
+        entries) is applied to the imported rows (developer requests
+        2026-11-20).
+        """
+        import_file_picker = ft.FilePicker()
+        if not any(
+            isinstance(service, ft.FilePicker) for service in page.services
+        ):
+            page.services.append(import_file_picker)
+        else:
+            import_file_picker = next(
+                service for service in page.services
+                if isinstance(service, ft.FilePicker)
+            )
+        paste_field = ft.TextField(
+            label="Paste client rows (copy from the Google Sheet: one header row + data)",
+            multiline=True, min_lines=3, max_lines=5, expand=True,
+        )
+        file_label = ft.Text("", size=11, color="#64748B")
+        load_status = ft.Text("", size=11, color="#64748B")
+        mapping_row = ft.Row(wrap=True, spacing=8)
+        password_field = ft.TextField(
+            label="Default password (optional — rows with a Password column use their own)",
+            value="",
+            hint_text="Leave empty when the file already has passwords",
+            width=420,
+            password=True,
+            can_reveal_password=True,
+        )
+        preview_summary = ft.Text("", size=12, color="#475569")
+        preview_table = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO)
+        state: dict[str, Any] = {"headers": [], "rows": [], "mapping": {}}
+
+        async def load_file(_=None):
+            try:
+                result = await import_file_picker.pick_files(
+                    dialog_title="Open the client spreadsheet",
+                    allowed_extensions=["xlsx", "xls", "ods", "csv"],
+                    allow_multiple=False,
+                    with_data=True,
+                )
+            except Exception as exc:
+                load_status.value = f"Could not open the file picker: {exc}"
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            if not result:
+                return
+            # flet 1.0.4 returns the chosen files as a plain list here;
+            # older shapes returned a result object with ``files``.
+            chosen_files = getattr(result, "files", result)
+            if not chosen_files:
+                return
+            chosen = chosen_files[0]
+            try:
+                headers, rows = read_client_table(
+                    file_bytes=chosen.bytes, filename=chosen.name,
+                )
+            except (ClientImportError, Exception) as exc:
+                load_status.value = f"Could not read the file: {exc}"
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            state["headers"], state["rows"] = headers, rows
+            state["mapping"] = suggest_client_column_mapping(headers)
+            file_label.value = f"File loaded: {chosen.name} ({len(rows)} rows)"
+            load_status.value = (
+                f"{len(rows)} data row(s) loaded from {len(headers)} "
+                "columns. Check the mapping, then build the preview."
+            )
+            load_status.color = "#166534"
+            mapping_row.controls = [_render_mapping()]
+            page.update()
+
+        def load_paste(_=None):
+            try:
+                headers, rows = read_client_table(
+                    pasted_text=paste_field.value or "",
+                )
+            except ClientImportError as exc:
+                load_status.value = str(exc)
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            except Exception as exc:
+                load_status.value = f"Could not read the pasted table: {exc}"
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            state["headers"], state["rows"] = headers, rows
+            state["mapping"] = suggest_client_column_mapping(headers)
+            file_label.value = ""
+            load_status.value = (
+                f"{len(rows)} data row(s) loaded from the paste. Check the "
+                "mapping, then build the preview."
+            )
+            load_status.color = "#166534"
+            mapping_row.controls = [_render_mapping()]
+            page.update()
+
+        def _render_mapping() -> ft.Control:
+            controls: list[ft.Control] = []
+            for field, label in CLIENT_FIELD_LABELS.items():
+                options = [ft.dropdown.Option(key="-1", text="(not mapped)")]
+                for index, header in enumerate(state["headers"]):
+                    options.append(ft.dropdown.Option(
+                        key=str(index), text=f"{index + 1}. {header}"[:50],
+                    ))
+                dropdown = ft.Dropdown(
+                    label=label, width=250, options=options,
+                    value=str(state["mapping"].get(field))
+                    if state["mapping"].get(field) is not None else "-1",
+                )
+
+                def on_map_change(_e, field=field, dropdown=dropdown):
+                    value = int(dropdown.value)
+                    state["mapping"][field] = value if value >= 0 else None
+
+                dropdown.on_change = on_map_change
+                controls.append(dropdown)
+            return ft.Row(controls, wrap=True, spacing=8)
+
+        # Shared preview rendering: the simple checklist or the grid swap
+        # view (developer request 2026-11-20: select columns and rows to
+        # start swapping from).
+        selected_columns: set[str] = set()
+        selected_rows: set[int] = set()
+        grid_state: dict[str, int] = {"limit": 40}
+
+        def _revalidate_preview(rotated_values: list[dict[str, str]],
+                                row_numbers: list[int]) -> None:
+            """Re-run the real validation after a swap, keeping row numbers."""
+            state["preview"] = build_client_import_preview(
+                state["headers"],
+                [
+                    [values.get(field, "") for field in CLIENT_FIELD_LABELS]
+                    for values in rotated_values
+                ],
+                {
+                    field: index for index, field
+                    in enumerate(CLIENT_FIELD_LABELS)
+                },
+                default_password=password_field.value or "",
+                required=current_requirements(),
+                split_names=split_names.value,
+            )
+            for row, number in zip(state["preview"]["rows"], row_numbers):
+                row["row_number"] = number
+
+        def _simple_preview_rows(preview: dict[str, Any]) -> list[ft.Control]:
+            return [
+                ft.Container(
+                    ft.Row([
+                        ft.Text(
+                            f"Row {row['row_number']}", size=11, width=60,
+                        ),
+                        ft.Text(
+                            f"{row['values'].get('name') or '(no name)'} · "
+                            f"{row['values'].get('cnic') or row['values'].get('ntn_number') or '—'} · "
+                            f"{row['values'].get('phone_number') or '—'}",
+                            size=11, expand=True,
+                        ),
+                        ft.Text(
+                            row["problem"] or "ready", size=11,
+                            color="#B91C1C" if row["problem"] else "#166534",
+                            width=340,
+                        ),
+                        *([ft.TextButton(
+                            "Fix",
+                            on_click=lambda _, r=row: fix_row_dialog(
+                                r, render_preview_body,
+                            ),
+                        )] if row["problem"] else []),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    padding=4,
+                )
+                for row in preview["rows"][:60]
+            ] + ([ft.Text("… older rows appear on import.", size=11,
+                          color="#64748B")]
+                 if len(preview["rows"]) > 60 else [])
+
+        def _toggle_row_selection(e, number: int, checkbox: ft.Checkbox):
+            if checkbox.value:
+                selected_rows.add(number)
+            else:
+                selected_rows.discard(number)
+
+        def _toggle_column_selection(e, field: str, checkbox: ft.Checkbox):
+            if checkbox.value:
+                selected_columns.add(field)
+            else:
+                selected_columns.discard(field)
+
+        def clear_grid_selection(_=None):
+            selected_columns.clear()
+            selected_rows.clear()
+            render_preview_body()
+
+        def _revalidate_single_row(row: dict[str, Any]) -> dict[str, Any]:
+            """Re-validate one row with the current settings, in place."""
+            fresh = build_client_import_preview(
+                state["headers"],
+                [[row["values"].get(field, "") for field in CLIENT_FIELD_LABELS]],
+                {field: index for index, field in enumerate(CLIENT_FIELD_LABELS)},
+                default_password=password_field.value or "",
+                required=current_requirements(),
+                split_names=split_names.value,
+            )["rows"][0]
+            row["values"] = fresh["values"]
+            row["problem"] = fresh["problem"]
+            row["notes"] = fresh["notes"]
+            return row
+
+        def fix_row_dialog(row: dict[str, Any], after_fix: Callable[[], None]):
+            """Edit one problem row's values, re-validating on save."""
+            error_text = ft.Text("", size=11, color="#B91C1C")
+            field_controls: dict[str, ft.TextField] = {}
+            for field, label in CLIENT_FIELD_LABELS.items():
+                field_controls[field] = ft.TextField(
+                    label=label, value=str(row["values"].get(field) or ""),
+                    width=280,
+                )
+
+            def do_fix(_=None):
+                row["values"] = {
+                    field: control.value.strip() if control.value else ""
+                    for field, control in field_controls.items()
+                }
+                _revalidate_single_row(row)
+                if row["problem"]:
+                    error_text.value = (
+                        f"Still flagged: {row['problem']} — adjust and "
+                        "save again, or Cancel."
+                    )
+                    page.update()
+                    return
+                page.pop_dialog()
+                preview_summary.value = (
+                    f"Row {row['row_number']} fixed and ready to import."
+                )
+                after_fix()
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text(f"Fix row {row['row_number']}"),
+                content=ft.Column([
+                    ft.Text(
+                        "Current problem: "
+                        + (row["problem"] or "none"),
+                        size=11, color="#B91C1C",
+                    ),
+                    ft.Column(
+                        list(field_controls.values()),
+                        spacing=6, scroll=ft.ScrollMode.AUTO, height=340,
+                    ),
+                    error_text,
+                ], spacing=8),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.Button("Save row", on_click=do_fix),
+                ],
+            ))
+
+        def export_problem_rows(_=None):
+            """Write every flagged row to a new Excel file for fixing."""
+            preview = state.get("preview")
+            if not preview:
+                load_status.value = "Build the preview first."
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            problem_rows = [
+                row for row in preview["rows"] if row["problem"]
+            ]
+            if not problem_rows:
+                load_status.value = "No problem rows — everything is ready."
+                load_status.color = "#166534"
+                page.update()
+                return
+            from services.dc_rate_service import _export_simple_table
+
+            headers = ["Source row", *CLIENT_FIELD_LABELS.values(), "Problems"]
+            export_rows = [
+                [row["row_number"], *(
+                    row["values"].get(field, "")
+                    for field in CLIENT_FIELD_LABELS
+                ), row["problem"]]
+                for row in problem_rows
+            ]
+            try:
+                payload = _export_simple_table(
+                    headers, export_rows, "xlsx", "Client import problems",
+                )
+            except Exception as exc:
+                load_status.value = f"Could not build the Excel file: {exc}"
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            from datetime import date as _date
+
+            async def save_problems():
+                try:
+                    destination = await import_file_picker.save_file(
+                        dialog_title="Save the problem rows",
+                        file_name=(
+                            "client_import_problems_"
+                            f"{_date.today().isoformat()}.xlsx"
+                        ),
+                        allowed_extensions=["xlsx"],
+                        src_bytes=payload,
+                    )
+                except Exception as exc:
+                    load_status.value = f"Could not save the file: {exc}"
+                    load_status.color = "#B91C1C"
+                    page.update()
+                    return
+                load_status.value = (
+                    f"{len(problem_rows)} problem row(s) exported to "
+                    f"{destination}." if destination
+                    else "Save dialog cancelled."
+                )
+                load_status.color = "#475569"
+                page.update()
+
+            if hasattr(page, "run_task"):
+                page.run_task(save_problems)
+            else:
+                load_status.value = (
+                    "Export problem rows works in the running application."
+                )
+                page.update()
+
+        def swap_grid_selection(_=None):
+            """Rotate the selected columns' values in the selected rows."""
+            preview = state.get("preview")
+            if not preview:
+                load_status.value = "Build the preview first."
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            if len(selected_columns) < 2:
+                load_status.value = (
+                    "Tick at least two column headers to swap."
+                )
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            if not selected_rows:
+                load_status.value = (
+                    "Tick at least one row to start swapping from."
+                )
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            fields_in_order = [
+                field for field in CLIENT_FIELD_LABELS
+                if field in selected_columns
+            ]
+            updated = 0
+            rotated_values: list[dict[str, str]] = []
+            row_numbers: list[int] = []
+            for row in preview["rows"]:
+                if row["row_number"] not in selected_rows:
+                    rotated_values.append(row["values"])
+                    row_numbers.append(row["row_number"])
+                    continue
+                try:
+                    rotated_values.append(
+                        swap_import_row_fields(row["values"], fields_in_order)
+                    )
+                except ClientImportError as exc:
+                    load_status.value = str(exc)
+                    load_status.color = "#B91C1C"
+                    page.update()
+                    return
+                row_numbers.append(row["row_number"])
+                updated += 1
+            _revalidate_preview(rotated_values, row_numbers)
+            preview_summary.value = (
+                f"Swapped {len(selected_columns)} column(s) in {updated} "
+                "selected row(s). Review, then import."
+            )
+            render_preview_body()
+
+        def render_preview_body():
+            preview = state.get("preview")
+            if not preview:
+                preview_table.controls = []
+                return
+            if not grid_mode.value:
+                preview_table.controls = _simple_preview_rows(preview)
+                page.update()
+                return
+            rows_shown = preview["rows"][: grid_state["limit"]]
+            column_controls: list[ft.Control] = [
+                ft.Text("No.", size=11, weight=ft.FontWeight.BOLD),
+            ]
+            for field, label in CLIENT_FIELD_LABELS.items():
+                header_checkbox = ft.Checkbox(
+                    value=field in selected_columns, scale=0.8,
+                )
+                header_checkbox.on_change = lambda e, f=field, c=header_checkbox: (
+                    _toggle_column_selection(e, f, c)
+                )
+                column_controls.append(ft.Row([
+                    header_checkbox,
+                    ft.Text(label.split(" (")[0], size=10),
+                ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+            data_columns = [
+                ft.DataColumn(ft.Container(control, width=95))
+                for control in column_controls
+            ]
+            data_rows = []
+            for row in rows_shown:
+                row_checkbox = ft.Checkbox(
+                    value=row["row_number"] in selected_rows, scale=0.8,
+                )
+                row_checkbox.on_change = lambda e, n=row["row_number"], c=row_checkbox: (
+                    _toggle_row_selection(e, n, c)
+                )
+                cells = [
+                    ft.DataCell(ft.Container(ft.Text(
+                        f"{row['row_number']}"
+                        + (" ⚠" if row["problem"] else ""),
+                        size=10,
+                    ), width=30)),
+                ]
+                for field in CLIENT_FIELD_LABELS:
+                    value = str(row["values"].get(field) or "")
+                    cells.append(ft.DataCell(ft.Container(
+                        ft.Text(value[:26], size=10,
+                                color="#B91C1C" if row["problem"] else None,
+                                tooltip=value or None),
+                        width=95,
+                    )))
+                if row["problem"]:
+                    cells.append(ft.DataCell(ft.TextButton(
+                        "Fix",
+                        on_click=lambda _, r=row: fix_row_dialog(
+                            r, render_preview_body,
+                        ),
+                    )))
+                data_rows.append(ft.DataRow(cells=[
+                    ft.DataCell(row_checkbox), *cells,
+                ]))
+            preview_table.controls = [
+                ft.Row([
+                    ft.OutlinedButton(
+                        "Swap selected columns in selected rows",
+                        on_click=swap_grid_selection,
+                    ),
+                    ft.TextButton("Clear selection",
+                                  on_click=clear_grid_selection),
+                    *([ft.TextButton(
+                        "Show 40 more rows",
+                        on_click=lambda _: _show_more_grid(),
+                    )] if len(preview["rows"]) > grid_state["limit"] else []),
+                ], wrap=True, spacing=8),
+                ft.Text(
+                    "Tick the column headers and the rows to include in the "
+                    "swap; values rotate within the selection. ⚠ marks a "
+                    "row with a validation problem.",
+                    size=10, color="#64748B",
+                ),
+                ft.Row([
+                    ft.DataTable(
+                        columns=data_columns, rows=data_rows,
+                        column_spacing=6, heading_row_height=34,
+                        data_row_height=30,
+                    ),
+                ], scroll=ft.ScrollMode.AUTO),
+            ]
+            page.update()
+
+        def _show_more_grid():
+            grid_state["limit"] += 40
+            render_preview_body()
+
+        def build_preview(_=None):
+            try:
+                preview = build_client_import_preview(
+                    state["headers"], state["rows"], state["mapping"],
+                    default_password=password_field.value or "",
+                    required=current_requirements(),
+                    split_names=split_names.value,
+                )
+            except ClientImportError as exc:
+                load_status.value = str(exc)
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            state["preview"] = preview
+            preview_summary.value = (
+                f"{preview['ready']} row(s) ready to import, "
+                f"{len(preview['rows']) - preview['ready']} with problems."
+            )
+            render_preview_body()
+
+        def run_import(_=None):
+            preview = state.get("preview")
+            if not preview:
+                load_status.value = "Build the preview first."
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            ready_rows = [row for row in preview["rows"] if not row["problem"]]
+
+            def do_import(_=None):
+                try:
+                    summary = import_clients(
+                        ready_rows,
+                        default_password=password_field.value or "",
+                        required=current_requirements(),
+                    )
+                except ClientImportError as exc:
+                    # Close both the confirm dialog and the import dialog
+                    # so the error is actually visible.
+                    page.pop_dialog()
+                    page.pop_dialog()
+                    notify(page, f"Import failed: {exc}")
+                    refresh_clients()
+                    return
+                except Exception as exc:
+                    page.pop_dialog()
+                    page.pop_dialog()
+                    notify(page, f"Import failed unexpectedly: {exc}")
+                    refresh_clients()
+                    return
+                # Close BOTH the confirm dialog and the import dialog —
+                # otherwise the summary snackbar renders behind the still
+                # open import dialog and the refreshed list stays hidden
+                # (developer report 2026-11-21).
+                page.pop_dialog()
+                page.pop_dialog()
+                errors = "; ".join(summary["errors"][:3]) if summary["errors"] else ""
+                notify(page, (
+                    f"Import finished: {summary['created']} client(s) "
+                    f"created, {summary['skipped']} row(s) skipped."
+                    + (f" Issues: {errors}" if errors else "")
+                ))
+                refresh_clients()
+
+            if not ready_rows:
+                load_status.value = "No importable rows — fix the problems first."
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text(f"Import {len(ready_rows)} client(s)?"),
+                content=ft.Text(
+                    "Rows with a Password column use their own password; "
+                    "the others get the default password (stored "
+                    "encrypted). Rows with problems are skipped.",
+                    size=13,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.Button("Import", on_click=do_import),
+                ],
+            ))
+
+        def swap_row_fields(_=None):
+            """Swap/rotate values between chosen fields in every preview row."""
+            choices = [swap_a.value, swap_b.value, swap_c.value]
+            picked = [name for name in choices if name and name != "none"]
+            preview = state.get("preview")
+            if not preview:
+                load_status.value = "Build the preview first."
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            try:
+                rotated_rows = [
+                    {**row,
+                     "values": swap_import_row_fields(row["values"], picked)}
+                    for row in preview["rows"]
+                ]
+            except ClientImportError as exc:
+                load_status.value = str(exc)
+                load_status.color = "#B91C1C"
+                page.update()
+                return
+            # Re-validate after the swap so problems stay accurate.
+            _revalidate_preview(
+                [rotated["values"] for rotated in rotated_rows],
+                [rotated["row_number"] for rotated in rotated_rows],
+            )
+            preview_summary.value = (
+                f"Values swapped between {len(picked)} field(s) for all "
+                "preview rows. Review, then import."
+            )
+            render_preview_body()
+
+        field_options = [
+            ft.dropdown.Option(key, label)
+            for key, label in CLIENT_FIELD_LABELS.items()
+        ]
+        swap_a = ft.Dropdown(label="Swap field 1", width=240,
+                             options=field_options)
+        swap_b = ft.Dropdown(label="Swap field 2", width=240,
+                             options=field_options)
+        swap_c = ft.Dropdown(
+            label="Field 3 (optional, 3-way rotate)", width=240,
+            options=[ft.dropdown.Option(key="none", text="(not used)"),
+                     *field_options],
+            value="none",
+        )
+        grid_mode = ft.Checkbox(
+            label="Grid swap view (select columns and rows to start swapping from)",
+            value=False,
+            on_change=lambda _: render_preview_body(),
+        )
+        split_names = ft.Checkbox(
+            label="Split name & parentage (usman ali so haider ali / fatima do mushtaq / rashida wid majid)",
+            value=True,
+        )
+        requirement_checks: dict[str, ft.Checkbox] = {}
+        for field, default_on in REQUIREMENT_DEFAULTS.items():
+            checkbox = ft.Checkbox(
+                label=CLIENT_FIELD_LABELS[field].split(" (")[0],
+                value=default_on,
+            )
+            requirement_checks[field] = checkbox
+
+        def current_requirements() -> dict[str, bool]:
+            return {
+                field: bool(checkbox.value)
+                for field, checkbox in requirement_checks.items()
+            }
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Import clients"),
+            content=ft.Column([
+                ft.Text(
+                    "Source: paste rows copied from a Google Sheet, or load "
+                    "an exported .xlsx / .xls / .ods / .csv file. Columns "
+                    "are detected automatically; fix any mapping below. "
+                    "Wrong-column mistakes can be corrected before "
+                    "importing with the swap fields tool or the grid view.",
+                    size=11, color="#64748B",
+                ),
+                paste_field,
+                ft.Row([
+                    ft.OutlinedButton("Load pasted rows", on_click=load_paste),
+                    ft.OutlinedButton("Load file…", on_click=load_file),
+                    file_label,
+                ], wrap=True, spacing=8,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                load_status,
+                ft.Container(mapping_row),
+                ft.Column([
+                    ft.Text(
+                        "Mandatory fields (everything is optional by "
+                        "default; tick a field to flag rows that leave "
+                        "it empty):",
+                        size=11, color="#64748B",
+                    ),
+                    ft.Row(
+                        [requirement_checks[field]
+                         for field in REQUIREMENT_DEFAULTS],
+                        wrap=True, spacing=10,
+                    ),
+                    ft.Text(
+                        "Rows without any password import with no stored "
+                        "credentials, and an empty name cell imports as "
+                        "\"(unnamed — row N)\" so the row is never lost.",
+                        size=11, color="#64748B",
+                    ),
+                    split_names,
+                ], spacing=4),
+                ft.Row([swap_a, swap_b, swap_c,
+                        ft.OutlinedButton("Swap these fields in all rows",
+                                          on_click=swap_row_fields)],
+                       wrap=True, spacing=8,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Row([grid_mode, password_field], wrap=True, spacing=16,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                preview_summary,
+                ft.Row([
+                    ft.OutlinedButton(
+                        "Export problem rows (Excel)",
+                        on_click=export_problem_rows,
+                        tooltip="Save a new Excel file containing only the "
+                        "flagged rows with their problems",
+                    ),
+                ], wrap=True, spacing=8),
+                preview_table,
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[
+                ft.TextButton("Close", on_click=lambda _: page.pop_dialog()),
+                ft.OutlinedButton("Build preview", on_click=build_preview),
+                ft.Button("Import ready rows", on_click=run_import),
+            ],
+        ))
+
+    def open_saved_column_swap_dialog(e=None):
+        """Swap/rotate saved values between two or three client columns."""
+        field_keys = list(_SWAPPABLE_FIELDS)
+        field_options = [
+            ft.dropdown.Option(key, label)
+            for key, label in _SWAPPABLE_FIELDS.items()
+        ]
+        field_a = ft.Dropdown(label="Column A", width=230,
+                              options=field_options, value="city")
+        field_b = ft.Dropdown(label="Column B", width=230,
+                              options=field_options, value="tehsil")
+        field_c = ft.Dropdown(
+            label="Column C (optional, 3-way rotate)", width=230,
+            options=[ft.dropdown.Option(key="none", text="(not used)"),
+                     *field_options],
+            value="none",
+        )
+        swap_status = ft.Text("", size=12, color="#475569")
+        swap_preview = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO)
+
+        def _picked():
+            picked = [field_a.value, field_b.value, field_c.value]
+            return [name for name in picked if name and name != "none"]
+
+        def build_swap_preview(_=None):
+            try:
+                preview = preview_saved_column_swap(_picked())
+            except ClientImportError as exc:
+                swap_status.value = str(exc)
+                swap_status.color = "#B91C1C"
+                page.update()
+                return
+            swap_preview.controls = [
+                ft.Container(
+                    ft.Column([
+                        ft.Text(item["client_name"], size=12,
+                                weight=ft.FontWeight.W_600),
+                        *[
+                            ft.Text(
+                                f"{change['label']}: "
+                                f"'{change['before'] or '—'}' → "
+                                f"'{change['after'] or '—'}'",
+                                size=11, color="#64748B",
+                            )
+                            for change in item["changes"]
+                        ],
+                    ], spacing=2),
+                    padding=6,
+                    bgcolor="#F8FAFC",
+                    border=ft.Border.all(1, "#E2E8F0"),
+                    border_radius=6,
+                )
+                for item in preview["affected"][:40]
+            ] + ([ft.Text("… and more.", size=11, color="#64748B")]
+                 if preview["count"] > 40 else [])
+            swap_status.value = (
+                f"{preview['count']} client(s) would change. Review, then "
+                "apply." if preview["count"]
+                else "No client changes — the chosen columns hold the same "
+                "values everywhere."
+            )
+            swap_status.color = "#475569"
+            page.update()
+
+        def apply_swap(_=None):
+            picked = _picked()
+
+            def do_apply(_=None):
+                try:
+                    summary = apply_saved_column_swap(picked)
+                except ClientImportError as exc:
+                    page.pop_dialog()
+                    swap_status.value = str(exc)
+                    swap_status.color = "#B91C1C"
+                    page.update()
+                    return
+                page.pop_dialog()
+                swap_status.value = (
+                    f"Swapped saved values for {summary['updated']} "
+                    "client(s)."
+                )
+                swap_status.color = "#15803D"
+                refresh_clients()
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Swap the saved column values?"),
+                content=ft.Text(
+                    "This rewrites the values in the database for every "
+                    "listed client. A backup taken before this change is "
+                    "recommended (Settings → Automatic backups → Back up "
+                    "now).", size=13,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.Button("Swap values", on_click=do_apply),
+                ],
+            ))
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Swap saved column data"),
+            content=ft.Column([
+                ft.Text(
+                    "Fix rows where information was typed into the wrong "
+                    "column: two columns exchange their values, three "
+                    "columns rotate (A → B → C → A). Only clients whose "
+                    "values actually differ are changed.",
+                    size=11, color="#64748B",
+                ),
+                ft.Row([field_a, field_b, field_c], wrap=True, spacing=8),
+                ft.Row([
+                    ft.OutlinedButton("Preview changes",
+                                      on_click=build_swap_preview),
+                    ft.Button("Apply swap", on_click=apply_swap),
+                ], wrap=True, spacing=8),
+                swap_status,
+                swap_preview,
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+            actions=[ft.TextButton("Close", on_click=lambda _: page.pop_dialog())],
+        ))
+
     def open_pending_referrers(e=None):
         """Open the existing totals report filtered to positive balances."""
         open_referrer_totals(e, pending_only=True)
@@ -1469,6 +2408,18 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             ft.OutlinedButton(
                 "Pending referrers",
                 on_click=open_pending_referrers,
+            ),
+            ft.OutlinedButton(
+                "Import clients",
+                on_click=open_import_clients_dialog,
+            ),
+            ft.OutlinedButton(
+                "Export clients",
+                on_click=open_export_clients_dialog,
+            ),
+            ft.OutlinedButton(
+                "Swap saved columns",
+                on_click=open_saved_column_swap_dialog,
             ),
         ],
         spacing=10,
