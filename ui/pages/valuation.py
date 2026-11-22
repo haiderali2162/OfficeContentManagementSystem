@@ -1040,13 +1040,50 @@ def build_valuation_page(
         page.update()
 
     def fetch_extreme_dc_rate(_=None, *, highest: bool = False):
-        """Select the lowest/highest fetched DC rate (developer request 1).
+        """Select the true lowest/highest DC rate of the searched Mauza.
 
-        The search runs on the rows of the selected DC rate unit (marla,
-        kanal, foot, acre, ...); the estimate then calculates against the
-        fetched value like any manually picked rate.
+        The DC / FBR rates tab calculates its range over every matching row
+        of the Mauza (all units, all schedule rows, no effective-date cut).
+        The calculator used to look only at ``rate_records["dc"]``, which had
+        already been narrowed to one unit (the first alphabetically) and to
+        rows effective on the transaction date, so the button could miss the
+        very rate the rates tab displayed. Query the Mauza directly here with
+        the same scope as that summary, merge those rows into the selectable
+        pool, and pick the extreme from the complete set.
         """
+        word = "highest" if highest else "lowest"
         rows = list(rate_records["dc"])
+        lookup_note = ""
+
+        typed_mauza = _text_value(mauza)
+        if typed_mauza:
+            try:
+                # Same scope as summarize_dc_rates on the rates tab: Mauza
+                # (plus Qanoongoi when typed), DC schedule, every unit, and
+                # no effective-window restriction.
+                fresh_rows = list_dc_rates(
+                    mauza=typed_mauza,
+                    qanoongoi=_text_value(qanoongoi),
+                    schedule_type="dc",
+                )
+                known_ids = {str(row["id"]) for row in rows}
+                rows.extend(
+                    row for row in fresh_rows
+                    if str(row["id"]) not in known_ids
+                )
+                # Keep the dropdown/calculation pool in sync with what the
+                # button just selected from.
+                rate_records["dc"] = rows
+                if not fresh_rows:
+                    lookup_note = (
+                        " No extra schedule rows were found for this Mauza "
+                        "outside the current search."
+                    )
+            except Exception as exc:
+                # A failed convenience lookup must not break the button; the
+                # previously fetched rows remain usable.
+                lookup_note = f" Mauza-wide lookup failed: {exc}"
+
         if not rows:
             rate_match_status.value = (
                 "Fetch a schedule first — there is no DC rate row to pick from."
@@ -1068,21 +1105,34 @@ def build_valuation_page(
             page.update()
             return
         target = (max if highest else min)(candidates, key=amount)
-        word = "highest" if highest else "lowest"
-        if dc_rate_unit.value != target["rate_unit"]:
-            # The unit menu follows the fetched row so the option list
-            # matches what is selected.
-            dc_rate_unit.value = target["rate_unit"]
-            unit_rows = [row for row in rows if row["rate_unit"] == dc_rate_unit.value]
-            dc_rate_choice.options = [
-                ft.dropdown.Option(str(row["id"]), _rate_label(row))
-                for row in unit_rows
-            ]
+        # Rebuild both menus from the complete pool: the target's unit may not
+        # have been offered by the narrowed pre-button search.
+        units = sorted({
+            str(row["rate_unit"]) for row in rows if row.get("rate_unit")
+        })
+        dc_rate_unit.options = [
+            ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units
+        ]
+        dc_rate_unit.value = str(target["rate_unit"])
+        unit_rows = [
+            row for row in rows
+            if str(row["rate_unit"]) == str(target["rate_unit"])
+        ]
+        dc_rate_choice.options = [
+            ft.dropdown.Option(str(row["id"]), _rate_label(row))
+            for row in unit_rows
+        ]
         dc_rate_choice.value = str(target["id"])
         unit_label = RATE_UNITS.get(dc_rate_unit.value, dc_rate_unit.value or "")
+        window_note = (
+            " This row is outside the transaction-date window — check the "
+            "schedule dates before relying on it."
+            if not _rate_effective_on(target) else ""
+        )
         rate_match_status.value = (
             f"Fetched the {word} DC rate for {unit_label}: {_rate_label(target)}. "
             "The estimate calculates against it."
+            + window_note + lookup_note
         )
         page.update()
 

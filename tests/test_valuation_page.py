@@ -1060,6 +1060,66 @@ def test_imported_mode_ranks_exact_pair_first_and_autoselects_single_exact(monke
     assert location_match.value == "8"
 
 
+def test_lowest_rate_button_fetches_true_mauza_minimum(monkeypatch):
+    """The button uses the rates tab's full-Mauza range, not the narrowed pool.
+
+    The rates tab showed the minimum across every DC row of the Mauza, while
+    the calculator's pre-button dropdown had been narrowed to one unit and to
+    rows effective today. The button must still find that displayed minimum.
+    """
+    location = _location_row(7)
+    expensive = _dc_rate(22, 7)
+    expensive["rate_value"] = "500"
+    cheap_but_expired = _dc_rate(21, 7)
+    cheap_but_expired.update({
+        "rate_unit": "per_foot",
+        "rate_value": "50",
+        "effective_from": valuation.date(2010, 1, 1),
+        "effective_to": valuation.date(2015, 12, 31),
+    })
+    _patch_estimate_services(monkeypatch, matches=[location], rates={"dc": [expensive]})
+
+    def listed_rates(**kwargs):
+        if kwargs.get("mauza"):
+            # The fresh Mauza-wide lookup (same scope as the rates tab summary).
+            return [cheap_but_expired, expensive]
+        # The initial calculator search still sees only the narrowed pool.
+        return [expensive] if kwargs.get("schedule_type") == "dc" else []
+
+    monkeypatch.setattr(valuation, "list_dc_rates", listed_rates)
+
+    class LoadingPage(FakePage):
+        def run_task(self, handler):
+            asyncio.run(handler())
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    unit = _dropdown(controls, "DC rate unit")
+    rate = _dropdown(controls, "Matched DC rate")
+    assert unit.value == "per_kanal"  # narrowed state before the button click
+    assert rate.value == "22"
+
+    lowest = next(
+        control for control in walk_controls(root)
+        if isinstance(control, ft.OutlinedButton) and control.content == "Lowest rate"
+    )
+    lowest.on_click(None)
+
+    assert unit.value == "per_foot"
+    assert rate.value == "21"
+    statuses = [
+        control.value for control in walk_controls(root)
+        if isinstance(control, ft.Text)
+        and "Fetched the lowest" in (control.value or "")
+    ]
+    assert statuses and "50" in statuses[0]
+    assert "outside the transaction-date window" in statuses[0]
+
+
 def test_calculate_errors_name_the_visible_controls(monkeypatch):
     class NS(SimpleNamespace):
         pass
