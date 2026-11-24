@@ -169,3 +169,92 @@ def copy_sqlite_database(source_engine: Engine, target_path) -> dict:
         "tables": len(tables),
         "status": "copied",
     }
+
+
+def copy_sqlite_file(source_path, target_path) -> dict:
+    """Copy an existing SQLite file into a new, integrity-checked file.
+
+    This is the restore counterpart of :func:`copy_sqlite_database`: the
+    source is a backup file instead of the live engine. The backup is never
+    modified; the destination is written to a staging file first and only
+    replaces its target after SQLite's ``integrity_check`` passes.
+
+    Args:
+        source_path: absolute path of an existing SQLite backup file.
+        target_path: absolute path of the new database file to create.
+
+    Returns:
+        A summary dictionary with ``source``, ``target``, ``tables`` and
+        ``status``.
+
+    Raises:
+        DatabaseCopyError: when the paths are invalid, the source is not a
+            healthy SQLite file, or the copy fails verification.
+        sqlite3.Error: when the file-level copy itself fails.
+    """
+    raw_source_path = str(source_path or "").strip()
+    if not raw_source_path:
+        raise DatabaseCopyError("Choose a backup file to restore.")
+    source = Path(raw_source_path)
+    if not source.is_absolute():
+        raise DatabaseCopyError(
+            "The backup file path must be absolute (for example "
+            "D:/Backups/land_office_backup_20260101_120000.sqlite3)."
+        )
+    source = source.resolve()
+    if not source.is_file():
+        raise DatabaseCopyError(
+            f"The backup file does not exist: {source}"
+        )
+    target = _target_file_path(target_path)
+    if source == target:
+        raise DatabaseCopyError(
+            "The backup file and the restore destination are the same file."
+        )
+
+    raw_source = sqlite3.connect(str(source))
+    staging_connection = None
+    staging_path = target.with_name(
+        f"{target.stem}.restore_{os.getpid()}{target.suffix}"
+    )
+    try:
+        check = raw_source.execute("PRAGMA integrity_check").fetchone()
+        if not check or check[0] != "ok":
+            raise DatabaseCopyError(
+                "The selected backup failed its integrity check; no file "
+                "was changed."
+            )
+        tables = raw_source.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+
+        staging_path.unlink(missing_ok=True)
+        staging_connection = sqlite3.connect(str(staging_path))
+        raw_source.backup(staging_connection)
+        staging_connection.commit()
+        copied_check = staging_connection.execute(
+            "PRAGMA integrity_check"
+        ).fetchone()
+        if not copied_check or copied_check[0] != "ok":
+            raise DatabaseCopyError(
+                "The restored copy failed its integrity check; the "
+                "selected backup was not changed."
+            )
+        staging_connection.close()
+        staging_connection = None
+        os.replace(staging_path, target)
+    except Exception:
+        staging_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if staging_connection is not None:
+            staging_connection.close()
+        raw_source.close()
+
+    return {
+        "source": str(source),
+        "target": str(target),
+        "tables": tables,
+        "status": "copied",
+    }

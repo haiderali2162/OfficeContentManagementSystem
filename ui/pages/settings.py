@@ -32,6 +32,7 @@ from services.backup_service import (
     get_backup_settings,
     get_last_backup_time,
     list_backups,
+    restore_backup,
     save_backup_settings,
 )
 from services.settings_service import (
@@ -631,8 +632,9 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     )
 
     # Automatic backups (developer request 2026-11-20): on/off, frequency,
-    # folder, retention count, and a quick manual backup. Preferences live
-    # in the app-setting store; snapshots come from core.database_copy.
+    # folder, retention count, a quick manual backup, and safe restore.
+    # Preferences live in the app-setting store; snapshots come from
+    # core.database_copy.
     backup_settings = get_backup_settings()
     backup_enabled = ft.Checkbox(
         label="Enable automatic backups (SQLite databases)",
@@ -666,6 +668,11 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     )
     backup_status = ft.Text("", size=12, color="#475569", selectable=True)
     backup_list_label = ft.Text("", size=12, color="#64748B", selectable=True)
+    backup_restore_choice = ft.Dropdown(
+        label="Restore from backup",
+        width=430,
+        hint_text="Choose a backup file from the folder above",
+    )
 
     async def browse_backup_folder(_=None):
         try:
@@ -687,6 +694,13 @@ def build_settings_page(page: ft.Page) -> ft.Control:
 
     def refresh_backup_list():
         backups = list_backups(backup_location.value or "")
+        backup_restore_choice.options = [
+            ft.dropdown.Option(item["path"], text=item["name"])
+            for item in backups
+        ]
+        valid_paths = {item["path"] for item in backups}
+        if backup_restore_choice.value not in valid_paths:
+            backup_restore_choice.value = backups[0]["path"] if backups else None
         backup_list_label.value = (
             f"{len(backups)} backup file(s) in the folder"
             + (
@@ -749,6 +763,86 @@ def build_settings_page(page: ft.Page) -> ft.Control:
             )
             page.update()
 
+    def restore_selected_backup(_=None):
+        """Restore the chosen backup into a new DB and switch to it."""
+        selected = backup_restore_choice.value
+        if not selected:
+            backup_status.value = "Choose a backup file to restore."
+            backup_status.color = "#B91C1C"
+            page.update()
+            return
+
+        def perform_restore():
+            async def run():
+                try:
+                    summary = await asyncio.to_thread(
+                        restore_backup, str(selected)
+                    )
+                    restored_path = summary["restored_path"]
+                    options = database_config.default_options()
+                    options["backend"] = "sqlite"
+                    options["path"] = restored_path
+                    await asyncio.to_thread(
+                        database_config.save_options, options
+                    )
+                    url = await asyncio.to_thread(
+                        database_config.build_url, options
+                    )
+                    await asyncio.to_thread(reconfigure_database, url)
+                    await asyncio.to_thread(initialize_database)
+                except BackupServiceError as exc:
+                    backup_status.value = str(exc)
+                    backup_status.color = "#B91C1C"
+                except Exception as exc:
+                    backup_status.value = f"Restore failed: {exc}"
+                    backup_status.color = "#B91C1C"
+                else:
+                    backup_status.value = (
+                        f"Restored to {Path(restored_path).name}. "
+                        "Current database saved as "
+                        f"{Path(summary['safety_copy']).name}. "
+                        "The app now uses the restored copy."
+                    )
+                    backup_status.color = "#15803D"
+                    backup_restore_choice.value = None
+                    refresh_backup_list()
+                page.update()
+
+            if hasattr(page, "run_task"):
+                page.run_task(run)
+            else:
+                backup_status.value = "Restore works in the running application."
+                backup_status.color = "#B91C1C"
+                page.update()
+
+        def confirm_restore(_=None):
+            page.pop_dialog()
+            perform_restore()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Restore backup"),
+            content=ft.Column(
+                controls=[
+                    ft.Text(f"Selected: {Path(str(selected)).name}", size=12),
+                    ft.Text(
+                        "A verified copy of the current database will be "
+                        "saved first. The backup will be restored into a "
+                        "new database file and the app will switch to it. "
+                        "Nothing in the current database is overwritten.",
+                        size=12,
+                        color="#475569",
+                    ),
+                ],
+                spacing=8,
+                tight=True,
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                ft.Button("Restore", on_click=confirm_restore),
+            ],
+        ))
+
     last_backup = get_last_backup_time()
     backup_status.value = (
         f"Last backup: {last_backup}." if last_backup else "No backup yet."
@@ -761,8 +855,9 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "(verified copy) into the chosen folder, then keep only "
                 "the newest files. The app checks once per minute while "
                 "it runs; the frequency decides when the next snapshot is "
-                "due. PostgreSQL/MySQL databases need their own backup "
-                "tooling.",
+                "due. Restore copies a selected backup into a new database "
+                "after saving the current one first. PostgreSQL/MySQL "
+                "databases need their own backup tooling.",
                 size=12,
                 color="#64748B",
             ),
@@ -787,10 +882,15 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 controls=[
                     ft.Button("Save backup settings", on_click=save_backup_prefs),
                     ft.OutlinedButton("Back up now", on_click=manual_backup),
+                    ft.OutlinedButton(
+                        "Restore selected backup",
+                        on_click=restore_selected_backup,
+                    ),
                 ],
                 spacing=8,
                 wrap=True,
             ),
+            backup_restore_choice,
             backup_status,
             backup_list_label,
         ],
@@ -1290,7 +1390,8 @@ def build_settings_page(page: ft.Page) -> ft.Control:
             _category_tile(
                 "Automatic backups",
                 "On/off, backup frequency, folder, how many old backups to "
-                "keep, and a quick manual backup (SQLite databases).",
+                "keep, a quick manual backup, and safe restore into a new "
+                "database (SQLite databases).",
                 backup_card,
             ),
             _category_tile(

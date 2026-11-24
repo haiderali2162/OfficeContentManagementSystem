@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.database import Base
-from services import settings_service
+from services import backup_service, settings_service
 from ui.pages import settings
 
 
@@ -182,6 +182,27 @@ def test_card_content_reset_restores_built_in_layout(settings_database):
         "built-in layout" in (control.value or "")
         for control in _walk(root) if isinstance(control, ft.Text)
     )
+
+
+def test_settings_page_offers_restore_from_backup_list(settings_database, tmp_path):
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    backup_name = "land_office_backup_20260101_120000.sqlite3"
+    (folder / backup_name).write_bytes(b"not opened by the UI test")
+
+    backup_service.save_backup_settings(
+        enabled=False, frequency_hours=24, location=str(folder), keep_count=5,
+    )
+    root = settings.build_settings_page(FakePage())
+
+    assert _button(root, "Restore selected backup")
+    dropdown = next(
+        control for control in _walk(root)
+        if isinstance(control, ft.Dropdown)
+        and control.label == "Restore from backup"
+    )
+    assert [option.text for option in dropdown.options] == [backup_name]
+    assert dropdown.value == str(folder / backup_name)
 
 
 def test_settings_page_validation_blocks_invalid_colour(settings_database):

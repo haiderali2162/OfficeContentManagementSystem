@@ -16,13 +16,18 @@ backed up (PostgreSQL/MySQL/custom URLs are skipped with a note).
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from core.database import engine
-from core.database_copy import DatabaseCopyError, copy_sqlite_database
+from core.database_copy import (
+    DatabaseCopyError,
+    copy_sqlite_database,
+    copy_sqlite_file,
+)
 from services.settings_service import get_setting, set_setting
 
 _SETTINGS_KEY = "backups.settings"
@@ -185,6 +190,80 @@ def create_backup_now(*, reason: str = "manual") -> dict[str, Any]:
         "target": summary.get("target", str(target)),
         "tables": summary.get("tables"),
         "removed_old": removed,
+    }
+
+
+def restore_backup(backup_path: str) -> dict[str, Any]:
+    """Restore a backup into a new SQLite file without overwriting the live DB.
+
+    A verified snapshot of the currently connected database is written first
+    (``*_before_restore_*``), then the selected backup is copied into a new
+    timestamped database (``*_restored_*``). The caller switches the app to
+    ``restored_path`` and persists that choice; this service deliberately
+    never touches the live file or the saved connection config.
+
+    Args:
+        backup_path: absolute path of one of the files returned by
+            :func:`list_backups`.
+
+    Returns:
+        A summary with ``backup``, ``safety_copy``, ``restored_path`` and
+        ``tables``.
+
+    Raises:
+        BackupServiceError: for non-SQLite backends, invalid paths, or a
+            failed copy. The current database remains untouched.
+    """
+    if not is_sqlite_backend():
+        raise BackupServiceError(
+            "Restore is available only while the SQLite database is in use. "
+            "Other database systems need their own restore tooling."
+        )
+    current_name = str(engine.url.database or "").strip()
+    if not current_name:
+        raise BackupServiceError(
+            "The current database has no file path, so it cannot be restored."
+        )
+    current_path = Path(current_name).resolve()
+    if not current_path.is_file():
+        raise BackupServiceError(
+            f"The current database file does not exist: {current_path}"
+        )
+
+    selected = Path(str(backup_path or "").strip())
+    if not selected.is_absolute():
+        raise BackupServiceError(
+            "The backup file path must be absolute. Choose a backup from the "
+            "list in Settings."
+        )
+    selected = selected.resolve()
+    if not selected.is_file():
+        raise BackupServiceError(
+            f"The backup file does not exist: {selected}"
+        )
+    if selected == current_path:
+        raise BackupServiceError(
+            "That is the current database, not a backup. Choose a different "
+            "file."
+        )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safety_path = current_path.with_name(
+        f"{current_path.stem}_before_restore_{stamp}{current_path.suffix}"
+    )
+    restored_path = current_path.with_name(
+        f"{current_path.stem}_restored_{stamp}{current_path.suffix}"
+    )
+    try:
+        copy_sqlite_database(engine, safety_path)
+        summary = copy_sqlite_file(selected, restored_path)
+    except (DatabaseCopyError, sqlite3.Error) as exc:
+        raise BackupServiceError(str(exc)) from exc
+    return {
+        "backup": str(selected),
+        "safety_copy": str(safety_path),
+        "restored_path": str(restored_path),
+        "tables": summary.get("tables"),
     }
 
 

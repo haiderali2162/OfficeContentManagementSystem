@@ -1,5 +1,6 @@
 """Client import / swap and automatic backup service tests (temp DBs)."""
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -572,3 +573,61 @@ def test_scheduler_due_check_respects_settings(import_database, tmp_path):
     assert first and first["reason"] == "auto"
     # Running again immediately is not due yet.
     assert backup_service.run_backup_if_due() is None
+
+
+def _client_names(path: Path) -> list[str]:
+    connection = sqlite3.connect(str(path))
+    try:
+        return [
+            row[0] for row in
+            connection.execute("SELECT name FROM clients ORDER BY id")
+        ]
+    finally:
+        connection.close()
+
+
+def test_restore_backup_creates_new_db_and_safety_copy(import_database, tmp_path):
+    engine = import_database
+    with engine.begin() as connection:
+        connection.execute(Client.__table__.insert().values(name="Before backup"))
+
+    location = tmp_path / "restore_backups"
+    location.mkdir()
+    backup_service.save_backup_settings(
+        enabled=False, frequency_hours=24, location=str(location),
+        keep_count=5,
+    )
+    backup = backup_service.create_backup_now()
+
+    with engine.begin() as connection:
+        connection.execute(Client.__table__.insert().values(name="After backup"))
+
+    result = backup_service.restore_backup(backup["target"])
+    restored = Path(result["restored_path"])
+    safety = Path(result["safety_copy"])
+    current = Path(engine.url.database).resolve()
+
+    assert restored.is_file() and safety.is_file()
+    assert restored != current and safety != current
+    assert result["tables"] > 0
+    # The backup predates the second row, so the restored copy has only it.
+    assert _client_names(restored) == ["Before backup"]
+    # The current DB and its safety copy are both untouched by the restore.
+    assert _client_names(safety) == ["Before backup", "After backup"]
+    assert _client_names(current) == ["Before backup", "After backup"]
+
+
+def test_restore_backup_rejects_invalid_files(import_database, tmp_path):
+    current = Path(import_database.url.database).resolve()
+
+    with pytest.raises(backup_service.BackupServiceError):
+        backup_service.restore_backup("relative.sqlite3")
+    with pytest.raises(backup_service.BackupServiceError):
+        backup_service.restore_backup(str(tmp_path / "missing.sqlite3"))
+    with pytest.raises(backup_service.BackupServiceError):
+        backup_service.restore_backup(str(current))
+
+    corrupt = tmp_path / "corrupt.sqlite3"
+    corrupt.write_text("not a database", encoding="utf-8")
+    with pytest.raises(backup_service.BackupServiceError):
+        backup_service.restore_backup(str(corrupt))
