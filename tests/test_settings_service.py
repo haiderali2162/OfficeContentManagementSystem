@@ -340,3 +340,83 @@ def test_missing_saved_default_folder_is_treated_as_unset(
     )
 
     assert settings_service.get_default_file_location() == ""
+
+
+# --------------------------------------------------------------------------
+# Valuation table templates and PDF/print report options.
+# --------------------------------------------------------------------------
+
+def test_valuation_table_template_defaults_round_trips_and_resets(settings_database):
+    default = settings_service.get_valuation_table_template()
+    assert default["id"] == settings_service.DEFAULT_VALUATION_TABLE_TEMPLATE
+    assert default["label"] == settings_service.VALUATION_TABLE_TEMPLATES[
+        settings_service.DEFAULT_VALUATION_TABLE_TEMPLATE
+    ]["label"]
+
+    saved = settings_service.set_valuation_table_template("mint")
+    assert saved["id"] == "mint"
+    assert saved["header_bg"] == "#0F766E"
+    assert settings_service.get_valuation_table_template() == saved
+
+    assert settings_service.reset_valuation_table_template()["id"] == (
+        settings_service.DEFAULT_VALUATION_TABLE_TEMPLATE
+    )
+
+
+def test_valuation_table_template_rejects_unknown_id(settings_database):
+    with pytest.raises(settings_service.SettingsError, match="Unsupported table template"):
+        settings_service.set_valuation_table_template("not-a-template")
+    assert settings_service.get_valuation_table_template()["id"] == (
+        settings_service.DEFAULT_VALUATION_TABLE_TEMPLATE
+    )
+
+
+def test_invalid_stored_template_falls_back_to_default(settings_database):
+    settings_service.set_setting(settings_service.VALUATION_TABLE_TEMPLATE_KEY, "old")
+    assert settings_service.get_valuation_table_template()["id"] == (
+        settings_service.DEFAULT_VALUATION_TABLE_TEMPLATE
+    )
+
+
+def test_report_options_round_trip_order_deduplication_and_reset(settings_database):
+    saved = settings_service.set_valuation_report_options({
+        "sections": ["charges", "fee_comparison", "charges"],
+        "charge_columns": ["amount", "charge", "amount"],
+        "comparison_columns": ["calculated", "charge"],
+    })
+    assert saved["sections"] == ["charges", "fee_comparison"]
+    assert saved["charge_columns"] == ["amount", "charge"]
+    assert saved["comparison_columns"] == ["calculated", "charge"]
+    assert settings_service.get_valuation_report_options() == saved
+
+    reset = settings_service.reset_valuation_report_options()
+    assert reset == settings_service.DEFAULT_VALUATION_REPORT_OPTIONS
+    assert settings_service.get_valuation_report_options() == reset
+
+
+def test_report_options_reject_unknown_and_empty_selections(settings_database):
+    with pytest.raises(settings_service.SettingsError, match="Unsupported"):
+        settings_service.set_valuation_report_options({
+            "sections": ["not-a-section"],
+        })
+    with pytest.raises(settings_service.SettingsError, match="at least one"):
+        settings_service.set_valuation_report_options({
+            "sections": [],
+        })
+    assert settings_service.get_valuation_report_options() == (
+        settings_service.DEFAULT_VALUATION_REPORT_OPTIONS
+    )
+
+
+def test_invalid_stored_report_options_fall_back_field_by_field(settings_database):
+    settings_service.set_setting(settings_service.VALUATION_REPORT_KEY, {
+        "sections": ["charges"],
+        "charge_columns": ["not-a-column"],
+        "comparison_columns": ["difference", "difference"],
+    })
+    options = settings_service.get_valuation_report_options()
+    assert options["sections"] == ["charges"]
+    assert options["charge_columns"] == (
+        settings_service.DEFAULT_VALUATION_REPORT_OPTIONS["charge_columns"]
+    )
+    assert options["comparison_columns"] == ["difference"]

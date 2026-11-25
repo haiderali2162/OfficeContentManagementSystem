@@ -68,6 +68,20 @@ def _button(root, text):
     )
 
 
+def _checkbox_by_data(root, data):
+    return next(
+        control for control in _walk(root)
+        if isinstance(control, ft.Checkbox) and control.data == data
+    )
+
+
+def _dropdown_by_label(root, label):
+    return next(
+        control for control in _walk(root)
+        if isinstance(control, ft.Dropdown) and control.label == label
+    )
+
+
 def _preview_heading(root):
     for control in _walk(root):
         value = (control.value or "") if isinstance(control, ft.Text) else ""
@@ -174,9 +188,12 @@ def test_card_content_reset_restores_built_in_layout(settings_database):
     _button(root, "Reset to built-in layout").on_click(None)
 
     assert settings_service.get_card_fields() == {"fields": [], "formulas": []}
+    card_field_labels = set(settings_service.CARD_BODY_FIELD_LABELS.values())
     assert all(
         checkbox.value is False
-        for checkbox in _walk(root) if isinstance(checkbox, ft.Checkbox)
+        for checkbox in _walk(root)
+        if isinstance(checkbox, ft.Checkbox)
+        and checkbox.label in card_field_labels
     )
     assert any(
         "built-in layout" in (control.value or "")
@@ -321,3 +338,69 @@ def test_settings_page_renders_custom_formulas_guide(settings_database):
         if isinstance(control, ft.ExpansionTile)
     ]
     assert "Custom registry formulas — user guide" in titles
+
+
+def test_report_settings_save_persists_template_sections_and_columns(settings_database):
+    root = settings.build_settings_page(FakePage())
+    _dropdown_by_label(root, "Table template").value = "slate"
+    _checkbox_by_data(root, "report_section:warnings").value = False
+    _checkbox_by_data(root, "report_charge_column:source").value = False
+    _checkbox_by_data(root, "report_comparison_column:difference").value = False
+
+    _button(root, "Save report settings").on_click(None)
+
+    template = settings_service.get_valuation_table_template()
+    options = settings_service.get_valuation_report_options()
+    assert template["id"] == "slate"
+    assert "warnings" not in options["sections"]
+    assert "source" not in options["charge_columns"]
+    assert "difference" not in options["comparison_columns"]
+    assert any(
+        "Report settings saved" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+    assert any(
+        control.data == "valuation_report_preview"
+        for control in _walk(root)
+    )
+
+
+def test_report_settings_reset_restores_template_and_all_options(settings_database):
+    settings_service.set_valuation_table_template("compact")
+    settings_service.set_valuation_report_options({
+        "sections": ["charges"],
+        "charge_columns": ["amount", "charge"],
+        "comparison_columns": ["written"],
+    })
+    root = settings.build_settings_page(FakePage())
+
+    _button(root, "Reset report settings").on_click(None)
+
+    assert settings_service.get_valuation_table_template()["id"] == (
+        settings_service.DEFAULT_VALUATION_TABLE_TEMPLATE
+    )
+    assert settings_service.get_valuation_report_options() == (
+        settings_service.DEFAULT_VALUATION_REPORT_OPTIONS
+    )
+    assert _dropdown_by_label(root, "Table template").value == (
+        settings_service.DEFAULT_VALUATION_TABLE_TEMPLATE
+    )
+    assert _checkbox_by_data(root, "report_section:warnings").value is True
+    assert _checkbox_by_data(root, "report_charge_column:source").value is True
+    assert _checkbox_by_data(root, "report_comparison_column:difference").value is True
+
+
+def test_report_settings_blocks_an_empty_section_selection(settings_database):
+    root = settings.build_settings_page(FakePage())
+    for key in settings_service.REPORT_SECTION_LABELS:
+        _checkbox_by_data(root, f"report_section:{key}").value = False
+
+    _button(root, "Save report settings").on_click(None)
+
+    assert settings_service.get_valuation_report_options() == (
+        settings_service.DEFAULT_VALUATION_REPORT_OPTIONS
+    )
+    assert any(
+        "at least one section" in (control.value or "").lower()
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )

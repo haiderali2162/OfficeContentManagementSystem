@@ -741,3 +741,236 @@ def format_card_body_lines(record: dict, config: dict | None = None) -> list[str
             value = "—"
         lines.append(f"{formula['label']}: {value}")
     return lines
+
+
+# --------------------------------------------------------------------------
+# Valuation result table templates and PDF/print report options.
+#
+# Both groups live in the additive app_settings table. An older database simply
+# falls back to the defaults below; no migration or invented fee data is added.
+# --------------------------------------------------------------------------
+
+VALUATION_TABLE_TEMPLATE_KEY = "valuation.table_template"
+
+#: Preset styles for the on-screen fee-comparison table and PDF tables. Each
+#: value is applied verbatim by the UI/report renderers after the id/label are
+#: removed, so only supported colour/font keys are stored.
+VALUATION_TABLE_TEMPLATES = {
+    "classic": {
+        "label": "Classic blue",
+        "header_bg": "#1F4E78",
+        "header_text": "#FFFFFF",
+        "row_even": "#F8FAFC",
+        "row_odd": "#FFFFFF",
+        "total_bg": "#E2E8F0",
+        "border_color": "#CBD5E1",
+        "text_color": "#1E293B",
+        "positive_color": "#B45309",
+        "font_size": 11,
+        "compact": False,
+    },
+    "mint": {
+        "label": "Fresh green",
+        "header_bg": "#0F766E",
+        "header_text": "#FFFFFF",
+        "row_even": "#ECFDF5",
+        "row_odd": "#FFFFFF",
+        "total_bg": "#D1FAE5",
+        "border_color": "#A7F3D0",
+        "text_color": "#064E3B",
+        "positive_color": "#B45309",
+        "font_size": 11,
+        "compact": False,
+    },
+    "slate": {
+        "label": "Slate professional",
+        "header_bg": "#334155",
+        "header_text": "#FFFFFF",
+        "row_even": "#F1F5F9",
+        "row_odd": "#FFFFFF",
+        "total_bg": "#E2E8F0",
+        "border_color": "#CBD5E1",
+        "text_color": "#0F172A",
+        "positive_color": "#9A3412",
+        "font_size": 11,
+        "compact": False,
+    },
+    "contrast": {
+        "label": "High contrast",
+        "header_bg": "#0F172A",
+        "header_text": "#FFFFFF",
+        "row_even": "#E2E8F0",
+        "row_odd": "#FFFFFF",
+        "total_bg": "#CBD5E1",
+        "border_color": "#475569",
+        "text_color": "#000000",
+        "positive_color": "#991B1B",
+        "font_size": 12,
+        "compact": False,
+    },
+    "compact": {
+        "label": "Compact grid",
+        "header_bg": "#475569",
+        "header_text": "#FFFFFF",
+        "row_even": "#F8FAFC",
+        "row_odd": "#FFFFFF",
+        "total_bg": "#E2E8F0",
+        "border_color": "#CBD5E1",
+        "text_color": "#334155",
+        "positive_color": "#B45309",
+        "font_size": 9,
+        "compact": True,
+    },
+}
+DEFAULT_VALUATION_TABLE_TEMPLATE = "classic"
+
+
+def get_valuation_table_template() -> dict[str, Any]:
+    """Return the saved table template with its resolved style values."""
+    stored = get_setting(VALUATION_TABLE_TEMPLATE_KEY, None)
+    name = stored if stored in VALUATION_TABLE_TEMPLATES else DEFAULT_VALUATION_TABLE_TEMPLATE
+    return {**VALUATION_TABLE_TEMPLATES[name], "id": name}
+
+
+def set_valuation_table_template(name: Any) -> dict[str, Any]:
+    """Persist one of :data:`VALUATION_TABLE_TEMPLATES` by id."""
+    if name not in VALUATION_TABLE_TEMPLATES:
+        supported = ", ".join(sorted(VALUATION_TABLE_TEMPLATES))
+        raise SettingsError(
+            f"Unsupported table template '{name}'. Use one of: {supported}."
+        )
+    set_setting(VALUATION_TABLE_TEMPLATE_KEY, name)
+    return get_valuation_table_template()
+
+
+def reset_valuation_table_template() -> dict[str, Any]:
+    """Restore the default valuation table template."""
+    set_setting(VALUATION_TABLE_TEMPLATE_KEY, DEFAULT_VALUATION_TABLE_TEMPLATE)
+    return get_valuation_table_template()
+
+
+VALUATION_REPORT_KEY = "valuation.report_options"
+
+#: Selectable PDF/print sections. The title, task number, and generated time
+#: always remain part of the report header.
+REPORT_SECTION_LABELS = {
+    "property_details": "Property & valuation details",
+    "charges": "Itemized taxes and fees",
+    "fee_comparison": "Fee comparison",
+    "explanation": "Calculation explanation",
+    "warnings": "Warnings",
+}
+
+#: Itemized-charge columns, in the order offered and printed.
+REPORT_CHARGE_COLUMN_LABELS = {
+    "charge": "Charge",
+    "category": "Category",
+    "payer": "Payer",
+    "party": "Party",
+    "method": "Method",
+    "base": "Base",
+    "rate": "Rate",
+    "amount": "Amount",
+    "currency": "Currency",
+    "source": "Source",
+    "effective_dates": "Effective dates",
+    "verification": "Verification",
+}
+
+#: Fee-comparison columns. ``charge`` is shared by both tables so a saved
+#: choice works consistently in both places.
+REPORT_COMPARISON_COLUMN_LABELS = {
+    "charge": "Charge",
+    "calculated": "On calculated valuation",
+    "written": "On written value",
+    "difference": "Difference (deficient)",
+}
+
+DEFAULT_VALUATION_REPORT_OPTIONS = {
+    "sections": list(REPORT_SECTION_LABELS),
+    "charge_columns": list(REPORT_CHARGE_COLUMN_LABELS),
+    "comparison_columns": list(REPORT_COMPARISON_COLUMN_LABELS),
+}
+
+
+def _normalize_report_list(
+    values: Any,
+    allowed: dict[str, str],
+    label: str,
+    default: list[str],
+) -> list[str]:
+    """Validate an ordered subset of report sections or columns."""
+    raw = default if values is None else values
+    if not isinstance(raw, (list, tuple)):
+        raise SettingsError(f"{label} must be a list.")
+    result: list[str] = []
+    for item in raw:
+        if item not in allowed:
+            supported = ", ".join(sorted(allowed))
+            raise SettingsError(
+                f"Unsupported {label[:-1]} '{item}'. Use one of: {supported}."
+            )
+        if item not in result:
+            result.append(item)
+    if not result:
+        raise SettingsError(f"Select at least one {label[:-1]}.")
+    return result
+
+
+def normalize_valuation_report_options(values: Any) -> dict[str, Any]:
+    """Validate and complete a PDF/print preference configuration."""
+    if values is None:
+        values = {}
+    if not isinstance(values, dict):
+        raise SettingsError("Valuation report options must be a mapping.")
+    return {
+        "sections": _normalize_report_list(
+            values.get("sections"), REPORT_SECTION_LABELS, "sections",
+            DEFAULT_VALUATION_REPORT_OPTIONS["sections"],
+        ),
+        "charge_columns": _normalize_report_list(
+            values.get("charge_columns"), REPORT_CHARGE_COLUMN_LABELS,
+            "charge_columns", DEFAULT_VALUATION_REPORT_OPTIONS["charge_columns"],
+        ),
+        "comparison_columns": _normalize_report_list(
+            values.get("comparison_columns"), REPORT_COMPARISON_COLUMN_LABELS,
+            "comparison_columns", DEFAULT_VALUATION_REPORT_OPTIONS["comparison_columns"],
+        ),
+    }
+
+
+def get_valuation_report_options() -> dict[str, Any]:
+    """Return saved PDF/print options, falling back field-by-field."""
+    stored = get_setting(VALUATION_REPORT_KEY, None)
+    if not isinstance(stored, dict):
+        return {key: list(value) for key, value in DEFAULT_VALUATION_REPORT_OPTIONS.items()}
+    result: dict[str, Any] = {}
+    for key, allowed, label in (
+        ("sections", REPORT_SECTION_LABELS, "sections"),
+        ("charge_columns", REPORT_CHARGE_COLUMN_LABELS, "charge_columns"),
+        ("comparison_columns", REPORT_COMPARISON_COLUMN_LABELS, "comparison_columns"),
+    ):
+        try:
+            result[key] = _normalize_report_list(
+                stored.get(key), allowed, label,
+                DEFAULT_VALUATION_REPORT_OPTIONS[key],
+            )
+        except SettingsError:
+            result[key] = list(DEFAULT_VALUATION_REPORT_OPTIONS[key])
+    return result
+
+
+def set_valuation_report_options(values: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist PDF/print sections and columns."""
+    normalized = normalize_valuation_report_options(values)
+    set_setting(VALUATION_REPORT_KEY, normalized)
+    return normalized
+
+
+def reset_valuation_report_options() -> dict[str, Any]:
+    """Restore all PDF/print sections and columns."""
+    normalized = {
+        key: list(value) for key, value in DEFAULT_VALUATION_REPORT_OPTIONS.items()
+    }
+    set_setting(VALUATION_REPORT_KEY, normalized)
+    return normalized

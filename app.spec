@@ -4,8 +4,8 @@
 Build with:  .\\.env\\Scripts\\python.exe -m PyInstaller app.spec --noconfirm
 
 Everything (Python runtime, DLLs, packages, the Flet desktop client archive)
-is packed into ONE executable: dist/LandOfficeManager.exe. Copy that single
-file anywhere and run it — no other files are needed.
+is packed into ONE executable: dist/LandOfficeManager_v<version>_<timestamp>.exe.
+Copy that single file anywhere and run it — no other files are needed.
 
 The database is created and kept NEXT TO THE EXE (core/config.py resolves
 the data directory from the executable location when frozen, so the
@@ -17,7 +17,20 @@ Note: a one-file build extracts itself to a temp folder at every start, so
 the first window appears a few seconds slower than an onedir build.
 """
 
+from datetime import datetime
+from pathlib import Path
+import re
+
 block_cipher = None
+
+# Portable builds carry their version and build time in the file name so an
+# older EXE can never be mistaken for a newer distribution copy.
+_config_text = Path("core/config.py").read_text(encoding="utf-8")
+_version_match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', _config_text)
+APP_VERSION = _version_match.group(1) if _version_match else "unknown"
+BUILD_STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+EXE_NAME = f"LandOfficeManager_v{APP_VERSION}_{BUILD_STAMP}"
+print(f"Portable build output: {EXE_NAME}.exe")
 
 first_party_modules = [
     "core.__init__",
@@ -70,6 +83,12 @@ third_party_modules = [
     "flet_desktop.win_taskbar",
     "flet_platform_assets",
     # Spreadsheet / report extras.
+    "reportlab",
+    "reportlab.lib",
+    "reportlab.lib.pagesizes",
+    "reportlab.pdfbase",
+    "reportlab.pdfbase.ttfonts",
+    "reportlab.platypus",
     "odf",
     "odf.element",
     "odf.grammar",
@@ -136,7 +155,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="LandOfficeManager",
+    name=EXE_NAME,
     icon="icon.ico",
     debug=False,
     bootloader_ignore_signals=False,

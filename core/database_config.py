@@ -7,6 +7,10 @@ stored inside the ``app_settings`` table — it lives in ``data/database.json``
 next to the data instead.
 
 Design notes:
+* ``database.json`` is a saved connection preference outside the database.
+  It is not required for startup: when absent, the app uses the SQLite file
+  beside the EXE. On the first run the app writes that default choice to the
+  file so portable users can see and edit it; Settings → Database updates it.
 * ``load_options`` is defensive: a missing, empty, or malformed file falls
   back to the built-in SQLite default so the app always starts.
 * Connection passwords are never written as plain text. They are encrypted
@@ -160,6 +164,30 @@ def save_options(options: dict[str, Any]) -> dict[str, Any]:
     )
     os.replace(temporary, CONFIG_FILE_PATH)
     return normalized
+
+
+def ensure_database_config_file() -> dict[str, Any]:
+    """Create ``database.json`` with safe defaults when it is missing.
+
+    The default path comes from :func:`default_options`, which resolves the
+    EXE-local SQLite file when frozen, so no developer-machine path is baked
+    into a distributed app. An existing file is never rewritten — even when
+    malformed — because it may hold the user's deliberate database choice.
+    Returns the options that are in effect after the check.
+    """
+    try:
+        if CONFIG_FILE_PATH.exists():
+            return load_options()
+    except OSError:
+        # An unreadable path should not stop startup; load_options has the
+        # same fallback behaviour.
+        return default_options()
+    try:
+        save_options(default_options())
+    except (OSError, DatabaseConfigError):
+        # A read-only data folder must not prevent the app from starting.
+        return default_options()
+    return load_options()
 
 
 def _encrypt_password(password: str) -> str:

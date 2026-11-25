@@ -9,6 +9,8 @@ from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -24,9 +26,41 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from services.settings_service import (
+    DEFAULT_VALUATION_REPORT_OPTIONS,
+    REPORT_CHARGE_COLUMN_LABELS,
+    REPORT_COMPARISON_COLUMN_LABELS,
+    REPORT_SECTION_LABELS,
+    VALUATION_TABLE_TEMPLATES,
+)
+
 
 class ValuationReportError(ValueError):
     """Raised when an unsupported or malformed valuation report is requested."""
+
+
+def task_number(estimate: dict[str, Any]) -> str:
+    """Return the user-entered task number from an estimate or export record."""
+    inputs = estimate.get("input_snapshot") or {}
+    return str(inputs.get("task_no") or estimate.get("task_no") or "").strip()
+
+
+def _safe_print_job_name(value: Any) -> str:
+    """Sanitize a task number before using it in a temporary file name."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    return cleaned[:80].strip("._") or "valuation"
+
+
+def valuation_pdf_filename(estimate: dict[str, Any], *, now: datetime | None = None) -> str:
+    """Name a saved PDF with its task number and generation date/time.
+
+    The timestamp prevents a second export on the same day from silently
+    replacing the first one, while the sanitized task number keeps the file
+    easy to find. No client name or other personal data goes in the name.
+    """
+    task = _safe_print_job_name(task_number(estimate) or "task")
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    return f"valuation_{task}_{stamp}.pdf"
 
 
 CHARGE_EXPORT_KEYS = (
@@ -160,6 +194,7 @@ def _estimate_rows(estimate: dict[str, Any]) -> list[list[str]]:
         deficient = "Not checked (no written value entered)"
     details = [
         ("Estimate ID", estimate.get("id") or "Unsaved"),
+        ("Task no.", task_number(estimate) or "Not entered"),
         ("Transaction date", estimate.get("transaction_date")),
         ("Client", estimate.get("client_name") or "Unlinked"),
         ("Transaction type", inputs.get("transaction_type")),
@@ -220,6 +255,154 @@ def _charge_rows(estimate: dict[str, Any]) -> list[list[str]]:
             str(snapshot.get("verification_status", "unverified")),
         ])
     return rows
+
+
+_CHARGE_COLUMN_WEIGHTS = {
+    "charge": 24, "category": 16, "payer": 12, "party": 18, "method": 14,
+    "base": 16, "rate": 12, "amount": 18, "currency": 11, "source": 22,
+    "effective_dates": 20, "verification": 14,
+}
+_COMPARISON_COLUMN_WEIGHTS = {
+    "charge": 34, "calculated": 22, "written": 22, "difference": 22,
+}
+
+
+def _amount_text(value: Any, currency: str = "PKR") -> str:
+    """Format a report amount without turning a missing value into zero."""
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{currency} {Decimal(str(value)):,.2f}"
+    except (InvalidOperation, ValueError, TypeError):
+        return str(value)
+
+
+def _charge_identity(charge: dict[str, Any]) -> tuple[str, str, str]:
+    party = charge.get("party") or {}
+    return (
+        str(charge.get("name") or ""),
+        str(party.get("label") or ""),
+        str(party.get("role") or ""),
+    )
+
+
+def _charge_display(charge: dict[str, Any]) -> str:
+    name, label, role = _charge_identity(charge)
+    if label and role:
+        return f"{name} — {label} ({role})"
+    if label:
+        return f"{name} — {label}"
+    return name
+
+
+def _comparison_rows(
+    estimate: dict[str, Any], columns: list[str],
+) -> list[list[str]]:
+    """Build the fee-comparison table rows from stored calculation snapshots."""
+    selected = [key for key in columns if key in REPORT_COMPARISON_COLUMN_LABELS]
+    if not selected:
+        return []
+    result = estimate.get("result_snapshot") or {}
+    charges_data = result.get("charges") or {}
+    written_data = charges_data.get("charges_on_written_valuation") or {}
+    calculated = charges_data.get("charges") or []
+    written = written_data.get("charges") or []
+    if not calculated or not written:
+        return []
+
+    written_by_key = {_charge_identity(line): line for line in written}
+    rows = [[REPORT_COMPARISON_COLUMN_LABELS[key] for key in selected]]
+    for line in calculated:
+        other = written_by_key.get(_charge_identity(line))
+        written_amount = other.get("amount") if other else None
+        difference = None
+        if written_amount is not None and line.get("amount") is not None:
+            try:
+                difference = Decimal(str(line["amount"])) - Decimal(str(written_amount))
+            except (InvalidOperation, ValueError, TypeError):
+                difference = None
+        values = {
+            "charge": _charge_display(line),
+            "calculated": _amount_text(line.get("amount"), line.get("currency_code", "PKR")),
+            "written": _amount_text(
+                written_amount,
+                (other or {}).get("currency_code", line.get("currency_code", "PKR")),
+            ) if other else "—",
+            "difference": _amount_text(
+                difference, line.get("currency_code", "PKR")
+            ) if difference is not None else "—",
+        }
+        rows.append([values[key] for key in selected])
+
+    totals = charges_data.get("totals_by_currency") or {}
+    written_totals = written_data.get("totals_by_currency") or {}
+    difference_total = {
+        currency: Decimal(str(totals.get(currency, 0))) - Decimal(str(written_totals.get(currency, 0)))
+        for currency in sorted(set(totals) | set(written_totals))
+    }
+
+    def joined(mapping: dict[str, Any]) -> str:
+        return " · ".join(f"{currency}: {value}" for currency, value in mapping.items()) or "—"
+
+    total_values = {
+        "charge": "Total",
+        "calculated": joined(totals),
+        "written": joined(written_totals),
+        "difference": joined(difference_total),
+    }
+    rows.append([total_values[key] for key in selected])
+    return rows
+
+
+def _pdf_color(value: Any, fallback: str):
+    """Resolve a saved template colour with a safe fallback."""
+    try:
+        return colors.HexColor(str(value))
+    except (ValueError, TypeError):
+        return colors.HexColor(fallback)
+
+
+def _pdf_table_style(
+    style: dict[str, Any],
+    row_count: int,
+    *,
+    font_size: float = 7,
+    total_row: bool = False,
+):
+    """Apply the selected table template to a ReportLab table."""
+    header_bg = _pdf_color(style.get("header_bg"), "#1F4E78")
+    header_text = _pdf_color(style.get("header_text"), "#FFFFFF")
+    row_even = _pdf_color(style.get("row_even"), "#F8FAFC")
+    row_odd = _pdf_color(style.get("row_odd"), "#FFFFFF")
+    border = _pdf_color(style.get("border_color"), "#CBD5E1")
+    commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), header_bg),
+        ("TEXTCOLOR", (0, 0), (-1, 0), header_text),
+        ("GRID", (0, 0), (-1, -1), 0.35, border),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [row_odd, row_even]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("FONTSIZE", (0, 0), (-1, -1), font_size),
+    ]
+    if total_row and row_count > 1:
+        commands.append(
+            ("BACKGROUND", (0, row_count - 1), (-1, row_count - 1),
+             _pdf_color(style.get("total_bg"), "#E2E8F0"))
+        )
+    return TableStyle(commands)
+
+
+def _proportional_widths(
+    columns: list[str], weights: dict[str, int], total_mm: float = 178,
+) -> list[float]:
+    """Share the printable page width across the selected report columns."""
+    total_weight = sum(weights.get(key, 16) for key in columns)
+    if not total_weight:
+        return []
+    return [total_mm * mm * weights.get(key, 16) / total_weight for key in columns]
 
 
 def export_estimate_json(estimate: dict[str, Any]) -> bytes:
@@ -372,8 +555,17 @@ def _pdf_font_name() -> str:
     return "Helvetica"
 
 
-def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
-    """Build a detailed PDF report with source/verification and warning fields."""
+def export_estimate_pdf(
+    estimate: dict[str, Any],
+    options: dict[str, Any] | None = None,
+    table_style: dict[str, Any] | None = None,
+) -> bytes:
+    """Build a PDF using the saved section, column, and table-style choices.
+
+    ``options`` and ``table_style`` are supplied by the UI from settings. When
+    omitted, the built-in defaults keep standalone calls and older tests
+    working without touching any database.
+    """
     output = BytesIO()
     document = SimpleDocTemplate(
         output, pagesize=A4, rightMargin=16 * mm, leftMargin=16 * mm,
@@ -383,95 +575,177 @@ def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
     )
     font = _pdf_font_name()
     styles = getSampleStyleSheet()
+
+    merged_options = {
+        key: list(value) for key, value in DEFAULT_VALUATION_REPORT_OPTIONS.items()
+    }
+    if isinstance(options, dict):
+        for key in merged_options:
+            if isinstance(options.get(key), (list, tuple)):
+                merged_options[key] = list(options[key])
+    sections = set(merged_options["sections"]) & set(REPORT_SECTION_LABELS)
+    charge_columns = [
+        key for key in merged_options["charge_columns"]
+        if key in REPORT_CHARGE_COLUMN_LABELS
+    ] or list(REPORT_CHARGE_COLUMN_LABELS)
+    comparison_columns = [
+        key for key in merged_options["comparison_columns"]
+        if key in REPORT_COMPARISON_COLUMN_LABELS
+    ] or list(REPORT_COMPARISON_COLUMN_LABELS)
+
+    style = dict(VALUATION_TABLE_TEMPLATES["classic"])
+    if isinstance(table_style, dict):
+        style.update({
+            key: value for key, value in table_style.items() if key in style
+        })
+    accent = _pdf_color(style.get("header_bg"), "#1F4E78")
+    text_color = _pdf_color(style.get("text_color"), "#1E293B")
+    compact = bool(style.get("compact"))
+    cell_size = 6.2 if compact else 7.0
     title = ParagraphStyle("ValuationTitle", parent=styles["Title"], fontName=font,
                            fontSize=17, leading=21, alignment=TA_CENTER,
-                           textColor=colors.HexColor("#1F4E78"), spaceAfter=6 * mm)
+                           textColor=accent, spaceAfter=6 * mm)
     body = ParagraphStyle("ValuationBody", parent=styles["BodyText"], fontName=font,
-                          fontSize=8.5, leading=12, wordWrap="LTR")
+                          fontSize=8.5, leading=12, wordWrap="LTR",
+                          textColor=text_color)
+    task_style = ParagraphStyle("ValuationTask", parent=body, fontSize=10.5, leading=13,
+                                alignment=TA_CENTER, textColor=accent,
+                                spaceAfter=2 * mm)
     heading = ParagraphStyle("ValuationHeading", parent=styles["Heading2"], fontName=font,
-                             fontSize=11, leading=14, textColor=colors.HexColor("#1F4E78"),
+                             fontSize=11, leading=14, textColor=accent,
                              spaceBefore=4 * mm, spaceAfter=2 * mm)
+    task_no = task_number(estimate)
     story = [
         Paragraph("Property Valuation and Charge Estimate", title),
+        Paragraph(f"Task no: {escape(_shape_pdf_text(task_no)) if task_no else 'Not entered'}", task_style),
         Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", body),
         Paragraph("Estimate only. Verify the applicable schedule, rule, transaction details, and official challan before use.", body),
         Spacer(1, 3 * mm),
-        Paragraph("Property and valuation details", heading),
     ]
-    detail_data = []
-    for key, value in _estimate_rows(estimate):
-        detail_data.append([
-            Paragraph(f"<b>{escape(key)}</b>", body),
-            Paragraph(escape(_shape_pdf_text(value)).replace("\n", "<br/>"), body),
-        ])
-    table = Table(detail_data, colWidths=[48 * mm, 128 * mm], repeatRows=0)
-    table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#CBD5E1")),
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F1F5F9")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    story.append(table)
 
-    story.append(Paragraph("Itemized taxes and fees", heading))
-    charge_rows = _charge_rows(estimate)
-    if charge_rows[1:]:
-        charge_style = ParagraphStyle("ValuationChargeCell", parent=body, fontSize=7, leading=9)
-        header_style = ParagraphStyle("ValuationChargeHead", parent=charge_style,
-                                      textColor=colors.white)
-        header_labels = ["Charge", "Category", "Payer", "Party", "Method", "Base", "Rate",
-                         "Amount", "Currency", "Source", "Effective dates", "Verification"]
-        chart_data = [[Paragraph(f"<b>{escape(label)}</b>", header_style)
-                       for label in header_labels]]
-        for row in charge_rows[1:]:
-            chart_data.append([
-                Paragraph(escape(_shape_pdf_text(value)), charge_style)
-                for value in row
-            ])
-        charge_table = Table(
-            chart_data,
-            colWidths=[24 * mm, 20 * mm, 14 * mm, 20 * mm, 14 * mm, 22 * mm, 13 * mm,
-                       22 * mm, 13 * mm, 26 * mm, 20 * mm, 16 * mm],
-            repeatRows=1,
-        )
-        charge_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#CBD5E1")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-             [colors.white, colors.HexColor("#F8FAFC")]),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 3),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
-        story.append(charge_table)
-        totals = ((estimate.get("result_snapshot") or {}).get("charges") or {}).get(
-            "totals_by_currency", {}
-        )
-        for currency, amount in totals.items():
-            story.append(Spacer(1, 1.5 * mm))
-            story.append(Paragraph(
-                escape(_shape_pdf_text(f"Total {currency}: {amount}")),
-                ParagraphStyle("ValuationTotal", parent=body,
-                               textColor=colors.HexColor("#1F4E78"),
-                               spaceAfter=2 * mm),
-            ))
-    else:
-        story.append(Paragraph("No charge rule was applied to this estimate.", body))
+    section_headings = {
+        "property_details": "Property and valuation details",
+        "charges": "Itemized taxes and fees",
+        "fee_comparison": "Fee comparison (calculated valuation vs written value)",
+        "explanation": "Calculation explanation",
+        "warnings": "Warnings",
+    }
+
+    if "property_details" in sections:
+        story.append(Paragraph(section_headings["property_details"], heading))
+        detail_rows = _estimate_rows(estimate)
+        if "warnings" not in sections:
+            detail_rows = [row for row in detail_rows if row[0] != "Warnings"]
+        detail_data = [
+            [
+                Paragraph(f"<b>{escape(key)}</b>", body),
+                Paragraph(escape(_shape_pdf_text(value)).replace("\n", "<br/>"), body),
+            ]
+            for key, value in detail_rows
+        ]
+        detail_table = Table(detail_data, colWidths=[48 * mm, 128 * mm], repeatRows=0)
+        detail_table.setStyle(_pdf_table_style(style, len(detail_data), font_size=8))
+        story.append(detail_table)
 
     snapshot = estimate.get("result_snapshot") or {}
-    story.append(Paragraph("Calculation explanation", heading))
-    for line in (snapshot.get("valuation") or {}).get("explanation", []):
-        story.append(Paragraph(escape(_shape_pdf_text(line)), body))
-    story.append(Paragraph("Warnings", heading))
-    for warning in estimate.get("warnings", []):
-        story.append(Paragraph("• " + escape(_shape_pdf_text(warning)), body))
-    if not estimate.get("warnings"):
-        story.append(Paragraph("No calculation warnings were recorded.", body))
+    charges_data = snapshot.get("charges") or {}
+
+    if "charges" in sections:
+        story.append(Paragraph(section_headings["charges"], heading))
+        charge_rows = _charge_rows(estimate)
+        if charge_rows[1:]:
+            charge_style = ParagraphStyle(
+                "ValuationChargeCell", parent=body, fontSize=cell_size,
+                leading=cell_size + 2,
+            )
+            header_style = ParagraphStyle(
+                "ValuationChargeHead", parent=charge_style,
+                textColor=_pdf_color(style.get("header_text"), "#FFFFFF"),
+            )
+            all_charge_keys = list(REPORT_CHARGE_COLUMN_LABELS)
+            chart_data = [[
+                Paragraph(
+                    f"<b>{escape(REPORT_CHARGE_COLUMN_LABELS[key])}</b>", header_style
+                )
+                for key in charge_columns
+            ]]
+            for row in charge_rows[1:]:
+                values = dict(zip(all_charge_keys, row))
+                chart_data.append([
+                    Paragraph(escape(_shape_pdf_text(values.get(key, ""))), charge_style)
+                    for key in charge_columns
+                ])
+            charge_table = Table(
+                chart_data,
+                colWidths=_proportional_widths(
+                    charge_columns, _CHARGE_COLUMN_WEIGHTS
+                ),
+                repeatRows=1,
+            )
+            charge_table.setStyle(_pdf_table_style(style, len(chart_data), font_size=cell_size))
+            story.append(charge_table)
+            totals = charges_data.get("totals_by_currency", {})
+            total_style = ParagraphStyle(
+                "ValuationTotal", parent=body, textColor=accent, spaceAfter=2 * mm
+            )
+            for currency, amount in totals.items():
+                story.append(Spacer(1, 1.5 * mm))
+                story.append(Paragraph(
+                    escape(_shape_pdf_text(f"Total {currency}: {amount}")), total_style
+                ))
+        else:
+            story.append(Paragraph("No charge rule was applied to this estimate.", body))
+
+    if "fee_comparison" in sections:
+        story.append(Paragraph(section_headings["fee_comparison"], heading))
+        comparison_rows = _comparison_rows(estimate, comparison_columns)
+        if comparison_rows:
+            comparison_style = ParagraphStyle(
+                "ValuationComparisonCell", parent=body, fontSize=cell_size,
+                leading=cell_size + 2,
+            )
+            comparison_header = ParagraphStyle(
+                "ValuationComparisonHead", parent=comparison_style,
+                textColor=_pdf_color(style.get("header_text"), "#FFFFFF"),
+            )
+            comparison_data = [
+                [
+                    Paragraph(
+                        f"<b>{escape(value)}</b>" if index == 0
+                        else escape(_shape_pdf_text(value)),
+                        comparison_header if index == 0 else comparison_style,
+                    )
+                    for value in row
+                ]
+                for index, row in enumerate(comparison_rows)
+            ]
+            comparison_table = Table(
+                comparison_data,
+                colWidths=_proportional_widths(
+                    comparison_columns, _COMPARISON_COLUMN_WEIGHTS
+                ),
+                repeatRows=1,
+            )
+            comparison_table.setStyle(_pdf_table_style(
+                style, len(comparison_data), font_size=cell_size, total_row=True
+            ))
+            story.append(comparison_table)
+        else:
+            story.append(Paragraph(
+                "Fee comparison was not calculated for this estimate.", body
+            ))
+
+    if "explanation" in sections:
+        story.append(Paragraph(section_headings["explanation"], heading))
+        for line in (snapshot.get("valuation") or {}).get("explanation", []):
+            story.append(Paragraph(escape(_shape_pdf_text(line)), body))
+
+    if "warnings" in sections:
+        story.append(Paragraph(section_headings["warnings"], heading))
+        for warning in estimate.get("warnings", []):
+            story.append(Paragraph("• " + escape(_shape_pdf_text(warning)), body))
+        if not estimate.get("warnings"):
+            story.append(Paragraph("No calculation warnings were recorded.", body))
 
     def footer(canvas, _document):
         canvas.saveState()
@@ -483,6 +757,32 @@ def export_estimate_pdf(estimate: dict[str, Any]) -> bytes:
 
     document.build(story, onFirstPage=footer, onLaterPages=footer)
     return output.getvalue()
+
+
+def prepare_print_pdf(payload: bytes, job_name: str = "valuation") -> Path:
+    """Write a PDF to a temporary print job without exposing client data in logs."""
+    directory = Path(tempfile.gettempdir()) / "land_office_print_jobs"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = directory / f"{_safe_print_job_name(job_name)}_{stamp}.pdf"
+    target.write_bytes(payload)
+    return target
+
+
+def print_pdf(payload: bytes, job_name: str = "valuation") -> Path:
+    """Send a generated PDF to the Windows default printer.
+
+    The spooler needs the file after this call returns, so the temporary PDF is
+    intentionally left in place for the print subsystem to finish.
+    """
+    if os.name != "nt":
+        raise ValuationReportError("Direct printing is available on Windows only.")
+    target = prepare_print_pdf(payload, job_name)
+    try:
+        os.startfile(str(target), "print")  # type: ignore[attr-defined]
+    except OSError as exc:
+        raise ValuationReportError(f"Could not send the PDF to the printer: {exc}") from exc
+    return target
 
 
 def export_estimate_history(records: list[dict[str, Any]], file_format: str) -> bytes:

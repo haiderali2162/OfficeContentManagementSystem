@@ -1157,6 +1157,28 @@ def list_location_picker(
     }
 
 
+def list_classifications() -> list[str]:
+    """Return unique classification values stored on DC/FBR rate rows.
+
+    Values are trimmed and de-duplicated case-insensitively so the UI shows
+    one choice per real classification even when imports used different
+    capitalisation or stray whitespace. Blank values are omitted.
+    """
+    with SessionLocal() as session:
+        raw_values = session.scalars(
+            select(DCValuationRate.classification).where(
+                DCValuationRate.classification.is_not(None),
+                func.trim(DCValuationRate.classification) != "",
+            )
+        ).all()
+    unique: dict[str, str] = {}
+    for raw_value in raw_values:
+        value = " ".join(str(raw_value or "").split())
+        if value:
+            unique.setdefault(value.casefold(), value)
+    return sorted(unique.values(), key=str.casefold)
+
+
 def _apply_location_land_type(statement, land_type: str | None):
     """Apply the calculator's rural/urban convention to a location query."""
     if land_type in {"rural", "urban"}:
@@ -2646,6 +2668,7 @@ _LOCATION_ID_LITERAL_LIMIT = min(10000, _SQLITE_BIND_PARAMETER_LIMIT - 20)
 def summarize_dc_rates(
     *, mauza: str = "", qanoongoi: str = "", rate_unit: str | None = None,
     schedule_type: str | None = None, land_type: str | None = None,
+    classification: str = "",
 ) -> dict[str, Any]:
     """Aggregate rate extremes for the selected location filters.
 
@@ -2683,6 +2706,11 @@ def summarize_dc_rates(
         statement = statement.where(DCValuationRate.rate_unit == rate_unit)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
+    if classification.strip():
+        statement = statement.where(
+            func.lower(func.trim(DCValuationRate.classification))
+            == classification.strip().casefold()
+        )
     aggregate = select(
         func.count(DCValuationRate.id),
         func.min(DCValuationRate.rate_value),
@@ -2879,6 +2907,7 @@ def list_dc_rates(
     committee_town: str = "",
     property_area: str = "",
     revenue_circle: str = "",
+    classification: str = "",
     locality: str = "",
     square_no: str = "",
     kila_no: str = "",
@@ -2939,6 +2968,11 @@ def list_dc_rates(
         statement = statement.join(DCValuationRate.location)
     if schedule_type in {"dc", "fbr"}:
         statement = statement.where(DCValuationRate.schedule_type == schedule_type)
+    if classification.strip():
+        statement = statement.where(
+            func.lower(func.trim(DCValuationRate.classification))
+            == classification.strip().casefold()
+        )
     if location_ids is not None:
         statement = statement.where(
             DCValuationRate.location_id.in_([int(value) for value in location_ids])

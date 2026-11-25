@@ -1003,6 +1003,37 @@ def test_schedule_summary_reports_empty_results(rate_database):
     }
 
 
+def test_classification_values_are_unique_and_filter_rates(rate_database):
+    first_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Alpha", mauza="Alpha", hadbast_number="1"
+    ))
+    second_id, _ = dc_rate_service.create_location(**_location_values(
+        name="Beta", mauza="Beta", hadbast_number="2"
+    ))
+    dc_rate_service.create_dc_rate(
+        location_id=first_id,
+        **_rate_values(classification="Residential", rate_value="100"),
+    )
+    dc_rate_service.create_dc_rate(
+        location_id=second_id,
+        **_rate_values(classification="residential", property_type="Commercial",
+                       rate_value="200"),
+    )
+    dc_rate_service.create_dc_rate(
+        location_id=second_id,
+        **_rate_values(classification="  Agricultural  ",
+                       property_type="Agricultural", rate_value="300"),
+    )
+
+    assert dc_rate_service.list_classifications() == [
+        "Agricultural", "Residential"
+    ]
+    matches = dc_rate_service.list_dc_rates(classification="RESIDENTIAL")
+    assert {record["location_id"] for record in matches} == {first_id, second_id}
+    assert dc_rate_service.list_dc_rates(classification="not stored") == []
+    assert dc_rate_service.summarize_dc_rates(classification="residential")["count"] == 2
+
+
 def test_qanoongoi_filters_and_location_hierarchy_summary(rate_database):
     alpha_id, _ = dc_rate_service.create_location(**_location_values(
         name="Alpha", mauza="Alpha", district="District A", tehsil="Tehsil A",

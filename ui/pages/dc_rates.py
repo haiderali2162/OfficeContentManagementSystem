@@ -42,6 +42,7 @@ from services.dc_rate_service import (
     list_saved_khewat_numbers,
     list_mauza_contexts,
     list_cadastral_values,
+    list_classifications,
     list_dc_rates,
     list_duplicate_rule_profiles,
     list_location_hint_values,
@@ -263,6 +264,20 @@ def build_dc_rates_page(
     revenue_circle_filter = ft.AutoComplete(
         width=160, suggestions_max_height=220, data="revenue_circle"
     )
+    # Classification choices come from the rate table itself (unique,
+    # trimmed values), not from a hard-coded list in the UI.
+    classification_filter = ft.Dropdown(
+        label="Classification",
+        width=190,
+        value="all",
+        options=[
+            ft.dropdown.Option("all", "All classifications"),
+            *[
+                ft.dropdown.Option(value, value)
+                for value in list_classifications()
+            ],
+        ],
+    )
     search_field = ft.TextField(
         label="Search location, property, classification, or source",
         prefix_icon=getattr(ft.Icons, "SEARCH", None),
@@ -362,6 +377,11 @@ def build_dc_rates_page(
             return "fbr", None
         return None, None
 
+    def selected_classification() -> str | None:
+        """Return the chosen classification, or ``None`` for all values."""
+        selected = classification_filter.value
+        return None if selected in (None, "all") else str(selected)
+
     def close_dialog():
         page.pop_dialog()
 
@@ -454,6 +474,7 @@ def build_dc_rates_page(
                     qanoongoi=qanoongoi_filter.value or "",
                     square_no=square_filter.value or "", kila_no=kila_filter.value or "",
                     khasra_no=khasra_filter.value or "",
+                    classification=selected_classification(),
                     schedule_type=schedule_type, land_type=land_type,
                     location_id=int(selected_location) if selected_location != "all" else None,
                     rate_unit=unit_filter.value if unit_filter.value != "all" else None,
@@ -558,6 +579,7 @@ def build_dc_rates_page(
                         revenue_circle=revenue_circle_filter.value or "",
                         square_no=square_filter.value or "", kila_no=kila_filter.value or "",
                         khasra_no=khasra_filter.value or "",
+                        classification=selected_classification(),
                         schedule_type=schedule_type, land_type=land_type,
                         location_id=int(selected_location) if selected_location != "all" else None,
                         rate_unit=unit_filter.value if unit_filter.value != "all" else None,
@@ -569,6 +591,7 @@ def build_dc_rates_page(
                         qanoongoi=qanoongoi_filter.value or "",
                         rate_unit=unit_filter.value if unit_filter.value != "all" else None,
                         schedule_type=schedule_type, land_type=land_type,
+                        classification=selected_classification(),
                     ),
                     asyncio.to_thread(
                         list_mauza_names,
@@ -1082,6 +1105,7 @@ def build_dc_rates_page(
                 square_filter.value = ""
                 kila_filter.value = ""
                 khasra_filter.value = ""
+                classification_filter.value = "all"
                 schedule_rates_refresh()
                 status_text.value = f"{schedule_field.value.upper()} rate saved and shown below."
                 page.update()
@@ -1817,6 +1841,7 @@ def build_dc_rates_page(
             square_no=square_filter.value or "",
             kila_no=kila_filter.value or "",
             khasra_no=khasra_filter.value or "",
+            classification=selected_classification(),
         )
 
     def open_duplicate_rules_dialog(_=None):
@@ -3318,6 +3343,7 @@ def build_dc_rates_page(
     square_filter.on_change = square_changed
     kila_filter.on_change = kila_changed
     khasra_filter.on_change = lambda event: schedule_rates_refresh(event, suggestion_field="khasra_no")
+    classification_filter.on_select = schedule_rates_refresh
     schedule_filter.on_select = schedule_rates_refresh
     location_filter.on_select = schedule_rates_refresh
     unit_filter.on_select = schedule_rates_refresh
@@ -3758,6 +3784,7 @@ def build_dc_rates_page(
         ft.Container(ft.Column([ft.Text("Square no."), square_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(ft.Column([ft.Text("Kila no."), kila_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
         ft.Container(ft.Column([ft.Text("Khasra no."), khasra_filter], spacing=2), col={"xs": 6, "sm": 3, "md": 2}),
+        ft.Container(classification_filter, col={"xs": 12, "sm": 6, "md": 2}),
         ft.Container(unit_filter, col={"xs": 12, "sm": 6, "md": 2}),
         ft.Container(schedule_filter, col={"xs": 12, "sm": 6, "md": 2}),
     ], run_spacing=4)

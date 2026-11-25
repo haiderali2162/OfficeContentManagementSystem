@@ -3,10 +3,12 @@
 import asyncio
 import flet as ft
 import json
+import re
 import pytest
 from decimal import Decimal
 from types import SimpleNamespace
 
+from services.settings_service import VALUATION_TABLE_TEMPLATES
 from ui.pages import dc_rates
 from ui.pages import valuation
 from ui.app_shell import AppShell
@@ -73,6 +75,7 @@ def _stub_control_updates(root):
 def isolate_valuation_schedule_queries(monkeypatch):
     """Keep page tests independent from the live schedule database."""
     monkeypatch.setattr(valuation, "list_location_hint_values", lambda **_kwargs: {})
+    monkeypatch.setattr(valuation, "list_classifications", lambda: [])
     monkeypatch.setattr(valuation, "find_schedule_location_matches", lambda **_kwargs: [])
     # The location draft is module-level cache shared by page rebuilds; clear
     # it around every test so restored values never leak between tests.
@@ -794,8 +797,11 @@ def test_export_current_result_row_has_all_formats_and_guards_empty(monkeypatch)
     root = valuation.build_valuation_page(LoadingPage())
     buttons = {control.content: control for control in walk_controls(root)
                if isinstance(control, ft.OutlinedButton)}
-    for label in ("CSV", "Excel", "PDF", "ODS"):
+    for label in ("CSV", "Excel", "PDF", "ODS", "Print estimate"):
         assert label in buttons, f"Missing current-result export button: {label}"
+    assert any(isinstance(control, ft.TextField)
+               and str(control.label).startswith("Task no.")
+               for control in walk_controls(root))
 
     # No calculation yet: the CSV button must show the guidance message and
     # never touch the report service.
@@ -1763,6 +1769,168 @@ def test_urban_extended_fbr_finder_selects_the_fbr_rate(monkeypatch):
 
 
 
+def test_calculate_renders_plain_result_rows_and_warns_on_unknown_filer(monkeypatch):
+    """Portable-safe rendering uses plain rows, not a nested DataTable."""
+    _patch_estimate_services(monkeypatch, matches=[_location_row(7)],
+                             rates={"dc": [_dc_rate(11, 7)]})
+
+    def fake_party_charges(*, rules, transaction_date, context, parties, jurisdiction):
+        return {
+            "charges": [{
+                "name": "Stamp fee", "category": "stamp_fee", "payer": "buyer",
+                "amount": Decimal("1.00"), "currency_code": "PKR",
+            }],
+            "totals_by_currency": {"PKR": Decimal("1.00")},
+            "total_currency": "PKR", "warnings": [], "skipped_rules": [],
+        }
+
+    monkeypatch.setattr(valuation, "calculate_charges_for_parties", fake_party_charges)
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda: [
+        {"id": 10, "name": "236K (Active filer)", "category": "236k",
+         "calculation_method": "percentage", "rate_value": "1.25",
+         "currency_code": "PKR", "verification_status": "unverified",
+         "eligibility_conditions_json": json.dumps(
+             {"base": "dc_value", "payer": "buyer",
+              "when": {"buyer_filer_status": "ATL"}})},
+    ])
+    template = {**VALUATION_TABLE_TEMPLATES["mint"], "id": "mint"}
+    report_options = {
+        "sections": ["charges", "fee_comparison"],
+        "charge_columns": ["charge", "amount"],
+        "comparison_columns": ["charge", "calculated", "written", "difference"],
+    }
+    monkeypatch.setattr(valuation, "get_valuation_table_template", lambda: template)
+    monkeypatch.setattr(valuation, "get_valuation_report_options", lambda: report_options)
+    pdf_calls = []
+    real_pdf = valuation.export_estimate_pdf
+
+    def spy_pdf(record, options=None, table_style=None):
+        pdf_calls.append((options, table_style))
+        return real_pdf(record, options, table_style)
+
+    monkeypatch.setattr(valuation, "export_estimate_pdf", spy_pdf)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+
+    def no_control_update():
+        raise AssertionError("calculate must render through page.update()")
+
+    for control in controls:
+        if isinstance(control, ft.Control):
+            control.update = no_control_update
+
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    area = next(control for control in controls
+                if isinstance(control, ft.TextField)
+                and control.label == "Area (K-M-F or 10k5m)")
+    area.value = "0-20-0"
+    written = next(control for control in controls
+                   if isinstance(control, ft.TextField)
+                   and control.label == "Registry written value (PKR)")
+    written.value = "50"
+    task = next(control for control in controls
+                if isinstance(control, ft.TextField)
+                and str(control.label).startswith("Task no."))
+    task.value = "T-42"
+
+    button = next(control for control in controls
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    texts = [control.value for control in walk_controls(root)
+             if isinstance(control, ft.Text) and control.value]
+    assert not any("Could not calculate estimate" in text for text in texts)
+    assert any("Fee comparison" in text for text in texts)
+    assert any("On calculated valuation" in text for text in texts)
+    assert any("236C/236K rules are configured" in text for text in texts)
+    assert any("tax status is Unknown" in text for text in texts)
+    result_panels = [control for control in walk_controls(root)
+                     if isinstance(control, ft.Column) and control.height == 328]
+    assert result_panels
+    assert not any(isinstance(control, ft.DataTable)
+                   for control in walk_controls(result_panels[0]))
+    comparison_tables = [
+        control for control in walk_controls(result_panels[0])
+        if getattr(control, "data", None) == "valuation_comparison_table"
+    ]
+    assert comparison_tables
+    comparison_texts = [
+        control.value for control in walk_controls(comparison_tables[0])
+        if isinstance(control, ft.Text) and control.value
+    ]
+    assert "On calculated valuation" in comparison_texts
+    assert any("Stamp fee" in value for value in comparison_texts)
+    assert any(
+        isinstance(control, ft.Container)
+        and control.bgcolor == template["header_bg"]
+        for control in walk_controls(comparison_tables[0])
+    )
+
+    saved_pdfs = []
+    monkeypatch.setattr(valuation, "get_default_file_location", lambda: "C:\\fake\\exports")
+    monkeypatch.setattr(
+        valuation, "write_export_to_folder",
+        lambda folder, filename, payload: (
+            saved_pdfs.append((folder, filename, len(payload))) or "C:\\fake\\exports\\report.pdf"
+        ),
+    )
+    print_jobs = []
+    monkeypatch.setattr(
+        valuation, "print_pdf",
+        lambda payload, job_name: print_jobs.append(job_name) or "C:\\fake\\print.pdf",
+    )
+    after_export = list(walk_controls(root))
+    pdf_button = next(control for control in after_export
+                      if isinstance(control, ft.OutlinedButton) and control.content == "PDF")
+    asyncio.run(pdf_button.on_click(None))
+    assert saved_pdfs and saved_pdfs[0][0] == "C:\\fake\\exports"
+    assert re.fullmatch(r"valuation_T-42_\d{8}_\d{6}\.pdf", saved_pdfs[0][1])
+    assert saved_pdfs[0][2] > 1000
+    assert pdf_calls and pdf_calls[0][0] == report_options
+    assert pdf_calls[0][1]["id"] == "mint"
+
+    print_button = next(control for control in after_export
+                        if isinstance(control, ft.OutlinedButton)
+                        and control.content == "Print estimate")
+    print_button.on_click(None)
+    assert print_jobs and "T-42" in print_jobs[0]
+
+
+def test_empty_production_database_explains_missing_rules(monkeypatch):
+    """An EXE-local empty DB must show guidance, not a silent empty result."""
+    _patch_estimate_services(monkeypatch, matches=[_location_row(7)],
+                             rates={"dc": [_dc_rate(11, 7)]})
+    monkeypatch.setattr(
+        valuation.database_config, "load_options",
+        lambda: {"backend": "sqlite", "path": r"C:\empty\office.sqlite3"},
+    )
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    area = next(control for control in controls
+                if isinstance(control, ft.TextField)
+                and control.label == "Area (K-M-F or 10k5m)")
+    area.value = "0-20-0"
+    button = next(control for control in controls
+                  if isinstance(control, ft.Button)
+                  and getattr(control, "content", None) == "Calculate estimate")
+    button.on_click(SimpleNamespace(control=button))
+
+    texts = [control.value for control in walk_controls(root)
+             if isinstance(control, ft.Text) and control.value]
+    assert any("No tax/fee charges were calculated." in text for text in texts)
+    assert any("No tax or fee rules exist in the active database" in text
+               and r"C:\empty\office.sqlite3" in text for text in texts)
+    assert not any("No configured charge rules applied." in text for text in texts)
+
+
 def test_urban_236_fees_use_the_found_fbr_schedule(monkeypatch):
     """Urban: 236C/236K rules calculate on FBR when found, else on the DC rate."""
     matches = [_location_row(7, property_area="Sector C", name="Market Block")]
@@ -2008,3 +2176,129 @@ def test_fetch_lowest_and_highest_dc_rate_by_unit(monkeypatch):
                    and control.content == "Highest rate")
     highest.on_click(SimpleNamespace(control=highest))
     assert rate.value == "13"  # Rs. 250 is the highest fetched rate
+
+
+def test_classification_choices_are_db_backed_in_both_profiles(monkeypatch):
+    monkeypatch.setattr(
+        valuation, "list_classifications",
+        lambda: ["Agricultural", "Residential"],
+    )
+    _patch_estimate_services(monkeypatch, matches=[_location_row(7)],
+                             rates={"dc": [_dc_rate(11, 7)]})
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    classification = _dropdown(controls, "Classification (optional)")
+    assert [option.text for option in classification.options] == [
+        "All / not specified", "Agricultural", "Residential"
+    ]
+
+    def classification_holder():
+        for control in walk_controls(root):
+            if not isinstance(control, ft.Container):
+                continue
+            content = getattr(control, "content", None)
+            if not isinstance(content, ft.Column):
+                continue
+            children = content.controls or []
+            has_label = any(
+                isinstance(child, ft.Text) and child.value == "Classification"
+                for child in children
+            )
+            if has_label and classification in children:
+                return control
+        raise AssertionError("Classification field container not found")
+
+    holder = classification_holder()
+    assert holder.visible is True
+
+    profile = next(
+        control for control in walk_controls(root)
+        if isinstance(control, ft.RadioGroup)
+        and any(isinstance(radio, ft.Radio) and radio.value == "rural"
+                for radio in walk_controls(control))
+    )
+    profile.value = "urban"
+    profile.on_change(None)
+    assert classification_holder().visible is True
+
+
+def test_lowest_rate_fetches_with_one_field_and_classification(monkeypatch):
+    monkeypatch.setattr(valuation, "list_classifications", lambda: ["Residential"])
+    _patch_estimate_services(
+        monkeypatch,
+        matches=[_location_row(7, revenue_circle="Circle A", land_type="urban")],
+        rates={"dc": []},
+    )
+    low = dict(_dc_rate(21, 7, "Residential"), rate_value="50",
+               rate_unit="per_foot")
+    high = dict(_dc_rate(22, 7, "Residential"), rate_value="500")
+    other = dict(_dc_rate(23, 7, "Commercial"), rate_value="1")
+    calls = []
+
+    def listed_rates(*, schedule_type, **kwargs):
+        calls.append({"schedule_type": schedule_type, **kwargs})
+        if schedule_type != "dc":
+            return []
+        rows = [low, high, other]
+        selected = kwargs.get("classification")
+        if selected:
+            rows = [
+                row for row in rows
+                if row["classification"].casefold() == selected.casefold()
+            ]
+        return rows
+
+    monkeypatch.setattr(valuation, "list_dc_rates", listed_rates)
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+    profile = next(
+        control for control in walk_controls(root)
+        if isinstance(control, ft.RadioGroup)
+        and any(isinstance(radio, ft.Radio) and radio.value == "rural"
+                for radio in walk_controls(control))
+    )
+    profile.value = "urban"
+    profile.on_change(None)
+
+    circle = _auto(controls, "revenue_circle")
+    circle.value = "Circle A"
+    classification = _dropdown(controls, "Classification (optional)")
+    classification.value = "Residential"
+    circle.on_change(SimpleNamespace(control=circle))
+
+    lowest = next(
+        control for control in walk_controls(root)
+        if isinstance(control, ft.OutlinedButton)
+        and control.content == "Lowest rate"
+    )
+    lowest.on_click(None)
+
+    rate = _dropdown(controls, "Matched DC rate")
+    unit = _dropdown(controls, "DC rate unit")
+    assert rate.value == "21"
+    assert unit.value == "per_foot"
+    assert any(
+        call["schedule_type"] == "dc"
+        and call.get("revenue_circle") == "Circle A"
+        and call.get("classification") == "Residential"
+        and not call.get("mauza")
+        for call in calls
+    )
+
+
+def test_dc_rate_unit_menu_stays_available_without_a_match(monkeypatch):
+    _patch_estimate_services(monkeypatch, matches=[], rates={"dc": []})
+    root = valuation.build_valuation_page(FakePage())
+    controls = list(walk_controls(root))
+    mauza = _auto(controls, "mauza")
+    mauza.value = "No such mauza"
+    mauza.on_change(SimpleNamespace(control=mauza))
+
+    unit = _dropdown(controls, "DC rate unit")
+    assert unit.visible is True
+    assert unit.disabled is False
+    assert [option.key for option in unit.options] == list(
+        valuation.DC_RATE_UNITS
+    )

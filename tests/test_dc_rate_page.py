@@ -16,6 +16,7 @@ from ui.pages import dc_rates
 def _isolate_cadastral_settings(monkeypatch):
     """Keep UI tests away from the live settings/database."""
     saved_modes = []
+    monkeypatch.setattr(dc_rates, "list_classifications", lambda: [])
     monkeypatch.setattr(dc_rates, "get_cadastral_storage_mode", lambda: "ranges")
     monkeypatch.setattr(
         dc_rates, "set_cadastral_storage_mode", lambda mode: saved_modes.append(mode)
@@ -206,6 +207,47 @@ def test_rate_page_is_responsive_and_saved_rate_is_shown(monkeypatch):
     assert last_filters["location_id"] is None
     assert last_filters["rate_unit"] is None
     assert last_filters["published_year"] is None
+
+
+def test_classification_filter_uses_db_values_in_rate_and_summary_queries(monkeypatch):
+    rate_calls = []
+    summary_calls = []
+    monkeypatch.setattr(
+        dc_rates, "list_classifications",
+        lambda: ["Agricultural", "Residential"],
+    )
+    monkeypatch.setattr(
+        dc_rates, "list_dc_rates",
+        lambda **kwargs: rate_calls.append(kwargs) or [],
+    )
+    monkeypatch.setattr(
+        dc_rates, "summarize_dc_rates",
+        lambda **kwargs: (
+            summary_calls.append(kwargs) or {
+                "count": 0, "lowest": None, "highest": None,
+                "lowest_square": None, "highest_square": None,
+                "lowest_kila": None, "highest_kila": None,
+            }
+        ),
+    )
+    page = FakePage()
+    root = dc_rates.build_dc_rates_page(page)
+
+    classification = next(
+        control for control in _walk(root)
+        if isinstance(control, ft.Dropdown)
+        and control.label == "Classification"
+    )
+    assert [option.text for option in classification.options] == [
+        "All classifications", "Agricultural", "Residential"
+    ]
+
+    classification.value = "Residential"
+    classification.on_select(SimpleNamespace(control=classification))
+    asyncio.run(page.background_task)
+
+    assert rate_calls[-1]["classification"] == "Residential"
+    assert summary_calls[-1]["classification"] == "Residential"
 
 
 def test_large_location_set_keeps_quick_filter_bounded(monkeypatch):

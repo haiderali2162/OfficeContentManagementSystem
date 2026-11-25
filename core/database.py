@@ -144,6 +144,10 @@ def reconfigure_database(url: str | URL) -> Engine:
 # default instead of blocking the startup path (the same defensive posture
 # the settings service takes for app preferences).
 try:
+    # Create the saved connection preference on the very first run (or after
+    # the file is removed) using the EXE-local SQLite default. Existing files
+    # are left untouched.
+    database_config.ensure_database_config_file()
     _startup_url = database_config.build_url(database_config.load_options())
 except Exception:  # noqa: BLE001 - startup must not crash on bad options
     _startup_url = f"sqlite:///{DATABASE_PATH.as_posix()}"

@@ -1,14 +1,23 @@
 """Valuation report exports preserve estimate content and Unicode data."""
 
+from datetime import datetime
 from io import BytesIO
 
 from openpyxl import load_workbook
+from reportlab.lib import colors
 
+from services import valuation_report_service
+from services.settings_service import VALUATION_TABLE_TEMPLATES
 from services.valuation_report_service import (
     export_estimate_csv,
     export_estimate_history,
     export_estimate_pdf,
     export_estimate_xlsx,
+    print_pdf,
+    task_number,
+    valuation_pdf_filename,
+    _comparison_rows,
+    _pdf_table_style,
     _shape_pdf_text,
 )
 
@@ -131,6 +140,7 @@ def test_build_current_export_record_shapes_unsaved_result_for_exporters():
         "property_type": "Rural", "classification": "Rural", "registry_written_value": "50000",
         "share_numerator": 1, "share_denominator": 1,
         "declared_consideration": "50000", "buyer_filer_status": "ATL",
+        "task_no": "T-9",
     }
     valuation = {
         "property_value": "100000.00", "transferred_value": "100000.00",
@@ -160,6 +170,7 @@ def test_build_current_export_record_shapes_unsaved_result_for_exporters():
     assert record["client_name"] is None
     assert record["total_charges"] == "150.00"
     assert record["currency_code"] == "PKR"
+    assert record["input_snapshot"]["task_no"] == "T-9"
     assert record["warnings"] == ["Test warning."]
     assert record["location_snapshot"]["mauza"] == "Chak 1"
     # Underscore-prefixed internal keys never reach the snapshot.
@@ -197,6 +208,48 @@ def test_export_estimate_ods_creates_valid_opendocument_spreadsheet():
     # odfpy can also round-trip the document structure.
     document = load(BytesIO(ods_bytes))
     assert document is not None
+
+
+def test_task_number_is_exported_and_placed_at_top_of_pdf(monkeypatch):
+    estimate = _estimate()
+    estimate["input_snapshot"]["task_no"] = "T-77/26"
+    assert task_number(estimate) == "T-77/26"
+    assert ["Task no.", "T-77/26"] in valuation_report_service._estimate_rows(estimate)
+
+    stories = []
+
+    class FakeDoc:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build(self, story, **kwargs):
+            stories.append(story)
+
+    monkeypatch.setattr(valuation_report_service, "SimpleDocTemplate", FakeDoc)
+    export_estimate_pdf(estimate)
+    top_text = " ".join(getattr(item, "text", "") for item in stories[0][:4])
+    assert "Task no: T-77/26" in top_text
+
+
+def test_print_pdf_writes_print_job_and_uses_windows_print_verb(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(valuation_report_service.os, "name", "nt")
+    monkeypatch.setattr(
+        valuation_report_service.os, "startfile",
+        lambda path, verb: calls.append((path, verb)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        valuation_report_service.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    payload = b"%PDF-1.4 test print payload"
+
+    target = print_pdf(payload, "T-77/26")
+
+    assert target.is_file()
+    assert target.read_bytes() == payload
+    assert "T-77_26" in target.name
+    assert calls == [(str(target), "print")]
 
 
 def test_export_estimate_ods_uses_unsaved_label_for_current_results():
@@ -282,3 +335,83 @@ def test_charge_rows_carry_party_labels_and_json_history_export():
 
     record = export_estimate_json(estimate)
     assert record.startswith(b"{")
+
+
+def _comparison_estimate():
+    estimate = _estimate()
+    estimate["input_snapshot"]["task_no"] = "T-77/26"
+    calculation = estimate["result_snapshot"]["charges"]
+    calculation["charges"] = [{
+        "name": "Fee A", "party": {"label": "Buyer 1", "role": "buyer"},
+        "amount": "100.00", "currency_code": "PKR",
+    }]
+    calculation["totals_by_currency"] = {"PKR": "100.00"}
+    calculation["charges_on_written_valuation"] = {
+        "charges": [{
+            "name": "Fee A", "party": {"label": "Buyer 1", "role": "buyer"},
+            "amount": "80.00", "currency_code": "PKR",
+        }],
+        "totals_by_currency": {"PKR": "80.00"},
+    }
+    return estimate
+
+
+def test_valuation_pdf_filename_uses_task_number_and_timestamp():
+    name = valuation_pdf_filename(
+        _comparison_estimate(), now=datetime(2026, 11, 25, 14, 30, 9)
+    )
+    assert name == "valuation_T-77_26_20261125_143009.pdf"
+
+
+def test_comparison_rows_follow_selected_columns_and_calculate_differences():
+    rows = _comparison_rows(_comparison_estimate(), ["charge", "difference"])
+    assert rows[0] == ["Charge", "Difference (deficient)"]
+    assert rows[1] == ["Fee A — Buyer 1 (buyer)", "PKR 20.00"]
+    assert rows[-1] == ["Total", "PKR: 20.00"]
+
+
+def test_pdf_export_applies_selected_sections_and_columns(monkeypatch):
+    stories = []
+
+    class FakeDoc:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build(self, story, **kwargs):
+            stories.append(story)
+
+    monkeypatch.setattr(valuation_report_service, "SimpleDocTemplate", FakeDoc)
+    options = {
+        "sections": ["charges"],
+        "charge_columns": ["charge", "amount"],
+        "comparison_columns": ["charge"],
+    }
+    pdf = export_estimate_pdf(
+        _comparison_estimate(), options, VALUATION_TABLE_TEMPLATES["mint"]
+    )
+    assert pdf == b""  # FakeDoc writes nothing; the built story is inspected.
+    texts = []
+    for item in stories[0]:
+        if getattr(item, "text", None):
+            texts.append(item.text)
+        for row in getattr(item, "_cellvalues", ()) or ():
+            for cell in row:
+                if getattr(cell, "text", None):
+                    texts.append(cell.text)
+    joined = " ".join(texts)
+    assert "Itemized taxes and fees" in joined
+    assert "Charge" in joined and "Amount" in joined
+    assert "Property and valuation details" not in joined
+    assert "Fee comparison" not in joined
+    assert "Warnings" not in joined
+    assert "<b>Source</b>" not in joined
+
+
+def test_pdf_table_style_uses_selected_template_colours():
+    style = _pdf_table_style(VALUATION_TABLE_TEMPLATES["mint"], 3, total_row=True)
+    backgrounds = [
+        command[3] for command in style.getCommands()
+        if command[0] == "BACKGROUND"
+    ]
+    assert colors.HexColor("#0F766E") in backgrounds
+    assert colors.HexColor("#D1FAE5") in backgrounds

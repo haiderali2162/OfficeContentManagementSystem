@@ -41,20 +41,33 @@ from services.settings_service import (
     CARD_COLOR_LABELS,
     CARD_HEADING_FIELDS,
     DEFAULT_CARD_APPEARANCE,
+    DEFAULT_VALUATION_REPORT_OPTIONS,
+    DEFAULT_VALUATION_TABLE_TEMPLATE,
     FORMULA_FIELDS,
+    REPORT_CHARGE_COLUMN_LABELS,
+    REPORT_COMPARISON_COLUMN_LABELS,
+    REPORT_SECTION_LABELS,
     SettingsError,
+    VALUATION_TABLE_TEMPLATES,
     format_card_body_lines,
     format_card_heading,
     get_card_appearance,
     get_card_fields,
     get_default_file_location,
+    get_valuation_report_options,
+    get_valuation_table_template,
     normalize_card_appearance,
     normalize_card_fields,
+    normalize_valuation_report_options,
     reset_card_appearance,
     reset_card_fields,
+    reset_valuation_report_options,
+    reset_valuation_table_template,
     set_card_appearance,
     set_card_fields,
     set_default_file_location,
+    set_valuation_report_options,
+    set_valuation_table_template,
 )
 
 
@@ -517,6 +530,7 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     * **Files** — the default import/export folder preference.
     * **Rate cards — appearance** — heading template and colours.
     * **Rate cards — shown fields and formulas** — card content editor.
+    * **Valuation reports** — table template, PDF/print sections, and columns.
 
     Each category owns its own status messages: opening one never disturbs
     another, and collapsed categories stay collapsed while other controls
@@ -1291,6 +1305,230 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     apply_content_to_controls(saved_content)
     update_content_preview()
 
+    # Valuation table style and PDF/print report contents. Both preferences
+    # are additive app_settings keys, so older databases simply use defaults.
+    saved_template = get_valuation_table_template()
+    saved_report = get_valuation_report_options()
+    report_status = ft.Text("", size=12, color="#475569", selectable=True)
+    report_preview = ft.Column(
+        controls=[], spacing=4, tight=True, data="valuation_report_preview"
+    )
+
+    def update_report_preview() -> None:
+        """Refresh the small table preview from the unsaved editor values."""
+        style = VALUATION_TABLE_TEMPLATES.get(
+            str(template_dropdown.value),
+            VALUATION_TABLE_TEMPLATES[DEFAULT_VALUATION_TABLE_TEMPLATE],
+        )
+        border_color = str(style["border_color"])
+        header_bg = str(style["header_bg"])
+        header_text = str(style["header_text"])
+        row_bg = str(style["row_even"])
+        text_color = str(style["text_color"])
+
+        def preview_cell(text: str, background: str, color: str, weight: int = 1):
+            return ft.Container(
+                content=ft.Text(
+                    text, size=10, color=color, no_wrap=True,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                    weight=ft.FontWeight.BOLD if color == header_text else None,
+                ),
+                padding=4,
+                bgcolor=background,
+                border=ft.Border.all(1, border_color),
+                expand=weight,
+            )
+
+        preview_table = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Row(controls=[
+                        preview_cell("Charge", header_bg, header_text, 3),
+                        preview_cell("Calculated", header_bg, header_text, 2),
+                        preview_cell("Written", header_bg, header_text, 2),
+                    ], spacing=0),
+                    ft.Row(controls=[
+                        preview_cell("Sample fee", row_bg, text_color, 3),
+                        preview_cell("PKR 1,000.00", row_bg, text_color, 2),
+                        preview_cell("PKR 900.00", row_bg, text_color, 2),
+                    ], spacing=0),
+                ],
+                spacing=0,
+                tight=True,
+            ),
+            bgcolor=str(style["row_odd"]),
+            border=ft.Border.all(1, border_color),
+            border_radius=6,
+        )
+        sections_text = ", ".join(
+            REPORT_SECTION_LABELS[key]
+            for key, checkbox in section_checkboxes.items() if checkbox.value
+        ) or "None"
+        charge_text = ", ".join(
+            REPORT_CHARGE_COLUMN_LABELS[key]
+            for key, checkbox in charge_checkboxes.items() if checkbox.value
+        ) or "None"
+        comparison_text = ", ".join(
+            REPORT_COMPARISON_COLUMN_LABELS[key]
+            for key, checkbox in comparison_checkboxes.items() if checkbox.value
+        ) or "None"
+        report_preview.controls = [
+            ft.Text(f"Sections: {sections_text}", size=11, color="#475569"),
+            ft.Text(f"Charge columns: {charge_text}", size=11, color="#475569"),
+            ft.Text(f"Comparison columns: {comparison_text}", size=11, color="#475569"),
+            preview_table,
+        ]
+        page.update()
+
+    template_dropdown = ft.Dropdown(
+        label="Table template",
+        value=saved_template["id"],
+        width=260,
+        options=[
+            ft.dropdown.Option(template_id, text=style["label"])
+            for template_id, style in VALUATION_TABLE_TEMPLATES.items()
+        ],
+    )
+    template_dropdown.on_change = lambda _: update_report_preview()
+    section_checkboxes = {
+        key: ft.Checkbox(
+            label=label,
+            value=key in saved_report["sections"],
+            data=f"report_section:{key}",
+            on_change=lambda _: update_report_preview(),
+        )
+        for key, label in REPORT_SECTION_LABELS.items()
+    }
+    charge_checkboxes = {
+        key: ft.Checkbox(
+            label=f"Charge column: {label}",
+            value=key in saved_report["charge_columns"],
+            data=f"report_charge_column:{key}",
+            on_change=lambda _: update_report_preview(),
+        )
+        for key, label in REPORT_CHARGE_COLUMN_LABELS.items()
+    }
+    comparison_checkboxes = {
+        key: ft.Checkbox(
+            label=f"Comparison column: {label}",
+            value=key in saved_report["comparison_columns"],
+            data=f"report_comparison_column:{key}",
+            on_change=lambda _: update_report_preview(),
+        )
+        for key, label in REPORT_COMPARISON_COLUMN_LABELS.items()
+    }
+
+    def _report_checkbox_rows(checkboxes: dict[str, ft.Checkbox], group_size: int = 4):
+        keys = list(checkboxes)
+        return ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[checkboxes[key] for key in keys[start:start + group_size]],
+                    wrap=True, spacing=12,
+                )
+                for start in range(0, len(keys), group_size)
+            ],
+            spacing=2, tight=True,
+        )
+
+    def current_report_values() -> dict[str, list[str]]:
+        return {
+            "sections": [
+                key for key, checkbox in section_checkboxes.items() if checkbox.value
+            ],
+            "charge_columns": [
+                key for key, checkbox in charge_checkboxes.items() if checkbox.value
+            ],
+            "comparison_columns": [
+                key for key, checkbox in comparison_checkboxes.items()
+                if checkbox.value
+            ],
+        }
+
+    def apply_report_to_controls(
+        template_id: str, options: dict[str, list[str]]
+    ) -> None:
+        template_dropdown.value = (
+            template_id if template_id in VALUATION_TABLE_TEMPLATES
+            else DEFAULT_VALUATION_TABLE_TEMPLATE
+        )
+        for key, checkbox in section_checkboxes.items():
+            checkbox.value = key in options.get("sections", [])
+        for key, checkbox in charge_checkboxes.items():
+            checkbox.value = key in options.get("charge_columns", [])
+        for key, checkbox in comparison_checkboxes.items():
+            checkbox.value = key in options.get("comparison_columns", [])
+        update_report_preview()
+
+    def save_report_settings(_=None) -> None:
+        try:
+            normalized = normalize_valuation_report_options(current_report_values())
+            template_id = str(template_dropdown.value or "")
+            if template_id not in VALUATION_TABLE_TEMPLATES:
+                raise SettingsError("Choose one of the offered table templates.")
+            set_valuation_table_template(template_id)
+            set_valuation_report_options(normalized)
+        except SettingsError as exc:
+            report_status.value = str(exc)
+            report_status.color = "#B91C1C"
+        except Exception as exc:
+            report_status.value = f"Could not save report settings: {exc}"
+            report_status.color = "#B91C1C"
+        else:
+            apply_report_to_controls(template_id, normalized)
+            report_status.value = (
+                "Report settings saved. New PDFs, print jobs, and calculations "
+                "use the selected template and columns."
+            )
+            report_status.color = "#15803D"
+        page.update()
+
+    def reset_report_settings(_=None) -> None:
+        try:
+            template = reset_valuation_table_template()
+            options = reset_valuation_report_options()
+        except Exception as exc:
+            report_status.value = f"Could not reset report settings: {exc}"
+            report_status.color = "#B91C1C"
+        else:
+            apply_report_to_controls(template["id"], options)
+            report_status.value = "Report settings reset to the built-in defaults."
+            report_status.color = "#15803D"
+        page.update()
+
+    report_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Choose the table style and exactly which sections and columns "
+                "appear in valuation PDFs and print jobs. At least one option "
+                "must stay selected in each column group. The template is also "
+                "used for the fee-comparison table on the next calculation.",
+                size=12, color="#64748B",
+            ),
+            ft.Text("Table appearance", size=13, weight=ft.FontWeight.BOLD),
+            template_dropdown,
+            report_preview,
+            ft.Text("PDF / print sections", size=13, weight=ft.FontWeight.BOLD),
+            _report_checkbox_rows(section_checkboxes),
+            ft.Text("Itemized charge columns", size=13, weight=ft.FontWeight.BOLD),
+            _report_checkbox_rows(charge_checkboxes),
+            ft.Text("Fee-comparison columns", size=13, weight=ft.FontWeight.BOLD),
+            _report_checkbox_rows(comparison_checkboxes),
+            ft.Row(
+                controls=[
+                    ft.Button("Save report settings", on_click=save_report_settings),
+                    ft.OutlinedButton(
+                        "Reset report settings", on_click=reset_report_settings
+                    ),
+                ],
+                spacing=8, wrap=True,
+            ),
+            report_status,
+        ],
+        spacing=10, tight=True,
+    )
+    apply_report_to_controls(saved_template["id"], saved_report)
+
     guide_card = ft.Column(
         controls=[
             ft.Text(
@@ -1405,6 +1643,12 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Which schedule fields appear on each card, plus formula "
                 "lines such as a per-kanal equivalent.",
                 content_card,
+            ),
+            _category_tile(
+                "Valuation reports — table template and PDF content",
+                "Table style, PDF/print sections, charge columns, and "
+                "fee-comparison columns. Saved separately from calculations.",
+                report_card,
             ),
             _category_tile(
                 "Custom registry formulas — user guide",

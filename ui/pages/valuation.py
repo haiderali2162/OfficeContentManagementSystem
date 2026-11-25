@@ -17,6 +17,16 @@ from typing import Any, Callable
 
 import flet as ft
 
+from core import database_config
+from core.config import DATA_DIR
+from services.settings_service import (
+    get_default_file_location,
+    get_valuation_report_options,
+    get_valuation_table_template,
+    VALUATION_TABLE_TEMPLATES,
+)
+from ui.file_location import write_export_to_folder
+
 # Static import (do not use __import__ here): PyInstaller's dependency scan
 # misses dynamic imports, which broke the standalone .exe with
 # "No module named 'ui.pages.dc_rates'".
@@ -35,6 +45,7 @@ from services.dc_rate_service import (
     expand_references,
     find_schedule_location_matches,
     get_dc_rate,
+    list_classifications,
     list_dc_rates,
     list_location_hint_values,
     list_mauza_names,
@@ -85,6 +96,9 @@ from services.valuation_report_service import (
     export_estimate_pdf,
     export_estimate_xlsx,
     export_estimate_ods,
+    print_pdf,
+    task_number,
+    valuation_pdf_filename,
 )
 from services.registry_fee_service import (
     RegistryFeeFormulaError,
@@ -119,6 +133,97 @@ def _money(value: Any, currency: str = "PKR") -> str:
     return f"{currency} {Decimal(str(value)):,.2f}"
 
 
+def _comparison_cell(
+    value: str,
+    *,
+    expand: int,
+    color: str,
+    bgcolor: str,
+    border_color: str,
+    size: int,
+    bold: bool = False,
+) -> ft.Container:
+    """One bordered cell of the on-screen fee-comparison table."""
+    return ft.Container(
+        content=ft.Text(
+            str(value),
+            size=size,
+            weight=ft.FontWeight.BOLD if bold else None,
+            color=color,
+            no_wrap=True,
+            overflow=ft.TextOverflow.ELLIPSIS,
+            selectable=True,
+        ),
+        padding=ft.Padding(left=8, top=5, right=8, bottom=5),
+        bgcolor=bgcolor,
+        border=ft.Border.all(1, border_color),
+        expand=expand,
+    )
+
+
+def _build_comparison_table(
+    cells: list[tuple[str, str, str, str, bool]],
+    template: dict[str, Any],
+) -> ft.Container:
+    """Render the comparison as one styled table control.
+
+    A single container is appended to the result panel; the rows are built with
+    it rather than added one-by-one to the page, which keeps the portable Flet
+    client from skipping freshly added nested controls.
+    """
+    header_labels = (
+        "Charge", "On calculated valuation", "On written value",
+        "Difference (deficient)",
+    )
+    weights = (3, 2, 2, 2)
+    size = int(template.get("font_size", 11))
+    border_color = str(template.get("border_color", "#CBD5E1"))
+    text_color = str(template.get("text_color", "#1E293B"))
+    positive_color = str(template.get("positive_color", "#B45309"))
+    header_bg = str(template.get("header_bg", "#1F4E78"))
+    header_text = str(template.get("header_text", "#FFFFFF"))
+    total_bg = str(template.get("total_bg", "#E2E8F0"))
+    row_even = str(template.get("row_even", "#F8FAFC"))
+    row_odd = str(template.get("row_odd", "#FFFFFF"))
+
+    def row_control(values: tuple[str, ...], *, header: bool, deficient: bool,
+                    total: bool, stripe: int = 0) -> ft.Row:
+        background = (
+            header_bg if header else total_bg if total
+            else row_even if stripe % 2 == 0 else row_odd
+        )
+        color = header_text if header else positive_color if deficient else text_color
+        return ft.Row(
+            controls=[
+                _comparison_cell(
+                    value, expand=weight, bgcolor=background, border_color=border_color,
+                    color=color, size=size, bold=header or total or deficient,
+                )
+                for value, weight in zip(values, weights)
+            ],
+            spacing=0,
+        )
+
+    rows: list[ft.Control] = []
+    rows.append(row_control(header_labels, header=True, deficient=False, total=False))
+    for index, cell in enumerate(cells):
+        values = (str(cell[0]), str(cell[1]), str(cell[2]), str(cell[3]))
+        rows.append(row_control(
+            values, header=False, deficient=bool(cell[4]),
+            total=str(cell[0]) == "Total", stripe=index,
+        ))
+        if index != len(cells) - 1:
+            rows.append(ft.Container(height=1, bgcolor=border_color))
+    return ft.Container(
+        content=ft.Column(controls=rows, spacing=0, tight=True),
+        bgcolor=row_odd,
+        border=ft.Border.all(1, border_color),
+        border_radius=8,
+        expand=True,
+        data="valuation_comparison_table",
+    )
+
+
 # Cached location draft (rural/urban choice and each typed field value).
 # Navigation rebuilds this page from scratch, so without this cache every
 # visit to another tab and back wiped the user's location inputs.
@@ -146,7 +251,10 @@ def build_valuation_page(
     result_panel = ft.Column(
         spacing=8,
         scroll=ft.ScrollMode.AUTO,
-        expand=True,
+        # Fixed height inside the fixed-height result card. `expand=True` here
+        # rendered inconsistently in the portable Flet client.
+        height=328,
+        expand=False,
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
@@ -196,25 +304,58 @@ def build_valuation_page(
         status.value = f"Report saved to {destination}." if destination else "Report export cancelled."
         page.update()
 
+    def save_report_to_folder(payload: bytes, filename: str) -> None:
+        """Save a PDF without a picker so portable exports work reliably."""
+        folder = get_default_file_location() or str(DATA_DIR / "exports")
+        destination = write_export_to_folder(folder, filename, payload)
+        status.value = f"Report saved to {destination}."
+        page.update()
+
+    def _current_report_record() -> dict[str, Any]:
+        return build_current_export_record(
+            inputs=last_calculation["inputs"],
+            valuation=last_calculation["valuation"],
+            charges=last_calculation["charges"],
+            location=last_calculation.get("location"),
+            dc_rate=last_calculation.get("dc_rate"),
+            fbr_rate=last_calculation.get("fbr_rate"),
+        )
+
+    def _report_settings():
+        """Read the latest saved PDF/print options and table style."""
+        return get_valuation_report_options(), get_valuation_table_template()
+
+    def _active_database_label() -> str:
+        """Describe the opened database without exposing server credentials."""
+        options = database_config.load_options()
+        backend = str(options.get("backend") or "sqlite")
+        if backend == "sqlite":
+            return str(options.get("path") or "the default SQLite file")
+        return database_config.backend_label(backend)
+
     def estimate_export_handler(estimate_id: int, file_format: str):
         async def export(_):
             try:
                 saved = get_estimate(estimate_id)
                 if saved is None:
                     raise ValueError("Saved estimate was not found.")
-                exporters = {
-                    "csv": export_estimate_csv,
-                    "xlsx": export_estimate_xlsx,
-                    "pdf": export_estimate_pdf,
-                    "ods": export_estimate_ods,
-                    "json": export_estimate_json,
-                }
-                payload = exporters[file_format](saved)
-                await save_report(
-                    payload,
-                    f"valuation_estimate_{estimate_id}_{date.today().isoformat()}.{file_format}",
-                    file_format,
-                )
+                if file_format == "pdf":
+                    options, template = _report_settings()
+                    payload = export_estimate_pdf(saved, options, template)
+                    filename = valuation_pdf_filename(saved)
+                else:
+                    exporters = {
+                        "csv": export_estimate_csv,
+                        "xlsx": export_estimate_xlsx,
+                        "ods": export_estimate_ods,
+                        "json": export_estimate_json,
+                    }
+                    payload = exporters[file_format](saved)
+                    filename = (
+                        f"valuation_estimate_{estimate_id}_"
+                        f"{date.today().isoformat()}.{file_format}"
+                    )
+                await save_report(payload, filename, file_format)
             except Exception as exc:
                 status.value = f"Could not export estimate: {exc}"
                 page.update()
@@ -229,31 +370,50 @@ def build_valuation_page(
                 page.update()
                 return
             try:
-                record = build_current_export_record(
-                    inputs=last_calculation["inputs"],
-                    valuation=last_calculation["valuation"],
-                    charges=last_calculation["charges"],
-                    location=last_calculation.get("location"),
-                    dc_rate=last_calculation.get("dc_rate"),
-                    fbr_rate=last_calculation.get("fbr_rate"),
-                )
-                exporters = {
-                    "csv": export_estimate_csv,
-                    "xlsx": export_estimate_xlsx,
-                    "pdf": export_estimate_pdf,
-                    "ods": export_estimate_ods,
-                    "json": export_estimate_json,
-                }
-                payload = exporters[file_format](record)
-                await save_report(
-                    payload,
-                    f"valuation_estimate_current_{date.today().isoformat()}.{file_format}",
-                    file_format,
-                )
+                record = _current_report_record()
+                if file_format == "pdf":
+                    options, template = _report_settings()
+                    payload = export_estimate_pdf(record, options, template)
+                    filename = valuation_pdf_filename(record)
+                    save_report_to_folder(payload, filename)
+                else:
+                    exporters = {
+                        "csv": export_estimate_csv,
+                        "xlsx": export_estimate_xlsx,
+                        "ods": export_estimate_ods,
+                        "json": export_estimate_json,
+                    }
+                    payload = exporters[file_format](record)
+                    filename = (
+                        f"valuation_estimate_current_"
+                        f"{date.today().isoformat()}.{file_format}"
+                    )
+                    await save_report(payload, filename, file_format)
             except Exception as exc:
                 form_error.value = f"Could not export the current result: {exc}"
                 page.update()
         return export
+
+    def current_print_handler(_=None):
+        """Print the current calculation directly to the default Windows printer."""
+        form_error.value = ""
+        if not last_calculation:
+            form_error.value = "Calculate an estimate before printing it."
+            page.update()
+            return
+        try:
+            record = _current_report_record()
+            options, template = _report_settings()
+            payload = export_estimate_pdf(record, options, template)
+            job_name = "valuation_{0}_{1}".format(
+                task_number(record) or "task",
+                date.today().isoformat(),
+            )
+            print_pdf(payload, job_name)
+            status.value = "Estimate sent to the default printer."
+        except Exception as exc:
+            form_error.value = f"Could not print the current result: {exc}"
+        page.update()
 
     def history_export_handler(file_format: str):
         async def export(_):
@@ -276,6 +436,11 @@ def build_valuation_page(
         ft.dropdown.Option("none", "No client linked"),
         *[ft.dropdown.Option(str(item["id"]), item["name"]) for item in clients],
     ])
+    task_no = ft.TextField(
+        label="Task no. (printed at the top of PDF/print)",
+        width=320,
+        hint_text="e.g. 1234/26",
+    )
     # Effective date is fixed to today's date for the streamlined workflow.
     transaction_date = date.today()
     property_profile = ft.RadioGroup(value="rural", content=ft.Row([
@@ -292,8 +457,14 @@ def build_valuation_page(
     square_no = ft.AutoComplete(data="square_no", width=150, suggestions_max_height=220)
     kila_no = ft.AutoComplete(data="kila_no", width=150, suggestions_max_height=220)
     khasra_no = ft.TextField(label="Khasra no. (optional)", width=180)
+    # Classification choices are DB-backed: the same unique values are shown
+    # in rural and urban modes and passed to Lowest/Highest rate fetching.
     classification = ft.Dropdown(label="Classification (optional)", width=220, options=[
         ft.dropdown.Option("none", "All / not specified"),
+        *[
+            ft.dropdown.Option(value, value)
+            for value in list_classifications()
+        ],
     ])
     floor = ft.TextField(label="Floor (if applicable)", width=180)
     # Searchable rate menus: the developer asked for a permanently visible
@@ -573,6 +744,29 @@ def build_valuation_page(
             for key, control in _active_location_fields()
         }
 
+    def _dc_unit_options() -> list[ft.dropdown.Option]:
+        """Rebuild the full DC unit menu so fetching never hides the field."""
+        return [
+            ft.dropdown.Option(unit, RATE_UNITS[unit]) for unit in DC_RATE_UNITS
+        ]
+
+    def _schedule_filters() -> dict[str, str]:
+        """Any entered field is enough to fetch a schedule.
+
+        Only fields visible for the current rural/urban profile are included,
+        so a stale value from the other profile cannot silently narrow the
+        query. Classification is included alongside the other fields.
+        """
+        filters = {
+            key: value
+            for key, value in _location_context().items()
+            if value
+        }
+        selected_class = _text_value(classification)
+        if selected_class and selected_class.casefold() != "none":
+            filters["classification"] = selected_class
+        return filters
+
     def _apply_location_hints(values_by_field: dict[str, list[str]]) -> None:
         for key, control in _active_location_fields():
             control.suggestions = [
@@ -730,10 +924,11 @@ def build_valuation_page(
         for field_name, control in draft_controls.items():
             if control.value not in (None, ""):
                 _LOCATION_DRAFT[field_name] = control.value
-        lookup_value = _text_value(mauza) if property_profile.value == "rural" else (
-            _text_value(property_area) or _text_value(town)
-        )
-        candidates = matching_locations() if lookup_value else []
+        # Any one entered schedule field (Mauza, Revenue circle, Qanoongoi,
+        # Classification, etc.) is enough to fetch. Hidden fields from the
+        # other rural/urban profile are excluded by _schedule_filters().
+        schedule_filters = _schedule_filters()
+        candidates = matching_locations() if schedule_filters else []
         candidate_ids = [int(item["id"]) for item in candidates]
         # The rates tab shows schedule rows regardless of their effective
         # window; the calculator filtered them by the transaction date, so a
@@ -915,7 +1110,10 @@ def build_valuation_page(
             rate_records["dc"], rate_records["fbr"] = [], []
             dc_rate_choice.options, fbr_rate_choice.options = [], []
             dc_rate_choice.value, fbr_rate_choice.value = None, None
-            dc_rate_unit.options, fbr_rate_unit.options = [], []
+            # The DC unit menu stays fully populated even with no matches, so
+            # fetching never makes the control appear enabled/disabled.
+            dc_rate_unit.options = _dc_unit_options()
+            fbr_rate_unit.options = []
             dc_rate_unit.value, fbr_rate_unit.value = None, None
             # The DC unit and rate dropdowns stay visible permanently
             # (developer request): an empty menu with its hint beats a
@@ -970,7 +1168,9 @@ def build_valuation_page(
                     and str(fbr_search_pin["id"]) not in {str(row["id"]) for row in rows}):
                 rows = [fbr_search_pin, *rows]
             units = sorted({row["rate_unit"] for row in rows})
-            unit_control.options = [ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units]
+            unit_control.options = [
+                ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units
+            ]
             # The DC unit and rate menus stay permanently visible (developer
             # request). FBR menus appear whenever the matched locations carry
             # FBR schedule rows — including rural deeds, so rural FBR taxes
@@ -1005,11 +1205,8 @@ def build_valuation_page(
                 rate_control.value = str(fbr_search_pin["id"])
             elif rate_control.value not in {str(row["id"]) for row in rows}:
                 rate_control.value = None
-        classes = sorted({str(row.get("classification")) for row in all_rates if row.get("classification")})
-        classification.options = [ft.dropdown.Option("none", "All / not specified")]
-        classification.options.extend(ft.dropdown.Option(value, value) for value in classes)
-        if classification.value not in classes and len(classes) == 1:
-            classification.value = classes[0]
+        # The classification menu stays DB-backed; do not narrow it to the
+        # current search results (that made options appear/disappear).
         selected_dc = next((row for row in rate_records["dc"]
                             if str(row["id"]) == dc_rate_choice.value), None)
         window_note = ""
@@ -1040,32 +1237,25 @@ def build_valuation_page(
         page.update()
 
     def fetch_extreme_dc_rate(_=None, *, highest: bool = False):
-        """Select the true lowest/highest DC rate of the searched Mauza.
+        """Select the true lowest/highest DC rate of the entered details.
 
-        The DC / FBR rates tab calculates its range over every matching row
-        of the Mauza (all units, all schedule rows, no effective-date cut).
-        The calculator used to look only at ``rate_records["dc"]``, which had
-        already been narrowed to one unit (the first alphabetically) and to
-        rows effective on the transaction date, so the button could miss the
-        very rate the rates tab displayed. Query the Mauza directly here with
-        the same scope as that summary, merge those rows into the selectable
-        pool, and pick the extreme from the complete set.
+        The rates tab calculates its range over every matching row (all
+        units, all schedule rows, no effective-date cut). The calculator used
+        to look only at ``rate_records["dc"]``, which had already been
+        narrowed to one unit and to rows effective on the transaction date.
+        It also required a Mauza, so a single Revenue circle or a selected
+        classification could not fetch anything. Query the rate table here
+        with every entered field, merge those rows into the selectable pool,
+        and pick the extreme from the complete set.
         """
         word = "highest" if highest else "lowest"
         rows = list(rate_records["dc"])
         lookup_note = ""
 
-        typed_mauza = _text_value(mauza)
-        if typed_mauza:
+        filters = _schedule_filters()
+        if filters:
             try:
-                # Same scope as summarize_dc_rates on the rates tab: Mauza
-                # (plus Qanoongoi when typed), DC schedule, every unit, and
-                # no effective-window restriction.
-                fresh_rows = list_dc_rates(
-                    mauza=typed_mauza,
-                    qanoongoi=_text_value(qanoongoi),
-                    schedule_type="dc",
-                )
+                fresh_rows = list_dc_rates(schedule_type="dc", **filters)
                 known_ids = {str(row["id"]) for row in rows}
                 rows.extend(
                     row for row in fresh_rows
@@ -1076,13 +1266,13 @@ def build_valuation_page(
                 rate_records["dc"] = rows
                 if not fresh_rows:
                     lookup_note = (
-                        " No extra schedule rows were found for this Mauza "
-                        "outside the current search."
+                        " No extra schedule rows were found for the entered "
+                        "details outside the current search."
                     )
             except Exception as exc:
                 # A failed convenience lookup must not break the button; the
                 # previously fetched rows remain usable.
-                lookup_note = f" Mauza-wide lookup failed: {exc}"
+                lookup_note = f" Schedule lookup failed: {exc}"
 
         if not rows:
             rate_match_status.value = (
@@ -1107,12 +1297,9 @@ def build_valuation_page(
         target = (max if highest else min)(candidates, key=amount)
         # Rebuild both menus from the complete pool: the target's unit may not
         # have been offered by the narrowed pre-button search.
-        units = sorted({
-            str(row["rate_unit"]) for row in rows if row.get("rate_unit")
-        })
-        dc_rate_unit.options = [
-            ft.dropdown.Option(unit, RATE_UNITS.get(unit, unit)) for unit in units
-        ]
+        # Keep the full unit menu available; only the selected value changes.
+        # This stops the field appearing to enable/disable while fetching.
+        dc_rate_unit.options = _dc_unit_options()
         dc_rate_unit.value = str(target["rate_unit"])
         unit_rows = [
             row for row in rows
@@ -1582,12 +1769,30 @@ def build_valuation_page(
                 + f": {_money(line['amount'], line['currency_code'])}"
             ) for line in charges["charges"])
         else:
-            result_panel.controls.append(ft.Text("No configured charge rules applied.", color="#64748B"))
+            result_panel.controls.append(ft.Text(
+                "No tax/fee charges were calculated.", color="#64748B"
+            ))
+            rule_count = int(last_calculation.get("rule_count", 0))
+            formula_count = int(last_calculation.get("formula_count", 0))
+            if not rule_count and not formula_count:
+                result_panel.controls.append(ft.Text(
+                    "No tax or fee rules exist in the active database: "
+                    f"{_active_database_label()}. Open Settings → Database and connect "
+                    "the database that contains your saved rules, then calculate again.",
+                    color="#B45309", size=12,
+                ))
+            else:
+                result_panel.controls.append(ft.Text(
+                    "Rules are configured but did not match this deed. "
+                    "See 'Review required' below for the reason.",
+                    color="#B45309", size=12,
+                ))
         result_panel.controls.extend(ft.Text(
             f"Total {currency}: {_money(amount, currency)}", weight=ft.FontWeight.BOLD
         ) for currency, amount in charges["totals_by_currency"].items())
-        # Optional comparison (developer request): the same fees computed on
-        # the registry written value, side by side with the calculated ones.
+        # Optional comparison: the same fees computed on the registry written
+        # value, side by side with the calculated ones. Rendered as one styled
+        # container built together so the portable Flet client shows it.
         charges_written = charges.get("charges_on_written_valuation")
         if charges_written is not None:
             def _charge_key(line: dict[str, Any]) -> tuple[str, str]:
@@ -1596,71 +1801,48 @@ def build_valuation_page(
 
             written_by_key = {_charge_key(line): line for line in charges_written["charges"]}
             written_totals = charges_written.get("totals_by_currency", {})
-            rows = []
+            comparison_cells: list[tuple[str, str, str, str, bool]] = []
             for line in charges["charges"]:
                 key = _charge_key(line)
                 other = written_by_key.get(key)
-                written_amount = (
-                    other["amount"] if other else None
-                )
+                written_amount = other["amount"] if other else None
                 difference = (
                     line["amount"] - written_amount
                     if written_amount is not None else None
                 )
-                rows.append(ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(
-                        f"{line['name']}"
-                        + (f" — {line['party']['label']}" if line.get("party") else ""),
-                        size=12,
-                    )),
-                    ft.DataCell(ft.Text(_money(line["amount"], line["currency_code"]), size=12)),
-                    ft.DataCell(ft.Text(
-                        _money(written_amount, other.get("currency_code", "PKR"))
-                        if other else "—", size=12,
-                    )),
-                    # Difference / deficient amount per charge: calculated
-                    # minus written (positive = deficient, developer request).
-                    ft.DataCell(ft.Text(
-                        _money(difference, line["currency_code"])
-                        if difference is not None else "—", size=12,
-                        weight=ft.FontWeight.BOLD if (difference or 0) > 0 else None,
-                        color="#B45309" if (difference or 0) > 0 else None,
-                    )),
-                ]))
-            rows.append(ft.DataRow(cells=[
-                ft.DataCell(ft.Text("Total", weight=ft.FontWeight.BOLD)),
-                ft.DataCell(ft.Text(
-                    " · ".join(f"{currency}: {_money(amount, currency)}" for currency, amount
-                               in charges["totals_by_currency"].items()) or "—",
-                    weight=ft.FontWeight.BOLD, size=12,
-                )),
-                ft.DataCell(ft.Text(
-                    " · ".join(f"{currency}: {_money(amount, currency)}" for currency, amount
-                               in written_totals.items()) or "—",
-                    weight=ft.FontWeight.BOLD, size=12,
-                )),
-                ft.DataCell(ft.Text(
-                    " · ".join(
-                        f"{currency}: {_money(charges['totals_by_currency'].get(currency, Decimal('0')) - written_totals.get(currency, Decimal('0')), currency)}"
-                        for currency in sorted(
-                            set(charges["totals_by_currency"]) | set(written_totals)
-                        )
-                    ) or "—",
-                    weight=ft.FontWeight.BOLD, size=12,
-                )),
-            ]))
+                deficient = bool(difference and difference > 0)
+                comparison_cells.append((
+                    f"{line['name']}"
+                    + (f" — {line['party']['label']}" if line.get("party") else ""),
+                    _money(line["amount"], line["currency_code"]),
+                    _money(written_amount, other.get("currency_code", "PKR"))
+                    if other else "—",
+                    _money(difference, line["currency_code"])
+                    if difference is not None else "—",
+                    deficient,
+                ))
+            comparison_cells.append((
+                "Total",
+                " · ".join(f"{currency}: {_money(amount, currency)}" for currency, amount
+                           in charges["totals_by_currency"].items()) or "—",
+                " · ".join(f"{currency}: {_money(amount, currency)}" for currency, amount
+                           in written_totals.items()) or "—",
+                " · ".join(
+                    f"{currency}: {_money(charges['totals_by_currency'].get(currency, Decimal('0')) - written_totals.get(currency, Decimal('0')), currency)}"
+                    for currency in sorted(
+                        set(charges["totals_by_currency"]) | set(written_totals)
+                    )
+                ) or "—",
+                False,
+            ))
+
             result_panel.controls.append(ft.Text(
                 "Fee comparison (calculated valuation vs written value)",
                 weight=ft.FontWeight.BOLD,
             ))
-            result_panel.controls.append(ft.DataTable(
-                columns=[
-                    ft.DataColumn(ft.Text("Charge", weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("On calculated valuation", weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("On written value", weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("Difference (deficient)", weight=ft.FontWeight.BOLD)),
-                ],
-                rows=rows, column_spacing=18,
+            result_panel.controls.append(_build_comparison_table(
+                comparison_cells,
+                last_calculation.get("table_template") or get_valuation_table_template(),
             ))
 
         warnings = valuation["warnings"] + charges["warnings"] + [
@@ -1670,7 +1852,10 @@ def build_valuation_page(
             result_panel.controls.append(ft.Text("Review required", color="#B45309", weight=ft.FontWeight.BOLD))
             result_panel.controls.extend(ft.Text(f"• {warning}", color="#B45309", size=12) for warning in warnings)
         result_panel.controls.extend(ft.Text(line, size=12, color="#64748B") for line in charges.get("explanation", []))
-        result_panel.update()
+        # Update through the page, not the nested panel control. A control-level
+        # update requires the panel to be attached to a live page; the portable
+        # build could silently skip freshly added result controls in that path.
+        page.update()
 
     def clear_all_fields(_=None):
         """Clear every input on the Calculate tab for the next registry entry.
@@ -1686,7 +1871,7 @@ def build_valuation_page(
             district, tehsil, qanoongoi, mauza, schedule_location,
             square_no, kila_no, khasra_no, town, revenue_circle,
             property_area, area_value, registry_written_value, location_search,
-            classification,
+            classification, task_no,
         )
         for control in text_controls:
             control.value = ""
@@ -1887,6 +2072,7 @@ def build_valuation_page(
                         raise ValueError(f"Custom field '{field.label}' must be a valid number.") from None
             context.update(custom_values)
             rules = list_tax_fee_rules()
+            formulas = list_registry_fee_formulas()
             # Urban 236C/236K basis (developer request): when an FBR schedule
             # was found for an urban deed, the 236C/236K rules calculate
             # against the FBR valuation; only when no FBR schedule was found
@@ -1928,7 +2114,7 @@ def build_valuation_page(
                         rules=rules, transaction_date=transaction_date,
                         context=ctx, jurisdiction=["Punjab", "Punjab, Pakistan"])
                 formulas_result = calculate_registry_fee_formulas(
-                    formulas=list_registry_fee_formulas(), effective_on=transaction_date,
+                    formulas=formulas, effective_on=transaction_date,
                     context=ctx, jurisdictions=["Punjab", "Punjab, Pakistan"],
                     custom_variables=[field["field_key"] for field in custom_formula_fields],
                 )
@@ -1944,6 +2130,26 @@ def build_valuation_page(
                 return result
 
             charges = compute_charges(context)
+            # 236C/236K are filer-dependent and must never be assumed. When a
+            # rule is configured but a party's status is still Unknown, say so
+            # explicitly instead of silently omitting the charge (the portable
+            # build made this look like a calculation failure).
+            filer_rules_configured = any(
+                str(rule.get("category") or "").casefold() in {"236c", "236k"}
+                for rule in rules
+            )
+            unknown_roles = sorted({
+                str(party.get("role") or "")
+                for party in parties
+                if str(party.get("filer_status") or "unknown").casefold() == "unknown"
+            })
+            if filer_rules_configured and unknown_roles:
+                charges["warnings"].append(
+                    "236C/236K rules are configured, but the "
+                    + " and ".join(unknown_roles)
+                    + " tax status is Unknown. Select ATL, Non-ATL, or Late filer "
+                    "for the relevant party to calculate those filer-based charges."
+                )
             # Second comparison base (developer request): the registry
             # written value. The same fees are computed against it so the
             # result can show a side-by-side comparison. A checkbox chooses
@@ -1963,6 +2169,7 @@ def build_valuation_page(
             inputs = {
                 "location_id": int(dc_rate["location_id"]),
                 "client_id": int(client.value) if client.value not in (None, "none") else None,
+                "task_no": (task_no.value or "").strip() or None,
                 "transaction_date": transaction_date,
                 "transaction_type": transaction_type.value,
                 "jurisdiction": "Punjab",
@@ -1999,12 +2206,18 @@ def build_valuation_page(
             }
             last_calculation.update({
                 "inputs": inputs, "valuation": valuation, "charges": charges,
+                # Rendering needs to distinguish an empty database from rules
+                # that exist but did not match this deed.
+                "rule_count": len(rules), "formula_count": len(formulas),
                 # Needed by the current-result exporters: the schedule row and
                 # rates behind this particular calculation.
                 "location": {key: value for key, value in dc_rate.items()
                              if not str(key).startswith("_")},
                 "dc_rate": dc_rate,
                 "fbr_rate": fbr_rate,
+                # The style selected in Settings is captured with the result so
+                # exports and re-renders use the same table appearance.
+                "table_template": get_valuation_table_template(),
             })
             draw_result(valuation, charges)
             status.value = "Estimate calculated. Review warnings before relying on any charge." 
@@ -2253,7 +2466,7 @@ def build_valuation_page(
     town_col = ft.Container(ft.Column([ft.Text("Town / city", size=12, weight=ft.FontWeight.W_500), town], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
     revenue_circle_col = ft.Container(ft.Column([ft.Text("Revenue circle", size=12, weight=ft.FontWeight.W_500), revenue_circle], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
     property_area_col = ft.Container(ft.Column([ft.Text("Property area", size=12, weight=ft.FontWeight.W_500), property_area], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
-    classification_col = ft.Container(ft.Column([ft.Text("Classification", size=12, weight=ft.FontWeight.W_500), classification], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=False)
+    classification_col = ft.Container(ft.Column([ft.Text("Classification", size=12, weight=ft.FontWeight.W_500), classification], spacing=4), col={"xs": 12, "sm": 6, "md": 3}, visible=True)
     locality_col = ft.Container(ft.Column([ft.Text("Locality / sub-area (optional)", size=12, weight=ft.FontWeight.W_500), schedule_location], spacing=4), col={"xs": 12, "sm": 6, "md": 6})
     square_col = ft.Container(ft.Column([ft.Text("Square no. (optional)", size=12, weight=ft.FontWeight.W_500), square_no], spacing=4), col={"xs": 6, "sm": 3, "md": 3})
     kila_col = ft.Container(ft.Column([ft.Text("Kila no. (optional)", size=12, weight=ft.FontWeight.W_500), kila_no], spacing=4), col={"xs": 6, "sm": 3, "md": 3})
@@ -2304,7 +2517,9 @@ def build_valuation_page(
         town_col.visible = not is_rural
         revenue_circle_col.visible = not is_rural
         property_area_col.visible = not is_rural
-        classification_col.visible = not is_rural
+        # Classification is available in both rural and urban modes: the
+        # Lowest/Highest buttons use it alongside any other entered fields.
+        classification_col.visible = True
         khasra_col.visible = not is_rural
         if is_rural:
             locality_col.col = {"xs": 12, "sm": 6, "md": 6}
@@ -3421,6 +3636,7 @@ def build_valuation_page(
     estimate_form = ft.Column([
         ft.Text("Estimate inputs", size=19, weight=ft.FontWeight.BOLD),
         ft.Text("Choose Rural or Urban, enter schedule-backed location details, then enter the area in K-M-F format. Matching DC and FBR rates are fetched from saved schedules.", size=12, color="#9A3412"),
+        task_no,
         khewat_section,
         make_collapsible_card("Property Profile & Location", [
             # Display-mode radio sits at the top, right after the
@@ -3450,8 +3666,8 @@ def build_valuation_page(
                 ft.Container(registry_written_value, col={"xs": 12, "md": 5}),
                 ft.Container(written_fbr_toggle, col={"xs": 12, "md": 3}),
             ], run_spacing=8),
-            # Fetch the cheapest/dearest fetched DC rate for the selected
-            # unit and calculate against it (developer request).
+            # Fetch the cheapest/dearest DC rate for the entered details
+            # (including any single field and the classification filter).
             ft.Row([
                 ft.Text("Fetch schedule by amount:", size=12, color="#64748B"),
                 ft.OutlinedButton("Lowest rate", on_click=fetch_lowest_dc_rate),
@@ -3481,9 +3697,12 @@ def build_valuation_page(
             ft.Text("Export current result:", size=12, color="#475569"),
             ft.OutlinedButton("CSV", on_click=current_export_handler("csv")),
             ft.OutlinedButton("Excel", on_click=current_export_handler("xlsx")),
-            ft.OutlinedButton("PDF", on_click=current_export_handler("pdf")),
+            ft.OutlinedButton("PDF", on_click=current_export_handler("pdf"),
+                              tooltip="Save PDF to the default export folder"),
             ft.OutlinedButton("ODS", on_click=current_export_handler("ods")),
             ft.OutlinedButton("JSON", on_click=current_export_handler("json")),
+            ft.OutlinedButton("Print estimate", on_click=current_print_handler,
+                              tooltip="Print the current calculation with Task no. at the top"),
         ], wrap=True, spacing=6),
         form_error,
         status,

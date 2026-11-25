@@ -74,6 +74,30 @@ def test_load_options_falls_back_when_file_is_malformed(options_home):
     assert database_config.load_options() == database_config.default_options()
 
 
+def test_ensure_database_config_file_creates_defaults_when_missing(options_home):
+    assert not database_config.CONFIG_FILE_PATH.exists()
+
+    options = database_config.ensure_database_config_file()
+
+    assert database_config.CONFIG_FILE_PATH.is_file()
+    assert options == database_config.default_options()
+    stored = json.loads(database_config.CONFIG_FILE_PATH.read_text(encoding="utf-8"))
+    assert stored["backend"] == "sqlite"
+    assert stored["path"] == database_config.default_options()["path"]
+
+
+def test_ensure_database_config_file_does_not_overwrite_existing(options_home):
+    custom = dict(database_config.default_options())
+    custom["path"] = str(options_home / "chosen.sqlite3")
+    database_config.save_options(custom)
+    before = database_config.CONFIG_FILE_PATH.read_text(encoding="utf-8")
+
+    database_config.ensure_database_config_file()
+
+    assert database_config.CONFIG_FILE_PATH.read_text(encoding="utf-8") == before
+    assert database_config.load_options()["path"] == custom["path"]
+
+
 def test_load_options_rejects_unknown_backend(options_home):
     database_config.CONFIG_FILE_PATH.write_text(
         json.dumps({"backend": "oracle"}), encoding="utf-8"

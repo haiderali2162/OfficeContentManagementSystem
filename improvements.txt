@@ -1,3 +1,9 @@
-on the fbr clients page:
-	1. got the following error while importing "The application encountered an error: name 'status_text' is not defined"
-	2. as i earlier said, the data in the file is not properly formatted so either allow user to fix it while importing or output a new excel file with the rows which has issue. let user choose.
+make these changes in both calculate page:
+	1. while fetching the lowest and highest rate on the calculate page it often enable disable the "rate unit" field. allow it to fetch schedule even if only one field is entered like mauza name or revenue circle even if qanoongoi is select or any other field.
+	2. on calculate page also add classification button to fetch lowest/highest schedule via classification like agri, residential or commercial
+	
+make these changes on "dc / fbr rates" page:
+	1. on that page also add a classification dropdown to also find/filter area via classification.
+
+make sure classification dropdown values are fetched from db from classification column make these values unique.
+also tell me what is the role of database.json file in our portable exe as it does not being created automatically when i distribute my exe. if it is necessary then make the app create it at its first very first run or in case it is missing.
