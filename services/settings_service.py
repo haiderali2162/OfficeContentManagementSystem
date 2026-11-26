@@ -12,6 +12,11 @@ Two DC/FBR rate-card preference groups live here:
 * ``CARD_FIELDS_KEY`` — which body fields are shown on each card and optional
   formula lines that compute derived values from the schedule row (see
   :func:`get_card_fields`).
+
+Version history: v0.2.26 stored only import/export and rate-card preferences.
+v0.2.27 adds :func:`reveal_directory`, a validated cross-platform way for
+Settings buttons to open the backup and log folders in the file manager. No
+new table or column is involved.
 """
 
 from __future__ import annotations
@@ -19,7 +24,10 @@ from __future__ import annotations
 import ast
 import json
 import operator as operator_module
+import os
 import re
+import subprocess
+import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from string import Formatter
@@ -152,6 +160,30 @@ def normalize_directory_path(value: Any) -> str:
     if not resolved.is_dir():
         raise SettingsError("Default folder must be a folder, not a file.")
     return str(resolved)
+
+
+def reveal_directory(path: Any) -> Path:
+    """Open an existing folder in the operating system's file manager.
+
+    The caller shows any :class:`SettingsError`. Validation happens before
+    launching a process so a malformed preference can never be passed to the
+    shell. ``subprocess`` is used without ``shell=True`` on non-Windows
+    platforms; no user data or password is included in the command.
+    """
+    normalized = normalize_directory_path(path)
+    if not normalized:
+        raise SettingsError("Choose a folder first.")
+    folder = Path(normalized)
+    try:
+        if os.name == "nt":
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+    except OSError as exc:
+        raise SettingsError(f"Could not open the folder: {exc}") from exc
+    return folder
 
 
 def get_default_file_location() -> str:

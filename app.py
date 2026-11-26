@@ -10,10 +10,18 @@ from core.database import (
     initialize_database,
 )
 from services.backup_service import start_backup_scheduler
+# v0.2.27: configure file logging before database/UI work so startup failures
+# are recorded too. Crash hooks are installed for the whole process.
+from services import logging_service
 from ui.app_shell import AppShell
 
 
 def main(page: ft.Page) -> None:
+    logging_service.configure_logging()
+    logging_service.install_exception_hooks()
+    app_log = logging_service.get_logger("app")
+    app_log.info("Starting Land Office Manager")
+
     # Flet's Windows desktop transport may report a peer reset while its
     # Proactor pipe is being closed. Ignore only that specific shutdown event;
     # every other asyncio error keeps the normal exception reporting path.
@@ -30,6 +38,9 @@ def main(page: ft.Page) -> None:
                 and "_call_connection_lost" in message
             ):
                 return
+            # v0.2.27: record every real loop error in the rotating log and
+            # a crash file before Flet's normal handler reports it.
+            logging_service.log_async_exception(context)
             if default_exception_handler:
                 default_exception_handler(loop, context)
             else:
@@ -45,6 +56,7 @@ def main(page: ft.Page) -> None:
     start_backup_scheduler()
 
     if not check_database_connection():
+        app_log.error("Application database connection check failed")
         page.title = APP_NAME
         page.add(
             ft.Text(

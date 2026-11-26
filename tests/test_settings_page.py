@@ -1,6 +1,7 @@
 """Settings-page tests for rate-card appearance customization."""
 
 import asyncio
+from pathlib import Path
 
 import flet as ft
 import pytest
@@ -8,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.database import Base
-from services import backup_service, settings_service
+from services import backup_service, logging_service, settings_service
 from ui.pages import settings
 
 
@@ -26,6 +27,10 @@ class FakePage:
     def pop_dialog(self):
         if self.dialogs:
             self.dialogs.pop()
+
+    def run_task(self, handler, *args):
+        """Run the page's background coroutine synchronously in tests."""
+        return asyncio.run(handler(*args))
 
 
 def _walk(control):
@@ -402,5 +407,88 @@ def test_report_settings_blocks_an_empty_section_selection(settings_database):
     )
     assert any(
         "at least one section" in (control.value or "").lower()
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_settings_page_has_logs_category(settings_database):
+    root = settings.build_settings_page(FakePage())
+    titles = [
+        control.title.value
+        for control in _walk(root)
+        if isinstance(control, ft.ExpansionTile)
+    ]
+    assert "Logs — backend errors and crash reports" in titles
+    assert _button(root, "Save log settings")
+    assert _button(root, "Open log folder")
+
+
+def test_manual_backup_button_creates_backup_and_reports_success(
+    settings_database, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        settings, "create_backup_now",
+        lambda: calls.append(True) or {
+            "target": "D:/backups/land_office_backup_test.sqlite3",
+            "removed_old": [],
+        },
+    )
+    monkeypatch.setattr(settings, "list_backups", lambda _location: [])
+    root = settings.build_settings_page(FakePage())
+
+    _button(root, "Back up now").on_click(None)
+
+    assert calls == [True]
+    assert any(
+        "Backup created: land_office_backup_test.sqlite3" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_open_backup_folder_button_reports_success(
+    settings_database, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "open_backup_folder", lambda: Path("D:/backups")
+    )
+    root = settings.build_settings_page(FakePage())
+
+    _button(root, "Open backup folder").on_click(None)
+
+    assert any(
+        "Opened backup folder" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_log_settings_save_and_open_folder(settings_database, monkeypatch, tmp_path):
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    reconfigured = []
+    opened = []
+    monkeypatch.setattr(
+        logging_service, "reconfigure_logging",
+        lambda: reconfigured.append(True),
+    )
+    monkeypatch.setattr(
+        logging_service, "open_log_folder",
+        lambda: opened.append(True) or folder,
+    )
+    root = settings.build_settings_page(FakePage())
+    _field(root, "Log folder (blank = Documents)").value = str(folder)
+
+    _button(root, "Save log settings").on_click(None)
+
+    assert logging_service.get_log_settings() == {
+        "enabled": True, "location": str(folder.resolve())
+    }
+    assert reconfigured
+
+    _button(root, "Open log folder").on_click(None)
+
+    assert opened
+    assert any(
+        "Opened log folder" in (control.value or "")
         for control in _walk(root) if isinstance(control, ft.Text)
     )

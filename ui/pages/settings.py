@@ -1,9 +1,13 @@
 """Application settings pages.
 
 The settings page is organised into collapsible categories (Flet
-``ExpansionTile``): Database, Files, Rate-card appearance, and Rate-card
-content. Values are persisted through ``services.settings_service`` and,
-for the database choice, ``core.database_config``.
+``ExpansionTile``): Database, Files, Automatic backups, Logs, Rate-card
+appearance, Rate-card content, and Valuation reports. Values are persisted
+through ``services.settings_service`` and, for the database choice,
+``core.database_config``.
+
+v0.2.27: the backup category opens the backup folder and shows the real
+last-backup age; the logs category configures the file/crash logger.
 
 It also exposes the database-connection editor (``build_database_section``):
 the user can point the running application at SQLite, PostgreSQL,
@@ -16,6 +20,7 @@ without restarting the app.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import flet as ft
 
@@ -28,13 +33,15 @@ from core.database import initialize_database, reconfigure_database
 from core.database_copy import DatabaseCopyError, copy_sqlite_database
 from services.backup_service import (
     BackupServiceError,
+    backup_status as describe_backup_status,
     create_backup_now,
     get_backup_settings,
-    get_last_backup_time,
     list_backups,
+    open_backup_folder,
     restore_backup,
     save_backup_settings,
 )
+from services import logging_service
 from services.settings_service import (
     CARD_BODY_FIELD_LABELS,
     CARD_COLOR_FIELDS,
@@ -753,11 +760,15 @@ def build_settings_page(page: ft.Page) -> ft.Control:
             try:
                 summary = await asyncio.to_thread(create_backup_now)
             except BackupServiceError as exc:
+                # v0.2.27: the visible message and the log both explain why
+                # the button did not create a snapshot.
                 backup_status.value = str(exc)
                 backup_status.color = "#B91C1C"
+                logging_service.log_error("Manual backup failed", exc)
             except Exception as exc:
                 backup_status.value = f"Backup failed: {exc}"
                 backup_status.color = "#B91C1C"
+                logging_service.log_error("Manual backup failed", exc)
             else:
                 removed = ", ".join(summary.get("removed_old") or []) or "none"
                 backup_status.value = (
@@ -776,6 +787,23 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Back up now works in the running application."
             )
             page.update()
+
+    def reveal_backup_folder(_=None):
+        """Open the saved backup folder; show a clear error when unavailable."""
+        try:
+            folder = open_backup_folder()
+        except BackupServiceError as exc:
+            backup_status.value = str(exc)
+            backup_status.color = "#B91C1C"
+            logging_service.log_error("Open backup folder failed", exc)
+        except Exception as exc:
+            backup_status.value = f"Could not open backup folder: {exc}"
+            backup_status.color = "#B91C1C"
+            logging_service.log_error("Open backup folder failed", exc)
+        else:
+            backup_status.value = f"Opened backup folder: {folder}"
+            backup_status.color = "#15803D"
+        page.update()
 
     def restore_selected_backup(_=None):
         """Restore the chosen backup into a new DB and switch to it."""
@@ -857,10 +885,9 @@ def build_settings_page(page: ft.Page) -> ft.Control:
             ],
         ))
 
-    last_backup = get_last_backup_time()
-    backup_status.value = (
-        f"Last backup: {last_backup}." if last_backup else "No backup yet."
-    )
+    # v0.2.27: show the last real backup, elapsed time, and due state that
+    # startup also uses instead of only the in-database timestamp.
+    backup_status.value = describe_backup_status()["message"]
     refresh_backup_list()
     backup_card = ft.Column(
         controls=[
@@ -897,6 +924,9 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                     ft.Button("Save backup settings", on_click=save_backup_prefs),
                     ft.OutlinedButton("Back up now", on_click=manual_backup),
                     ft.OutlinedButton(
+                        "Open backup folder", on_click=reveal_backup_folder
+                    ),
+                    ft.OutlinedButton(
                         "Restore selected backup",
                         on_click=restore_selected_backup,
                     ),
@@ -910,6 +940,114 @@ def build_settings_page(page: ft.Page) -> ft.Control:
         ],
         spacing=10,
         tight=True,
+    )
+
+    # Backend log settings (v0.2.27): a rotating application log and crash
+    # reports are written to Documents or a chosen folder. This is additive
+    # app_settings data; no database schema change is involved.
+    saved_log_settings = logging_service.get_log_settings()
+    log_enabled = ft.Checkbox(
+        label="Enable backend error logging and crash reports",
+        value=saved_log_settings["enabled"],
+    )
+    log_location = ft.TextField(
+        label="Log folder (blank = Documents)",
+        value=saved_log_settings["location"],
+        hint_text="Leave empty for Documents, or choose an absolute folder",
+        width=430,
+    )
+    log_status = ft.Text("", size=12, color="#475569", selectable=True)
+
+    async def browse_log_folder(_=None):
+        try:
+            selected = await file_picker.get_directory_path(
+                dialog_title="Choose the log folder",
+                initial_directory=log_location.value or None,
+            )
+        except Exception as exc:
+            log_status.value = f"Could not open the folder picker: {exc}"
+            log_status.color = "#B91C1C"
+        else:
+            if selected:
+                log_location.value = selected
+                log_status.value = (
+                    "Folder selected. Save the log settings to apply it."
+                )
+                log_status.color = "#475569"
+        page.update()
+
+    def save_log_prefs(_=None):
+        try:
+            saved = logging_service.save_log_settings(
+                enabled=bool(log_enabled.value), location=log_location.value or ""
+            )
+            logging_service.reconfigure_logging()
+        except SettingsError as exc:
+            log_status.value = str(exc)
+            log_status.color = "#B91C1C"
+        except Exception as exc:
+            log_status.value = f"Could not save log settings: {exc}"
+            log_status.color = "#B91C1C"
+            logging_service.log_error("Save log settings failed", exc)
+        else:
+            log_location.value = saved["location"]
+            log_status.value = (
+                "Error logging enabled."
+                if saved["enabled"] else
+                "Error logging disabled."
+            )
+            if saved["location"]:
+                log_status.value += f" Folder: {saved['location']}"
+            log_status.color = "#15803D"
+        page.update()
+
+    def reveal_log_folder(_=None):
+        try:
+            folder = logging_service.open_log_folder()
+        except SettingsError as exc:
+            log_status.value = str(exc)
+            log_status.color = "#B91C1C"
+        except Exception as exc:
+            log_status.value = f"Could not open log folder: {exc}"
+            log_status.color = "#B91C1C"
+            logging_service.log_error("Open log folder failed", exc)
+        else:
+            log_status.value = f"Opened log folder: {folder}"
+            log_status.color = "#15803D"
+        page.update()
+
+    log_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Errors are written to a rotating land_office.log and "
+                "unhandled failures also create a timestamped crash report. "
+                "Nothing here stores client data, passwords, or database "
+                "contents. Leave the folder blank to use Documents.",
+                size=12, color="#64748B",
+            ),
+            log_enabled,
+            ft.Row(
+                controls=[
+                    log_location,
+                    ft.OutlinedButton(
+                        "Browse folder", on_click=browse_log_folder
+                    ),
+                ],
+                spacing=8, wrap=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            ft.Row(
+                controls=[
+                    ft.Button("Save log settings", on_click=save_log_prefs),
+                    ft.OutlinedButton(
+                        "Open log folder", on_click=reveal_log_folder
+                    ),
+                ],
+                spacing=8, wrap=True,
+            ),
+            log_status,
+        ],
+        spacing=10, tight=True,
     )
 
     heading_field = ft.TextField(
@@ -1631,6 +1769,12 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "keep, a quick manual backup, and safe restore into a new "
                 "database (SQLite databases).",
                 backup_card,
+            ),
+            _category_tile(
+                "Logs — backend errors and crash reports",
+                "Rotating error log, automatic crash reports, folder choice, "
+                "and a button to open the active log folder.",
+                log_card,
             ),
             _category_tile(
                 "Rate cards — appearance",

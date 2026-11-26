@@ -1,12 +1,14 @@
 """Client import / swap and automatic backup service tests (temp DBs)."""
 
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
+from core import database as core_database
 from core.database import Base
 from core.models import Client
 from services import backup_service, client_import_service, client_service
@@ -27,7 +29,9 @@ def import_database(tmp_path, monkeypatch):
     isolated = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(client_import_service, "SessionLocal", isolated)
     monkeypatch.setattr(client_import_service.client_service, "SessionLocal", isolated)
-    monkeypatch.setattr(backup_service, "engine", engine)
+    # v0.2.27: backup_service resolves the live engine through this module.
+    # Patching the old import-time attribute would hide the regression.
+    monkeypatch.setattr(backup_service.core_database, "engine", engine)
     settings_store = {}
     monkeypatch.setattr(backup_service, "get_setting",
                         lambda key, default=None: settings_store.get(key, default))
@@ -530,6 +534,40 @@ def test_backup_settings_validation(import_database):
     assert current["enabled"] is False
 
 
+def test_backup_uses_the_current_engine_after_a_database_switch(
+    import_database, tmp_path, monkeypatch
+):
+    """Regression: v0.2.26 held a stale import-time engine reference."""
+    folder = tmp_path / "switched"
+    folder.mkdir()
+    backup_service.save_backup_settings(
+        enabled=False, frequency_hours=24, location=str(folder), keep_count=2,
+    )
+    switched_engine = object()
+
+    class FakeURL:
+        def get_backend_name(self):
+            return "sqlite"
+
+    class FakeEngine:
+        url = FakeURL()
+
+    switched_engine = FakeEngine()
+    monkeypatch.setattr(backup_service.core_database, "engine", switched_engine)
+    seen = []
+
+    def fake_copy(engine, target):
+        seen.append(engine)
+        return {"target": str(target), "tables": 1}
+
+    monkeypatch.setattr(backup_service, "copy_sqlite_database", fake_copy)
+
+    summary = backup_service.create_backup_now()
+
+    assert seen == [switched_engine]
+    assert summary["target"].startswith(str(folder))
+
+
 def test_manual_backup_creates_and_prunes_files(import_database, tmp_path):
     location = tmp_path / "backups"
     location.mkdir()
@@ -555,6 +593,45 @@ def test_manual_backup_creates_and_prunes_files(import_database, tmp_path):
     )
     with pytest.raises(backup_service.BackupServiceError):
         backup_service.create_backup_now()
+
+
+def test_startup_due_check_uses_newest_real_backup_file(
+    import_database, tmp_path
+):
+    """A snapshot made before v0.2.27 still counts after an upgrade."""
+    folder = tmp_path / "legacy"
+    folder.mkdir()
+    backup_service.save_backup_settings(
+        enabled=True, frequency_hours=24, location=str(folder), keep_count=5,
+    )
+    backup_service.set_setting(backup_service._LAST_RUN_KEY, "")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    (folder / f"land_office_backup_{stamp}.sqlite3").write_bytes(b"legacy")
+
+    assert backup_service.run_backup_if_due() is None
+    status = backup_service.backup_status()
+    assert status["due"] is False
+    assert status["last_backup"] != ""
+    assert status["hours_since"] is not None
+
+
+def test_open_backup_folder_uses_the_saved_location(
+    import_database, tmp_path, monkeypatch
+):
+    folder = tmp_path / "open_me"
+    folder.mkdir()
+    backup_service.save_backup_settings(
+        enabled=False, frequency_hours=24, location=str(folder), keep_count=5,
+    )
+    opened = []
+    monkeypatch.setattr(
+        backup_service, "reveal_directory", lambda value: opened.append(value) or Path(value)
+    )
+
+    result = backup_service.open_backup_folder()
+
+    assert opened == [str(folder)]
+    assert result == folder.resolve()
 
 
 def test_scheduler_due_check_respects_settings(import_database, tmp_path):

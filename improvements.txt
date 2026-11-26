@@ -1,9 +1,12 @@
-make these changes in both calculate page:
-	1. while fetching the lowest and highest rate on the calculate page it often enable disable the "rate unit" field. allow it to fetch schedule even if only one field is entered like mauza name or revenue circle even if qanoongoi is select or any other field.
-	2. on calculate page also add classification button to fetch lowest/highest schedule via classification like agri, residential or commercial
-	
-make these changes on "dc / fbr rates" page:
-	1. on that page also add a classification dropdown to also find/filter area via classification.
-
-make sure classification dropdown values are fetched from db from classification column make these values unique.
-also tell me what is the role of database.json file in our portable exe as it does not being created automatically when i distribute my exe. if it is necessary then make the app create it at its first very first run or in case it is missing.
+need to improve following:
+	1. upon backup button click in the automatic backups setting does not create a backup which was working fine before.
+	2. on startup, if automatic backup was enabled, check what was the last backup and how long it's been since the last backup then create a backup if needed according to user settings.
+	3. also create a button to go to the dir where backups are being stored.
+	4. create a strict or reporing mode while calculating fees to save all the calculations with a task no as user often forgets to enter a task no each time he is saving an estimate.
+	5. save all the estimates with task no and date time and make a setting also which will allow user to select either save via task no, with date, with time or any other custom value or a combination of any of these.
+	6. also allow user to get print or pdf all the saved estimates in a single file or get individual files according to his saved criteria.
+	7. ask user to print todays saved or old ones or a selection system to select from. make it as much extensive  as possible.
+	8. also allow user to save waseeka name along with task no and registry area which we already have while saving and reporting. improvement/addition to option 5.
+	9. also make a log system to monitor whats happening in the backend and look for any errors causing misbehaviour or crash. in case of crash auto generate a log file in the document folder	or user selected dir.
+	10. also impelent a warning system in the app which will inform the user about what is missing and in case of in appropriate set up or supply of proper data app could provide in correct results.
+	11. also whatever code you implement add comments or ducument the code properly with previouse and updated version numbers. also add comments about the previous errors and do this for all the up comming updates/upgrades.

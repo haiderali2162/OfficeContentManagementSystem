@@ -12,23 +12,39 @@ existing app-setting store, so no schema change is needed. The scheduler
 is a small daemon thread (started from ``app.py``) that checks every
 minute whether a backup is due; only file-backed SQLite databases can be
 backed up (PostgreSQL/MySQL/custom URLs are skipped with a note).
+
+Version history:
+
+* v0.2.26 — the service captured ``engine`` at import time. After Settings
+  switched the live database, ``create_backup_now`` could still target the
+  old engine, which made the **Back up now** button appear to do nothing or
+  fail. The scheduler had the same stale-engine risk.
+* v0.2.27 — the current ``core.database.engine`` is resolved at call time;
+  due checks also consider the newest real backup file when the saved
+  timestamp is absent, and the Settings page can open the backup folder.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from core.database import engine
+from sqlalchemy.engine import Engine
+
+# Resolve the engine through the module: ``reconfigure_database`` replaces
+# ``core.database.engine`` when the user switches databases in Settings.
+from core import database as core_database
 from core.database_copy import (
     DatabaseCopyError,
     copy_sqlite_database,
     copy_sqlite_file,
 )
-from services.settings_service import get_setting, set_setting
+from services import logging_service
+from services.settings_service import get_setting, reveal_directory, set_setting
 
 _SETTINGS_KEY = "backups.settings"
 _LAST_RUN_KEY = "backups.last_run_at"
@@ -42,6 +58,14 @@ DEFAULT_SETTINGS = {
 }
 
 _scheduler_started = False
+_BACKUP_NAME_RE = re.compile(
+    r"^land_office_backup_(\d{8}_\d{6})(?:_\d+)?\.sqlite3$"
+)
+
+
+def _live_engine() -> Engine:
+    """Return the engine currently selected by the running application."""
+    return core_database.engine
 
 
 class BackupServiceError(ValueError):
@@ -115,8 +139,8 @@ def save_backup_settings(
 
 
 def is_sqlite_backend() -> bool:
-    """True when the live engine connects to a SQLite file (backable)."""
-    return engine.url.get_backend_name() == "sqlite"
+    """True when the currently selected engine connects to a SQLite file."""
+    return _live_engine().url.get_backend_name() == "sqlite"
 
 
 def list_backups(location: str) -> list[dict[str, Any]]:
@@ -154,6 +178,54 @@ def _apply_retention(location: str, keep_count: int) -> list[str]:
     return removed
 
 
+def _parse_backup_name_time(name: str) -> datetime | None:
+    """Read the UTC creation time embedded in a backup file name."""
+    match = _BACKUP_NAME_RE.match(str(name or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _last_backup_datetime(location: str | None = None) -> datetime | None:
+    """Newest known backup time from settings or the real backup files.
+
+    v0.2.26 only read ``backups.last_run_at``. A backup made by an older
+    build (or copied in from another machine) had no timestamp in the
+    settings store, so startup backed up immediately even when a recent
+    snapshot existed. v0.2.27 uses both sources and returns the newest.
+    """
+    times: list[datetime] = []
+    stored = str(get_setting(_LAST_RUN_KEY, "") or "")
+    if stored:
+        try:
+            stamp = datetime.fromisoformat(stored)
+        except ValueError:
+            stamp = None
+        if stamp is not None:
+            times.append(
+                stamp if stamp.tzinfo is not None
+                else stamp.replace(tzinfo=timezone.utc)
+            )
+    folder = str(location or get_backup_settings()["location"] or "").strip()
+    for item in list_backups(folder):
+        stamp = _parse_backup_name_time(item["name"])
+        if stamp is not None:
+            times.append(stamp)
+    return max(times) if times else None
+
+
+def _format_local_time(stamp: datetime) -> str:
+    """Show a UTC-aware timestamp in the user's local time for status text."""
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone()
+    return stamp.strftime("%Y-%m-%d %H:%M")
+
+
 def create_backup_now(*, reason: str = "manual") -> dict[str, Any]:
     """Create one verified snapshot and apply the retention rule."""
     if not is_sqlite_backend():
@@ -178,7 +250,9 @@ def create_backup_now(*, reason: str = "manual") -> dict[str, Any]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     target = folder / f"land_office_backup_{stamp}.sqlite3"
     try:
-        summary = copy_sqlite_database(engine, target)
+        # v0.2.27: read the live engine here instead of the import-time copy.
+        # A database switched in Settings must be the one backed up.
+        summary = copy_sqlite_database(_live_engine(), target)
     except DatabaseCopyError as exc:
         raise BackupServiceError(str(exc)) from exc
     removed = _apply_retention(location, settings["keep_count"])
@@ -219,7 +293,7 @@ def restore_backup(backup_path: str) -> dict[str, Any]:
             "Restore is available only while the SQLite database is in use. "
             "Other database systems need their own restore tooling."
         )
-    current_name = str(engine.url.database or "").strip()
+    current_name = str(_live_engine().url.database or "").strip()
     if not current_name:
         raise BackupServiceError(
             "The current database has no file path, so it cannot be restored."
@@ -255,7 +329,7 @@ def restore_backup(backup_path: str) -> dict[str, Any]:
         f"{current_path.stem}_restored_{stamp}{current_path.suffix}"
     )
     try:
-        copy_sqlite_database(engine, safety_path)
+        copy_sqlite_database(_live_engine(), safety_path)
         summary = copy_sqlite_file(selected, restored_path)
     except (DatabaseCopyError, sqlite3.Error) as exc:
         raise BackupServiceError(str(exc)) from exc
@@ -277,20 +351,19 @@ def run_backup_if_due() -> dict[str, Any] | None:
     settings = get_backup_settings()
     if not settings["enabled"] or not is_sqlite_backend():
         return None
-    last = str(get_setting(_LAST_RUN_KEY, "") or "")
-    try:
-        last_run = datetime.fromisoformat(last) if last else None
-    except ValueError:
-        last_run = None
+    # v0.2.27: include real backup files in the due check so a snapshot made
+    # by an older build still counts as the last backup after an upgrade.
+    last_run = _last_backup_datetime(settings["location"])
     now = datetime.now(timezone.utc)
-    if last_run is not None:
-        if last_run.tzinfo is None:
-            last_run = last_run.replace(tzinfo=timezone.utc)
-        if now - last_run < timedelta(hours=settings["frequency_hours"]):
-            return None
+    if last_run is not None and now - last_run < timedelta(
+        hours=settings["frequency_hours"]
+    ):
+        return None
     try:
         return create_backup_now(reason="auto")
     except Exception as exc:  # scheduler must survive failures
+        # v0.2.27: keep the failure visible after the desktop window closes.
+        logging_service.log_error("Automatic backup failed", exc)
         return {"reason": "auto", "error": str(exc)}
 
 
@@ -315,13 +388,73 @@ def start_backup_scheduler() -> None:
 
 def get_last_backup_time() -> str:
     """Human-readable last automatic/manual backup time (blank if never)."""
-    last = str(get_setting(_LAST_RUN_KEY, "") or "")
-    if not last:
-        return ""
+    last = _last_backup_datetime()
+    return _format_local_time(last) if last else ""
+
+
+def backup_status(location: str | None = None) -> dict[str, Any]:
+    """Describe the last backup, elapsed time, and whether startup is due.
+
+    The Settings page uses this instead of recalculating the schedule in an
+    event handler. ``due`` is true only when automatic backups are enabled,
+    the active engine is SQLite, and the frequency interval has passed (or
+    no backup can be found yet).
+    """
+    settings = get_backup_settings()
+    folder = str(location or settings["location"] or "").strip()
+    last = _last_backup_datetime(folder)
+    now = datetime.now(timezone.utc)
+    hours_since = (
+        round((now - last).total_seconds() / 3600, 1) if last else None
+    )
+    due = bool(
+        settings["enabled"]
+        and is_sqlite_backend()
+        and (
+            last is None
+            or now - last >= timedelta(hours=settings["frequency_hours"])
+        )
+    )
+    next_due = (
+        last + timedelta(hours=settings["frequency_hours"])
+        if last and settings["enabled"] else None
+    )
+    if not settings["enabled"]:
+        message = "Automatic backups are disabled."
+    elif not is_sqlite_backend():
+        message = "Automatic backups require the SQLite database backend."
+    elif last is None:
+        message = "No backup found; the next startup check will create one."
+    elif due:
+        message = (
+            f"Last backup {_format_local_time(last)} ({hours_since} hours ago); "
+            "a backup is due."
+        )
+    else:
+        message = (
+            f"Last backup {_format_local_time(last)} ({hours_since} hours ago); "
+            f"next at {_format_local_time(next_due)}."
+        )
+    return {
+        "enabled": settings["enabled"],
+        "location": folder,
+        "last_backup": _format_local_time(last) if last else "",
+        "hours_since": hours_since,
+        "due": due,
+        "next_backup": _format_local_time(next_due) if next_due else "",
+        "message": message,
+    }
+
+
+def open_backup_folder(location: str | None = None) -> Path:
+    """Open the configured backup folder in the operating system's file manager."""
+    folder = str(location or get_backup_settings()["location"] or "").strip()
+    if not folder:
+        raise BackupServiceError(
+            "Choose a backup folder in Settings first."
+        )
     try:
-        stamp = datetime.fromisoformat(last)
-        if stamp.tzinfo is not None:
-            stamp = stamp.astimezone()
-        return stamp.strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        return last
+        path = reveal_directory(folder)
+    except ValueError as exc:
+        raise BackupServiceError(str(exc)) from exc
+    return path

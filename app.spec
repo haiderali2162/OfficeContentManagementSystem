@@ -66,6 +66,7 @@ first_party_modules = [
     "services.dc_rate_duplicate_service",
     "services.dc_rate_service",
     "services.estimate_service",
+    "services.logging_service",
     "services.naqsha_service",
     "services.registry_fee_service",
     "services.schedule_lookup_service",
