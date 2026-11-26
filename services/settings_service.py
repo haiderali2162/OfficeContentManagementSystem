@@ -15,8 +15,13 @@ Two DC/FBR rate-card preference groups live here:
 
 Version history: v0.2.26 stored only import/export and rate-card preferences.
 v0.2.27 adds :func:`reveal_directory`, a validated cross-platform way for
-Settings buttons to open the backup and log folders in the file manager. No
-new table or column is involved.
+Settings buttons to open the backup and log folders in the file manager.
+v0.2.28 adds ``valuation.estimate_naming`` (strict task-number mode, automatic
+task-number fallback, and token-based estimate names). v0.2.29 keeps that key
+but replaces the hard-coded client requirement with a configurable
+``required_identity_fields`` list (task no., waseeka name, registry area,
+client). All groups use the existing ``app_settings`` JSON table; no new table
+or column is involved.
 """
 
 from __future__ import annotations
@@ -1006,3 +1011,215 @@ def reset_valuation_report_options() -> dict[str, Any]:
     }
     set_setting(VALUATION_REPORT_KEY, normalized)
     return normalized
+
+
+# --------------------------------------------------------------------------
+# Estimate identity / naming preferences (v0.2.28, extended v0.2.29).
+#
+# v0.2.26 saved task numbers only inside ``input_snapshot_json`` and offered
+# no naming choice. The user could forget the task number and every estimate
+# looked the same in history/export filenames. v0.2.27 added error logging but
+# did not touch estimate data. v0.2.28 adds one additive ``app_settings`` key
+# with a strict reporting switch, an auto-task fallback, and a token template
+# so an estimate can be named by task number, date, time, custom text, or any
+# supported combination.
+#
+# v0.2.29 fixes the report from developer testing: v0.2.28's save service
+# required a linked client even though the calculator's client box was hidden
+# in the collapsed advanced panel. The client link is now optional by default.
+# ``required_identity_fields`` lets the user require any combination of the
+# four identity fields, and the client selector is visible in the main form.
+# No fee/tax rule is affected by these preferences.
+# --------------------------------------------------------------------------
+
+VALUATION_NAMING_KEY = "valuation.estimate_naming"
+
+#: Named starting points shown in Settings. The template remains editable so
+#: the user is not limited to these presets.
+ESTIMATE_NAME_PRESETS = {
+    "task_date_time": {
+        "label": "Task no + date + time",
+        "template": "{task_no}_{date}_{time}",
+    },
+    "task_date": {
+        "label": "Task no + date",
+        "template": "{task_no}_{date}",
+    },
+    "task_only": {
+        "label": "Task no only",
+        "template": "{task_no}",
+    },
+    "waseeka_task_date": {
+        "label": "Waseeka + task no + date",
+        "template": "{waseeka}_{task_no}_{date}",
+    },
+    "date_time": {
+        "label": "Date + time",
+        "template": "{date}_{time}",
+    },
+    "custom_date_time": {
+        "label": "Custom text + date + time",
+        "template": "{custom}_{date}_{time}",
+    },
+    "custom_task_date": {
+        "label": "Custom text + task no + date",
+        "template": "{custom}_{task_no}_{date}",
+    },
+}
+
+#: Identity fields that may be required before an estimate is saved (v0.2.29).
+#: Keys are deliberately storage keys, not translated labels, so old settings
+#: remain readable even if the UI wording changes.
+ESTIMATE_REQUIRED_IDENTITY_FIELDS = {
+    "task_no": "Task number",
+    "waseeka_name": "Waseeka name",
+    "registry_area": "Registry area",
+    "client": "Client record",
+}
+
+#: Default required fields from the developer's v0.2.29 decision: task number
+#: and waseeka name are enough; registry area and client stay optional.
+DEFAULT_REQUIRED_IDENTITY_FIELDS = ("task_no", "waseeka_name")
+
+DEFAULT_ESTIMATE_NAMING = {
+    # v0.2.28: strict mode required a task number. v0.2.29: strict mode now
+    # enforces the selected identity fields; auto task numbers still satisfy
+    # the task-number requirement when the field is left blank.
+    "strict_mode": True,
+    "auto_task_no": True,
+    "required_identity_fields": list(DEFAULT_REQUIRED_IDENTITY_FIELDS),
+    "preset": "task_date_time",
+    "template": ESTIMATE_NAME_PRESETS["task_date_time"]["template"],
+    "custom_text": "",
+}
+
+#: Tokens accepted in a naming template. ``waseeka`` and ``registry_area`` are
+#: included because the developer asked to save and report both values.
+ESTIMATE_NAME_TOKENS = {
+    "task_no", "date", "time", "datetime", "custom", "waseeka", "registry_area",
+}
+
+
+def normalize_estimate_naming(values: Any) -> dict[str, Any]:
+    """Validate and complete an estimate-naming preference dictionary."""
+    if values is None:
+        # No saved policy: use the v0.2.29 defaults (task no. + waseeka).
+        # A stored v0.2.28 policy without the new key is handled below and
+        # keeps its original task-number-only meaning.
+        values = dict(DEFAULT_ESTIMATE_NAMING)
+    if not isinstance(values, dict):
+        raise SettingsError("Estimate naming settings must be a mapping.")
+
+    preset = str(values.get("preset") or DEFAULT_ESTIMATE_NAMING["preset"]).strip()
+    if preset not in ESTIMATE_NAME_PRESETS:
+        supported = ", ".join(sorted(ESTIMATE_NAME_PRESETS))
+        raise SettingsError(
+            f"Unsupported estimate naming preset '{preset}'. Use one of: {supported}."
+        )
+    fallback_template = ESTIMATE_NAME_PRESETS[preset]["template"]
+    template = str(values.get("template") or fallback_template).strip()
+    if not template:
+        raise SettingsError("Enter an estimate naming template.")
+
+    used_tokens: list[str] = []
+    for _literal, field, format_spec, conversion in Formatter().parse(template):
+        if field is None:
+            continue
+        if field not in ESTIMATE_NAME_TOKENS:
+            supported = ", ".join(sorted(ESTIMATE_NAME_TOKENS))
+            raise SettingsError(
+                f"Unknown naming token '{field}'. Use one of: {supported}."
+            )
+        if format_spec or conversion:
+            raise SettingsError("Naming tokens do not support formatting options.")
+        if field not in used_tokens:
+            used_tokens.append(field)
+    if not used_tokens:
+        raise SettingsError(
+            "Include at least one naming token such as {task_no} or {date}."
+        )
+
+    custom_text = str(values.get("custom_text") or "").strip()
+    if len(custom_text) > 120:
+        raise SettingsError("Custom naming text must be 120 characters or fewer.")
+
+    # v0.2.29: an old v0.2.28 setting has no ``required_identity_fields`` key.
+    # Preserve the old meaning (task number only) rather than silently adding
+    # new requirements to an existing user's saved policy.
+    if "required_identity_fields" in values:
+        raw_fields = values["required_identity_fields"]
+        if isinstance(raw_fields, (str, bytes)) or not isinstance(raw_fields, (list, tuple, set)):
+            raise SettingsError(
+                "Required identity fields must be a list of field names."
+            )
+        seen: list[str] = []
+        for item in raw_fields:
+            field = str(item).strip()
+            if field not in ESTIMATE_REQUIRED_IDENTITY_FIELDS:
+                supported = ", ".join(sorted(ESTIMATE_REQUIRED_IDENTITY_FIELDS))
+                raise SettingsError(
+                    f"Unsupported required identity field '{field}'. Use one of: {supported}."
+                )
+            if field not in seen:
+                seen.append(field)
+        # Keep a canonical order so Settings, validation messages, and saved
+        # snapshots are deterministic regardless of JSON/UI ordering.
+        required_fields = [
+            field for field in ESTIMATE_REQUIRED_IDENTITY_FIELDS if field in seen
+        ]
+    elif bool(values.get("strict_mode", DEFAULT_ESTIMATE_NAMING["strict_mode"])):
+        required_fields = ["task_no"]
+    else:
+        required_fields = []
+
+    return {
+        "strict_mode": bool(values.get("strict_mode", DEFAULT_ESTIMATE_NAMING["strict_mode"])),
+        "auto_task_no": bool(values.get("auto_task_no", DEFAULT_ESTIMATE_NAMING["auto_task_no"])),
+        "required_identity_fields": required_fields,
+        "preset": preset,
+        "template": template[:255],
+        "custom_text": custom_text,
+    }
+
+
+def get_estimate_naming() -> dict[str, Any]:
+    """Return saved naming preferences with defaults for invalid/old values."""
+    stored = get_setting(VALUATION_NAMING_KEY, None)
+    try:
+        return normalize_estimate_naming(stored)
+    except SettingsError:
+        return {key: value for key, value in DEFAULT_ESTIMATE_NAMING.items()}
+
+
+def set_estimate_naming(values: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist estimate-name settings."""
+    normalized = normalize_estimate_naming(values)
+    set_setting(VALUATION_NAMING_KEY, normalized)
+    return normalized
+
+
+def reset_estimate_naming() -> dict[str, Any]:
+    """Restore the built-in estimate naming preferences."""
+    normalized = {key: value for key, value in DEFAULT_ESTIMATE_NAMING.items()}
+    set_setting(VALUATION_NAMING_KEY, normalized)
+    return normalized
+
+
+def format_estimate_template(template: str, values: dict[str, Any]) -> str:
+    """Render a validated naming template with caller-supplied token values.
+
+    Path separators and control characters are replaced so the rendered name
+    is safe to show in history and to pass through the PDF filename sanitizer.
+    """
+    safe_values: dict[str, str] = {}
+    for key in ESTIMATE_NAME_TOKENS:
+        text = str(values.get(key) or "").strip()
+        text = re.sub(r"[<>:\"/\\|?*\x00-\x1f]+", "-", text)
+        safe_values[key] = re.sub(r"\s+", " ", text).strip()
+    try:
+        rendered = str(template).format_map(safe_values)
+    except (KeyError, ValueError, IndexError) as exc:
+        raise SettingsError(f"Could not render the naming template: {exc}") from exc
+    rendered = re.sub(r"[-_]{2,}", lambda match: match.group(0)[:1], rendered)
+    rendered = re.sub(r"\s+", " ", rendered).strip(" -_") or "estimate"
+    return rendered[:255]

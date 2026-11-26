@@ -420,3 +420,98 @@ def test_invalid_stored_report_options_fall_back_field_by_field(settings_databas
         settings_service.DEFAULT_VALUATION_REPORT_OPTIONS["charge_columns"]
     )
     assert options["comparison_columns"] == ["difference"]
+
+
+# --------------------------------------------------------------------------
+# Estimate naming / strict reporting preferences (v0.2.28, extended v0.2.29).
+# --------------------------------------------------------------------------
+
+def test_estimate_naming_defaults_round_trips_and_resets(settings_database):
+    assert settings_service.get_estimate_naming() == (
+        settings_service.DEFAULT_ESTIMATE_NAMING
+    )
+    assert settings_service.get_estimate_naming()[
+        "required_identity_fields"
+    ] == ["task_no", "waseeka_name"]
+    saved = settings_service.set_estimate_naming({
+        "strict_mode": True,
+        "auto_task_no": False,
+        "preset": "custom_task_date",
+        "template": "{custom} {task_no} {date}",
+        "custom_text": "Deed",
+    })
+    assert saved["strict_mode"] is True
+    assert saved["auto_task_no"] is False
+    assert settings_service.get_estimate_naming() == saved
+
+    reset = settings_service.reset_estimate_naming()
+    assert reset == settings_service.DEFAULT_ESTIMATE_NAMING
+
+
+def test_estimate_naming_rejects_unknown_tokens_and_presets(settings_database):
+    with pytest.raises(settings_service.SettingsError, match="Unknown naming token"):
+        settings_service.set_estimate_naming({"template": "{task_no}-{unknown}"})
+    with pytest.raises(settings_service.SettingsError, match="Unsupported"):
+        settings_service.set_estimate_naming({"preset": "not-a-preset"})
+    with pytest.raises(settings_service.SettingsError, match="at least one naming token"):
+        settings_service.set_estimate_naming({"template": "plain text"})
+    assert settings_service.get_estimate_naming() == (
+        settings_service.DEFAULT_ESTIMATE_NAMING
+    )
+
+
+def test_estimate_naming_required_fields_validate_and_keep_canonical_order(settings_database):
+    """v0.2.29: any combination of identity fields may be required."""
+    saved = settings_service.set_estimate_naming({
+        "required_identity_fields": [
+            "client", "waseeka_name", "client", "registry_area",
+        ],
+    })
+    assert saved["required_identity_fields"] == [
+        "waseeka_name", "registry_area", "client",
+    ]
+    assert settings_service.get_estimate_naming() == saved
+
+    with pytest.raises(settings_service.SettingsError, match="Unsupported required identity field"):
+        settings_service.set_estimate_naming({
+            "required_identity_fields": ["task_no", "unknown"],
+        })
+    with pytest.raises(settings_service.SettingsError, match="must be a list"):
+        settings_service.set_estimate_naming({
+            "required_identity_fields": "task_no",
+        })
+    assert settings_service.get_estimate_naming() == saved
+
+
+def test_legacy_estimate_naming_keeps_v028_task_only_requirement(settings_database):
+    """A saved v0.2.28 policy is not silently given new requirements."""
+    settings_service.set_setting(settings_service.VALUATION_NAMING_KEY, {
+        "strict_mode": True,
+        "auto_task_no": False,
+        "preset": "task_only",
+        "template": "{task_no}",
+        "custom_text": "",
+    })
+    naming = settings_service.get_estimate_naming()
+    assert naming["required_identity_fields"] == ["task_no"]
+
+
+def test_invalid_stored_estimate_naming_falls_back_to_defaults(settings_database):
+    settings_service.set_setting(settings_service.VALUATION_NAMING_KEY, {
+        "template": "{not_a_token}",
+    })
+    assert settings_service.get_estimate_naming() == (
+        settings_service.DEFAULT_ESTIMATE_NAMING
+    )
+
+
+def test_format_estimate_template_sanitizes_path_characters():
+    rendered = settings_service.format_estimate_template(
+        "{custom}_{task_no}_{date}",
+        {
+            "custom": "Deed/2026",
+            "task_no": "12/26",
+            "date": "2026-11-27",
+        },
+    )
+    assert rendered == "Deed-2026_12-26_2026-11-27"

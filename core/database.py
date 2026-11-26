@@ -1,5 +1,6 @@
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import sqlite3
 import threading
@@ -361,7 +362,14 @@ def migrate_khewat_schema(database_engine=None) -> None:
 
 
 def migrate_valuation_columns(database_engine=None) -> None:
-    """Add schedule dimensions to already-created valuation tables safely."""
+    """Add schedule dimensions and estimate identity columns safely.
+
+    v0.2.26/v0.2.27 created ``valuation_estimates`` without dedicated task
+    number, waseeka, registry-area, or naming columns. v0.2.28 adds all five
+    as nullable columns and backfills only values already present in the old
+    JSON snapshots. Existing rows, calculations, and rules are never deleted
+    or rewritten.
+    """
     # An engine argument also lets migration tests use a temporary SQLite file;
     # normal application startup continues to use the configured office DB.
     database_engine = database_engine or engine
@@ -388,6 +396,15 @@ def migrate_valuation_columns(database_engine=None) -> None:
         "structure_rate": "NUMERIC(20, 8)",
         "per_marla_value": "NUMERIC(20, 8)",
     }
+    # v0.2.28 additive estimate-identity fields. Nullable types keep every
+    # pre-existing estimate valid; the service fills them for new saves.
+    estimate_additions = {
+        "task_no": "VARCHAR(120)",
+        "estimate_name": "VARCHAR(255)",
+        "waseeka_name": "VARCHAR(200)",
+        "registry_area": "VARCHAR(120)",
+        "naming_snapshot_json": "TEXT",
+    }
     with database_engine.begin() as connection:
         if "property_locations" in tables:
             present = {c["name"] for c in inspect(database_engine).get_columns("property_locations")}
@@ -409,6 +426,67 @@ def migrate_valuation_columns(database_engine=None) -> None:
                 "CAST(strftime('%Y', effective_from) AS INTEGER) "
                 "WHERE published_year IS NULL"
             ))
+        if "valuation_estimates" in tables:
+            present = {
+                column["name"]
+                for column in inspect(database_engine).get_columns("valuation_estimates")
+            }
+            for name, sql_type in estimate_additions.items():
+                if name not in present:
+                    connection.execute(text(
+                        f'ALTER TABLE valuation_estimates ADD COLUMN "{name}" {sql_type}'
+                    ))
+
+            # v0.2.28 backfill: recover identity values already stored in the
+            # v0.2.26/v0.2.27 JSON snapshots. Parsing in Python avoids relying
+            # on the optional SQLite JSON1 extension.
+            rows = connection.execute(text(
+                "SELECT id, input_snapshot_json, location_snapshot_json "
+                "FROM valuation_estimates"
+            )).mappings().all()
+            for row in rows:
+                try:
+                    inputs = json.loads(row["input_snapshot_json"] or "{}")
+                except (TypeError, ValueError):
+                    inputs = {}
+                try:
+                    location = json.loads(row["location_snapshot_json"] or "{}")
+                except (TypeError, ValueError):
+                    location = {}
+                if not isinstance(inputs, dict):
+                    inputs = {}
+                if not isinstance(location, dict):
+                    location = {}
+                task_no = str(inputs.get("task_no") or "").strip()[:120]
+                waseeka = str(inputs.get("waseeka_name") or "").strip()[:200]
+                registry_area = str(
+                    inputs.get("registry_area") or location.get("property_area") or ""
+                ).strip()[:120]
+                if task_no or waseeka or registry_area:
+                    connection.execute(text(
+                        "UPDATE valuation_estimates SET "
+                        "task_no = COALESCE(NULLIF(task_no, ''), :task_no), "
+                        "waseeka_name = COALESCE(NULLIF(waseeka_name, ''), :waseeka), "
+                        "registry_area = COALESCE(NULLIF(registry_area, ''), :area) "
+                        "WHERE id = :id"
+                    ), {
+                        "task_no": task_no or None,
+                        "waseeka": waseeka or None,
+                        "area": registry_area or None,
+                        "id": row["id"],
+                    })
+
+            # create_all creates these indexes on fresh databases; an existing
+            # legacy table needs them created explicitly after the ALTERs.
+            for index_name, column_name in (
+                ("ix_estimate_task_no", "task_no"),
+                ("ix_estimate_name", "estimate_name"),
+                ("ix_estimate_waseeka_name", "waseeka_name"),
+            ):
+                connection.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON valuation_estimates ({column_name})"
+                ))
 
 
 def migrate_tax_rule_columns(database_engine=None) -> None:

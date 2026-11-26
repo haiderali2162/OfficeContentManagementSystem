@@ -674,7 +674,12 @@ class RegistryFeeCustomField(Base):
 
 
 class ValuationEstimate(Base):
-    """Persisted estimate inputs and result snapshots for later review."""
+    """Persisted estimate inputs and result snapshots for later review.
+
+    Version history: v0.2.26/v0.2.27 had no dedicated task-number, waseeka, or
+    naming columns. v0.2.28 adds nullable identity fields and a naming snapshot
+    through the additive migration in ``core.database.migrate_valuation_columns``.
+    """
 
     __tablename__ = "valuation_estimates"
     __table_args__ = (
@@ -709,6 +714,13 @@ class ValuationEstimate(Base):
             "total_charges >= 0", name="ck_estimate_total_charges_non_negative"
         ),
         Index("ix_estimate_transaction_date", "transaction_date"),
+        # v0.2.28: dedicated estimate identity fields. v0.2.26/v0.2.27 kept
+        # the task number only in input_snapshot_json, so it could not be
+        # filtered or shown reliably in history. These additive columns are
+        # nullable so older rows remain valid without a data rewrite.
+        Index("ix_estimate_task_no", "task_no"),
+        Index("ix_estimate_name", "estimate_name"),
+        Index("ix_estimate_waseeka_name", "waseeka_name"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -730,6 +742,13 @@ class ValuationEstimate(Base):
     transaction_date: Mapped[date] = mapped_column(
         Date, nullable=False, index=True
     )
+    # v0.2.28 identity fields. ``task_no`` is the human-facing reference;
+    # ``estimate_name`` is the rendered naming-template result preserved with
+    # the calculation so later setting changes cannot rename old estimates.
+    task_no: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    estimate_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    waseeka_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    registry_area: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     property_type: Mapped[str] = mapped_column(String(100), nullable=False)
     classification: Mapped[Optional[str]] = mapped_column(String(120))
     area_value: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
@@ -751,6 +770,9 @@ class ValuationEstimate(Base):
     rate_snapshot_json: Mapped[Optional[str]] = mapped_column(Text)
     result_snapshot_json: Mapped[Optional[str]] = mapped_column(Text)
     warnings_json: Mapped[Optional[str]] = mapped_column(Text)
+    # Snapshot of the naming policy used for this save (v0.2.28). Historical
+    # estimates stay explainable even after the user changes the template.
+    naming_snapshot_json: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

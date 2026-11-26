@@ -9,13 +9,19 @@ from reportlab.lib import colors
 from services import valuation_report_service
 from services.settings_service import VALUATION_TABLE_TEMPLATES
 from services.valuation_report_service import (
+    estimate_name,
     export_estimate_csv,
     export_estimate_history,
     export_estimate_pdf,
     export_estimate_xlsx,
+    export_estimates_combined_pdf,
+    export_estimates_zip,
     print_pdf,
+    registry_area,
+    saved_at_text,
     task_number,
     valuation_pdf_filename,
+    waseeka_name,
     _comparison_rows,
     _pdf_table_style,
     _shape_pdf_text,
@@ -415,3 +421,66 @@ def test_pdf_table_style_uses_selected_template_colours():
     ]
     assert colors.HexColor("#0F766E") in backgrounds
     assert colors.HexColor("#D1FAE5") in backgrounds
+
+
+def _identity_estimate(task_no, name):
+    estimate = _estimate()
+    estimate.update({
+        "id": 20 if name == "First" else 21,
+        "task_no": task_no,
+        "estimate_name": f"{name}_{task_no}",
+        "waseeka_name": f"Waseeka {name}",
+        "registry_area": f"Area {name}",
+        "created_at": datetime(2026, 11, 27, 10, 30),
+    })
+    return estimate
+
+
+def test_identity_rows_and_session_history_columns_are_reported():
+    estimate = _identity_estimate("T-1/26", "First")
+    rows = dict(valuation_report_service._estimate_rows(estimate))
+    assert rows["Task no."] == "T-1/26"
+    assert rows["Saved as"] == "First_T-1/26"
+    assert rows["Waseeka name"] == "Waseeka First"
+    assert rows["Registry area"] == "Area First"
+    assert rows["Saved at"] == "2026-11-27 10:30"
+
+    content = export_estimate_history([estimate], "csv").decode("utf-8-sig")
+    assert "T-1/26" in content
+    assert "Waseeka First" in content
+    assert "Area First" in content
+    assert "2026-11-27 10:30" in content
+
+
+def test_combined_pdf_contains_every_selected_estimate():
+    payload = export_estimates_combined_pdf(
+        [_identity_estimate("T-1/26", "First"), _identity_estimate("T-2/26", "Second")],
+        {"sections": ["property_details"], "charge_columns": ["charge"],
+         "comparison_columns": ["charge"]},
+        VALUATION_TABLE_TEMPLATES["classic"],
+    )
+    assert payload.startswith(b"%PDF-")
+    assert len(payload) > 2000
+
+
+def test_individual_pdf_zip_keeps_one_file_per_estimate():
+    import zipfile
+
+    payload = export_estimates_zip(
+        [_identity_estimate("T-1/26", "First"), _identity_estimate("T-2/26", "Second")],
+        now=datetime(2026, 11, 27, 10, 30, 0),
+    )
+    with zipfile.ZipFile(BytesIO(payload)) as archive:
+        names = archive.namelist()
+        pdfs = [name for name in names if name.endswith(".pdf")]
+        assert len(pdfs) == 2
+        assert all(archive.read(name).startswith(b"%PDF-") for name in pdfs)
+        assert "README.txt" in names
+    assert "README.txt" not in "".join(pdfs)
+
+
+def test_filename_prefers_saved_estimate_name_without_client_data():
+    estimate = _identity_estimate("T-1/26", "First")
+    name = valuation_pdf_filename(estimate, now=datetime(2026, 11, 27, 10, 30, 9))
+    assert name == "valuation_First_T-1_26_20261127_103009.pdf"
+    assert "احمد خان" not in name

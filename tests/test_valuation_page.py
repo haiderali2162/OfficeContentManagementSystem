@@ -5,9 +5,11 @@ import flet as ft
 import json
 import re
 import pytest
+from datetime import date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
+from services import settings_service
 from services.settings_service import VALUATION_TABLE_TEMPLATES
 from ui.pages import dc_rates
 from ui.pages import valuation
@@ -77,6 +79,11 @@ def isolate_valuation_schedule_queries(monkeypatch):
     monkeypatch.setattr(valuation, "list_location_hint_values", lambda **_kwargs: {})
     monkeypatch.setattr(valuation, "list_classifications", lambda: [])
     monkeypatch.setattr(valuation, "find_schedule_location_matches", lambda **_kwargs: [])
+    # Naming preferences live in app_settings; tests must never read the live DB.
+    monkeypatch.setattr(
+        valuation, "get_estimate_naming",
+        lambda: dict(settings_service.DEFAULT_ESTIMATE_NAMING),
+    )
     # The location draft is module-level cache shared by page rebuilds; clear
     # it around every test so restored values never leak between tests.
     valuation._LOCATION_DRAFT.clear()
@@ -2302,3 +2309,301 @@ def test_dc_rate_unit_menu_stays_available_without_a_match(monkeypatch):
     assert [option.key for option in unit.options] == list(
         valuation.DC_RATE_UNITS
     )
+
+
+# --------------------------------------------------------------------------
+# v0.2.28 estimate identity/history/batch UI, extended with v0.2.29 client identity.
+# --------------------------------------------------------------------------
+
+def test_identity_fields_and_strict_hint_are_visible(monkeypatch):
+    _patch_estimate_services(monkeypatch)
+    monkeypatch.setattr(valuation, "get_estimate_naming", lambda: {
+        **settings_service.DEFAULT_ESTIMATE_NAMING,
+        "strict_mode": True,
+        "auto_task_no": False,
+        "template": "{task_no}_{date}",
+    })
+
+    root = valuation.build_valuation_page(FakePage())
+    controls = list(walk_controls(root))
+    labels = {
+        control.label for control in controls if isinstance(control, ft.TextField)
+    }
+    assert "Task no. (printed at the top of PDF/print)" in labels
+    assert "Waseeka name (saved with estimate)" in labels
+    assert "Registry area (saved with estimate)" in labels
+
+    client_box = next(
+        control for control in controls
+        if isinstance(control, ft.Dropdown)
+        and getattr(control, "data", None) == "estimate_client"
+    )
+    assert "Client" in client_box.label
+
+    hint = next(
+        control for control in controls
+        if getattr(control, "data", None) == "estimate_naming_hint"
+    )
+    assert "Strict reporting is on" in hint.value
+    assert "enter a task no. before saving" in hint.value
+    assert "Task number, Waseeka name" in hint.value
+    assert "Client box beside Task no." in hint.value
+    assert "Saved name:" in hint.value
+
+
+def test_save_estimate_sends_identity_fields_and_shows_generated_name(monkeypatch):
+    matches = [_location_row(7)]
+    rates = {"dc": [_dc_rate(11, 7)]}
+    _patch_estimate_services(monkeypatch, matches=matches, rates=rates)
+    monkeypatch.setattr(valuation, "get_estimate_naming", lambda: {
+        **settings_service.DEFAULT_ESTIMATE_NAMING,
+        "strict_mode": True,
+        "auto_task_no": True,
+    })
+    monkeypatch.setattr(
+        valuation, "get_valuation_table_template",
+        lambda: {**VALUATION_TABLE_TEMPLATES["classic"], "id": "classic"},
+    )
+
+    def fake_dual_valuation(**_kwargs):
+        return {
+            "area_square_feet": Decimal("5440"),
+            "property_value": Decimal("100"),
+            "transferred_value": Decimal("100"),
+            "dc_value": Decimal("100"),
+            "fbr_value": None,
+            "registry_written_value": None,
+            "declared_consideration": None,
+            "comparison": None,
+            "explanation": ["Area: 1-0-0."],
+            "warnings": [],
+            "rate_quantity": Decimal("1"),
+            "rate_unit": "per_kanal",
+            "dc_rate": {}, "fbr_rate": None, "rate_id": 11, "rate": {},
+            "fbr_valuation": None, "rate_snapshot": {"dc": {}, "fbr": None},
+            "fbr_warning": None,
+        }
+
+    def fake_charges(**_kwargs):
+        return {
+            "charges": [], "totals_by_currency": {}, "total_currency": "PKR",
+            "warnings": [], "skipped_rules": [],
+        }
+
+    monkeypatch.setattr(valuation, "calculate_dual_valuation", fake_dual_valuation)
+    monkeypatch.setattr(valuation, "calculate_charges_for_parties", fake_charges)
+    saved = []
+
+    def fake_save(**kwargs):
+        saved.append(kwargs)
+        return 77
+
+    monkeypatch.setattr(valuation, "save_estimate", fake_save)
+    monkeypatch.setattr(valuation, "get_estimate", lambda estimate_id: {
+        "id": 77,
+        "task_no": "T-GENERATED",
+        "estimate_name": "T-GENERATED_2026-11-27",
+        "waseeka_name": "Deed A",
+        "registry_area": "Zone B",
+    })
+
+    root = valuation.build_valuation_page(LoadingPage())
+    _stub_control_updates(root)
+    controls = list(walk_controls(root))
+
+    def field(label):
+        return next(
+            control for control in controls
+            if isinstance(control, ft.TextField) and control.label == label
+        )
+
+    mauza = _auto(controls, "mauza")
+    mauza.value = "Chak 1"
+    mauza.on_change(SimpleNamespace(control=mauza))
+    field("Area (K-M-F or 10k5m)").value = "1-0-0"
+    field("Waseeka name (saved with estimate)").value = "Deed A"
+    field("Registry area (saved with estimate)").value = "Zone B"
+    calculate_button = next(
+        control for control in controls
+        if isinstance(control, ft.Button)
+        and control.content == "Calculate estimate"
+    )
+    calculate_button.on_click(SimpleNamespace(control=calculate_button))
+
+    save_button = next(
+        control for control in controls
+        if isinstance(control, ft.OutlinedButton)
+        and control.content == "Save estimate"
+    )
+    save_button.on_click(SimpleNamespace(control=save_button))
+
+    assert saved, "Save estimate did not call the estimate service"
+    assert saved[0]["inputs"]["waseeka_name"] == "Deed A"
+    assert saved[0]["inputs"]["registry_area"] == "Zone B"
+    # v0.2.29: an unlinked client is valid with the default identity rule.
+    assert saved[0]["client_id"] is None
+    assert field("Task no. (printed at the top of PDF/print)").value == "T-GENERATED"
+    assert any(
+        "saved as T-GENERATED_2026-11-27" in (control.value or "")
+        for control in walk_controls(root)
+        if isinstance(control, ft.Text)
+    )
+
+    def failing_save(**_kwargs):
+        raise RuntimeError(
+            "Strict reporting requires missing estimate identity: Client record "
+            "— choose a client in the 'Client' box beside Task no. on the "
+            "Calculate tab."
+        )
+
+    monkeypatch.setattr(valuation, "save_estimate", failing_save)
+    save_button.on_click(SimpleNamespace(control=save_button))
+    assert any(
+        "'Client' box beside Task no." in (control.value or "")
+        for control in walk_controls(root)
+        if isinstance(control, ft.Text)
+    )
+
+
+def test_history_filters_selection_and_batch_reports(monkeypatch):
+    records = [{
+        "id": 5,
+        "transaction_date": date(2026, 11, 27),
+        "created_at": datetime(2026, 11, 27, 9, 30),
+        "task_no": "T-5",
+        "estimate_name": "T-5_2026-11-27_09-30-00",
+        "waseeka_name": "Alpha deed",
+        "registry_area": "Zone A",
+        "client_name": "Client A",
+        "property_type": "Residential",
+        "classification": "Residential",
+        "transferred_value": Decimal("100"),
+        "total_charges": Decimal("1"),
+        "currency_code": "PKR",
+    }, {
+        "id": 6,
+        "transaction_date": date(2026, 11, 27),
+        "created_at": datetime(2026, 11, 27, 10, 15),
+        "task_no": "T-6",
+        "estimate_name": "T-6_2026-11-27_10-15-00",
+        "waseeka_name": "Beta deed",
+        "registry_area": "Zone B",
+        "client_name": "Client B",
+        "property_type": "Residential",
+        "classification": "Residential",
+        "transferred_value": Decimal("200"),
+        "total_charges": Decimal("2"),
+        "currency_code": "PKR",
+    }]
+    filter_calls = []
+    monkeypatch.setattr(valuation, "list_client_choices", lambda: [])
+    monkeypatch.setattr(valuation, "list_tax_fee_rules", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        valuation, "list_estimates",
+        lambda **kwargs: filter_calls.append(kwargs) or list(records),
+    )
+    monkeypatch.setattr(
+        valuation, "get_estimate",
+        lambda estimate_id: next(
+            (record for record in records if record["id"] == estimate_id), None
+        ),
+    )
+    monkeypatch.setattr(valuation, "list_registry_fee_formulas", lambda: [])
+    monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
+    monkeypatch.setattr(valuation, "preload_location_dimensions", lambda: None)
+    monkeypatch.setattr(valuation, "get_valuation_report_options", lambda: {})
+    monkeypatch.setattr(
+        valuation, "get_valuation_table_template",
+        lambda: {**VALUATION_TABLE_TEMPLATES["classic"], "id": "classic"},
+    )
+    monkeypatch.setattr(valuation, "get_default_file_location", lambda: "C:\\fake\\exports")
+    written = []
+    monkeypatch.setattr(
+        valuation, "write_export_to_folder",
+        lambda folder, filename, payload: written.append((folder, filename, payload))
+        or f"C:\\fake\\exports\\{filename}",
+    )
+    combined_calls = []
+    monkeypatch.setattr(
+        valuation, "export_estimates_combined_pdf",
+        lambda records_arg, options, template, **kwargs: (
+            combined_calls.append((records_arg, kwargs)) or b"%PDF-test"
+        ),
+    )
+    zip_calls = []
+    monkeypatch.setattr(
+        valuation, "export_estimates_zip",
+        lambda records_arg, options, template: (
+            zip_calls.append(records_arg) or b"PK-test"
+        ),
+    )
+    print_jobs = []
+    monkeypatch.setattr(
+        valuation, "print_pdf",
+        lambda payload, job_name: print_jobs.append(job_name) or "printed",
+    )
+
+    root = valuation.build_valuation_page(LoadingPage())
+    controls = list(walk_controls(root))
+
+    def by_data(data):
+        return next(control for control in controls if getattr(control, "data", None) == data)
+
+    period = by_data("history_period")
+    period.value = "today"
+    by_data("history_task_filter").value = "T-"
+    by_data("history_waseeka_filter").value = "deed"
+    apply_filters = next(
+        control for control in controls
+        if isinstance(control, ft.Button) and control.content == "Apply history filters"
+    )
+    apply_filters.on_click(None)
+
+    assert filter_calls[-1] == {
+        "limit": 500,
+        "since": date.today(),
+        "until": date.today(),
+        "task_no_contains": "T-",
+        "waseeka_name_contains": "deed",
+    }
+    checkboxes = [
+        control for control in walk_controls(root)
+        if isinstance(control, ft.Checkbox)
+        and str(getattr(control, "data", "")).startswith("estimate_select:")
+    ]
+    assert sorted(control.data for control in checkboxes) == [
+        "estimate_select:5", "estimate_select:6",
+    ]
+
+    select_all = next(
+        control for control in controls
+        if isinstance(control, ft.OutlinedButton) and control.content == "Select all shown"
+    )
+    select_all.on_click(None)
+    assert all(control.value for control in checkboxes)
+    assert "2 selected" in by_data("history_status").value
+
+    combined = next(
+        control for control in controls
+        if isinstance(control, ft.OutlinedButton) and control.content == "Combined PDF"
+    )
+    combined.on_click(None)
+    assert len(combined_calls) == 1
+    assert [record["id"] for record in combined_calls[0][0]] == [5, 6]
+    assert written[-1][1].startswith("valuation_batch_selected_")
+
+    individual = next(
+        control for control in controls
+        if isinstance(control, ft.OutlinedButton)
+        and control.content == "Individual PDFs (ZIP)"
+    )
+    individual.on_click(None)
+    assert len(zip_calls) == 1
+    assert written[-1][1].endswith(".zip")
+
+    print_batch = next(
+        control for control in controls
+        if isinstance(control, ft.Button) and control.content == "Print batch"
+    )
+    print_batch.on_click(None)
+    assert print_jobs and "valuation_batch_" in print_jobs[0]

@@ -3,12 +3,18 @@
 The calculator calls valuation/tax services; those services query persisted
 schedule/rule models. Saving stores input/output snapshots through the estimate
 service so historical calculations remain reviewable when live rules change.
+
+v0.2.28 adds task-number/waseeka/registry-area identity fields, strict naming
+feedback, history filters and selection, combined batch PDFs, and individual
+PDF ZIP exports. v0.2.29 moves the Client box into the visible identity row
+and shows precise validation guidance; the client link is optional unless the
+user requires it in Settings. Existing calculation behaviour is preserved.
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import json
 import re
@@ -20,7 +26,10 @@ import flet as ft
 from core import database_config
 from core.config import DATA_DIR
 from services.settings_service import (
+    ESTIMATE_REQUIRED_IDENTITY_FIELDS,
+    format_estimate_template,
     get_default_file_location,
+    get_estimate_naming,
     get_valuation_report_options,
     get_valuation_table_template,
     VALUATION_TABLE_TEMPLATES,
@@ -90,15 +99,21 @@ from services.tax_service import (
 )
 from services.valuation_report_service import (
     build_current_export_record,
+    estimate_name,
     export_estimate_history,
     export_estimate_csv,
     export_estimate_json,
     export_estimate_pdf,
     export_estimate_xlsx,
     export_estimate_ods,
+    export_estimates_combined_pdf,
+    export_estimates_zip,
     print_pdf,
+    registry_area,
+    saved_at_text,
     task_number,
     valuation_pdf_filename,
+    waseeka_name,
 )
 from services.registry_fee_service import (
     RegistryFeeFormulaError,
@@ -276,7 +291,49 @@ def build_valuation_page(
         )
 
     _reset_result_panel()
-    history_list = ft.ListView(height=230, spacing=6)
+    history_list = ft.ListView(
+        height=230, spacing=6, data="valuation_estimate_history"
+    )
+    history_period = ft.Dropdown(
+        label="Saved estimates",
+        value="all",
+        width=210,
+        options=[
+            ft.dropdown.Option("all", "All saved dates"),
+            ft.dropdown.Option("today", "Today"),
+            ft.dropdown.Option("yesterday", "Yesterday"),
+            ft.dropdown.Option("last_7_days", "Last 7 days"),
+            ft.dropdown.Option("custom", "Custom date range"),
+        ],
+        data="history_period",
+    )
+    history_from = ft.TextField(
+        label="From date (YYYY-MM-DD)", width=190, data="history_from"
+    )
+    history_to = ft.TextField(
+        label="To date (YYYY-MM-DD)", width=190, data="history_to"
+    )
+    history_task_filter = ft.TextField(
+        label="Find task no.", width=190, data="history_task_filter"
+    )
+    history_waseeka_filter = ft.TextField(
+        label="Find waseeka name", width=210, data="history_waseeka_filter"
+    )
+    history_status = ft.Text("", size=12, color="#475569", data="history_status")
+    report_source = ft.Dropdown(
+        label="Print / PDF source",
+        value="selected",
+        width=260,
+        options=[
+            ft.dropdown.Option("selected", "Selected estimates"),
+            ft.dropdown.Option("filtered", "Current filtered list"),
+            ft.dropdown.Option("today", "Today's saved estimates"),
+            ft.dropdown.Option("all", "All saved estimates"),
+        ],
+        data="batch_report_source",
+    )
+    history_records: list[dict[str, Any]] = []
+    selected_estimates: set[int] = set()
     last_calculation: dict[str, Any] = {}
     file_picker = next(
         (service for service in page.services if isinstance(service, ft.FilePicker)),
@@ -312,8 +369,17 @@ def build_valuation_page(
         page.update()
 
     def _current_report_record() -> dict[str, Any]:
+        # Identity fields can be typed after Calculate. Copy them into the
+        # export record at export time so the PDF/filename always shows the
+        # values currently visible in the form.
+        inputs = dict(last_calculation["inputs"])
+        inputs.update({
+            "task_no": (task_no.value or "").strip() or None,
+            "waseeka_name": (waseeka_name_field.value or "").strip() or None,
+            "registry_area": (registry_area_field.value or "").strip() or None,
+        })
         return build_current_export_record(
-            inputs=last_calculation["inputs"],
+            inputs=inputs,
             valuation=last_calculation["valuation"],
             charges=last_calculation["charges"],
             location=last_calculation.get("location"),
@@ -418,10 +484,8 @@ def build_valuation_page(
     def history_export_handler(file_format: str):
         async def export(_):
             try:
-                summaries = list_estimates(limit=500)
-                full_records = [get_estimate(row["id"]) for row in summaries]
-                records = [record for record in full_records if record]
-                payload = export_estimate_history(records, file_format)
+                full_records = _batch_estimate_records("filtered")
+                payload = export_estimate_history(full_records, file_format)
                 await save_report(
                     payload,
                     f"valuation_estimate_history_{date.today().isoformat()}.{file_format}",
@@ -432,15 +496,255 @@ def build_valuation_page(
                 page.update()
         return export
 
-    client = ft.Dropdown(label="Client (optional)", width=250, value="none", options=[
-        ft.dropdown.Option("none", "No client linked"),
-        *[ft.dropdown.Option(str(item["id"]), item["name"]) for item in clients],
-    ])
+    def _history_filter_kwargs() -> dict[str, Any]:
+        """Translate the user's visible history choices into service filters."""
+        period = str(history_period.value or "all")
+        today = date.today()
+        kwargs: dict[str, Any] = {}
+        if period == "today":
+            kwargs = {"since": today, "until": today}
+        elif period == "yesterday":
+            previous = today - timedelta(days=1)
+            kwargs = {"since": previous, "until": previous}
+        elif period == "last_7_days":
+            kwargs = {"since": today - timedelta(days=6), "until": today}
+        elif period == "custom":
+            # The service validates the format and the ordering.
+            kwargs = {
+                "since": (history_from.value or "").strip() or None,
+                "until": (history_to.value or "").strip() or None,
+            }
+        task_filter = (history_task_filter.value or "").strip()
+        waseeka_filter = (history_waseeka_filter.value or "").strip()
+        if task_filter:
+            kwargs["task_no_contains"] = task_filter
+        if waseeka_filter:
+            kwargs["waseeka_name_contains"] = waseeka_filter
+        return kwargs
+
+    def _batch_estimate_records(source: str) -> list[dict[str, Any]]:
+        """Resolve the selected/filtered/today/all reports into full records."""
+        source = str(source or "selected")
+        if source == "selected":
+            if not selected_estimates:
+                raise ValueError(
+                    "Select at least one estimate checkbox, or choose another "
+                    "Print / PDF source."
+                )
+            summaries = list_estimates(ids=sorted(selected_estimates), limit=500)
+        elif source == "filtered":
+            summaries = history_records
+        elif source == "today":
+            summaries = list_estimates(
+                since=date.today(), until=date.today(), limit=500
+            )
+        else:
+            summaries = list_estimates(limit=500)
+        records = [get_estimate(row["id"]) for row in summaries]
+        records = [record for record in records if record]
+        if not records:
+            raise ValueError("No saved estimates matched this report source.")
+        return records
+
+    def _batch_report_handler(mode: str):
+        """Print, combine, or package the estimates chosen in the history UI."""
+
+        def run(_):
+            if not hasattr(page, "run_task"):
+                _run_batch_report(mode)
+                return
+
+            async def worker():
+                _run_batch_report(mode)
+
+            page.run_task(worker)
+
+        return run
+
+    def _run_batch_report(mode: str) -> None:
+        status.value = ""
+        try:
+            source = str(report_source.value or "selected")
+            records = _batch_estimate_records(source)
+            options, template = _report_settings()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            source_label = source.replace("_", "-")
+            if mode == "print":
+                payload = export_estimates_combined_pdf(
+                    records, options, template,
+                    title=f"Valuation estimate report — {source_label}",
+                )
+                print_pdf(payload, f"valuation_batch_{date.today().isoformat()}")
+                status.value = (
+                    f"Sent {len(records)} estimate(s) to the default printer."
+                )
+            elif mode == "pdf":
+                payload = export_estimates_combined_pdf(
+                    records, options, template,
+                    title=f"Valuation estimate report — {source_label}",
+                )
+                filename = f"valuation_batch_{source_label}_{stamp}.pdf"
+                save_report_to_folder(payload, filename)
+                status.value = (
+                    f"Combined PDF saved with {len(records)} estimate(s)."
+                )
+            else:
+                payload = export_estimates_zip(records, options, template)
+                filename = f"valuation_individual_{source_label}_{stamp}.zip"
+                save_report_to_folder(payload, filename)
+                status.value = (
+                    f"ZIP saved with {len(records)} individual estimate PDF(s)."
+                )
+        except Exception as exc:
+            status.value = f"Could not produce the batch report: {exc}"
+        page.update()
+
+    def _apply_history_filters(_=None) -> None:
+        try:
+            refresh_history()
+        except Exception as exc:
+            history_status.value = f"Could not apply history filters: {exc}"
+            history_status.color = "#B91C1C"
+            page.update()
+
+    def _clear_history_filters(_=None) -> None:
+        history_period.value = "all"
+        for field in (history_from, history_to,
+                      history_task_filter, history_waseeka_filter):
+            field.value = ""
+        refresh_history()
+
+    def _select_all_history(_=None) -> None:
+        selected_estimates.update(record["id"] for record in history_records)
+        _refresh_history_checkboxes()
+
+    def _clear_history_selection(_=None) -> None:
+        selected_estimates.clear()
+        _refresh_history_checkboxes()
+
+    def _refresh_history_checkboxes() -> None:
+        def walk(control):
+            yield control
+            for child in getattr(control, "controls", ()) or ():
+                yield from walk(child)
+            content = getattr(control, "content", None)
+            if isinstance(content, ft.Control):
+                yield from walk(content)
+
+        for control in walk(history_list):
+            if (
+                isinstance(control, ft.Checkbox)
+                and str(control.data or "").startswith("estimate_select:")
+            ):
+                estimate_id = int(str(control.data).split(":", 1)[1])
+                control.value = estimate_id in selected_estimates
+        selected_count = len(selected_estimates)
+        history_status.value = (
+            f"{len(history_records)} saved estimate(s) shown; "
+            f"{selected_count} selected."
+        )
+        history_status.color = "#475569"
+        page.update()
+
+    def _toggle_history_selection(estimate_id: int, selected: bool) -> None:
+        if selected:
+            selected_estimates.add(estimate_id)
+        else:
+            selected_estimates.discard(estimate_id)
+        _refresh_history_checkboxes()
+
+    client = ft.Dropdown(
+        label="Client (optional unless required in Settings)",
+        width=260, value="none",
+        data="estimate_client",
+        options=[
+            ft.dropdown.Option("none", "No client linked"),
+            *[ft.dropdown.Option(str(item["id"]), item["name"]) for item in clients],
+        ],
+    )
     task_no = ft.TextField(
         label="Task no. (printed at the top of PDF/print)",
         width=320,
         hint_text="e.g. 1234/26",
+        data="estimate_task_no",
     )
+    waseeka_name_field = ft.TextField(
+        label="Waseeka name (saved with estimate)",
+        width=300,
+        hint_text="e.g. Deed of sale, 12/26",
+        data="estimate_waseeka_name",
+    )
+    registry_area_field = ft.TextField(
+        label="Registry area (saved with estimate)",
+        width=260,
+        hint_text="Leave blank to use the property profile area",
+        data="estimate_registry_area",
+    )
+    naming_policy = get_estimate_naming()
+
+    def _naming_values() -> dict[str, str]:
+        now = datetime.now()
+        return {
+            "task_no": (task_no.value or "").strip() or "1234/26",
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H-%M-%S"),
+            "datetime": now.strftime("%Y-%m-%d_%H-%M-%S"),
+            "custom": naming_policy["custom_text"] or "Deed",
+            "waseeka": (waseeka_name_field.value or "").strip() or "Waseeka",
+            "registry_area": (
+                (registry_area_field.value or "").strip() or "Registry area"
+            ),
+        }
+
+    def _naming_message() -> str:
+        try:
+            preview = format_estimate_template(
+                str(naming_policy["template"]), _naming_values()
+            )
+        except Exception as exc:
+            return f"Estimate naming preview unavailable: {exc}"
+        required = [
+            ESTIMATE_REQUIRED_IDENTITY_FIELDS.get(field, field)
+            for field in naming_policy["required_identity_fields"]
+        ]
+        location_hint = (
+            " Client is selected in the Client box beside Task no. at the top "
+            "of the Calculate tab."
+        )
+        if naming_policy["strict_mode"] and naming_policy["auto_task_no"]:
+            mode = (
+                "Strict reporting is on; enter a task no. before saving when "
+                "required, or leave it blank for automatic numbering. "
+                "Required fields: "
+                + (", ".join(required) if required else "none selected")
+                + "."
+            )
+        elif naming_policy["strict_mode"]:
+            mode = (
+                "Strict reporting is on; enter a task no. before saving when "
+                "required. Required fields: "
+                + (", ".join(required) if required else "none selected")
+                + "."
+            )
+        elif naming_policy["auto_task_no"]:
+            mode = "A blank task no. is generated automatically."
+        else:
+            mode = "Task no. is optional; enter one for easier reporting."
+        return f"{mode}{location_hint} Saved name: {preview}.pdf"
+
+    naming_hint = ft.Text(
+        _naming_message(), size=12, color="#64748B",
+        data="estimate_naming_hint", selectable=True,
+    )
+
+    def _refresh_naming_hint(_=None) -> None:
+        naming_hint.value = _naming_message()
+        page.update()
+
+    task_no.on_change = _refresh_naming_hint
+    waseeka_name_field.on_change = _refresh_naming_hint
+    registry_area_field.on_change = _refresh_naming_hint
+    client.on_change = _refresh_naming_hint
     # Effective date is fixed to today's date for the streamlined workflow.
     transaction_date = date.today()
     property_profile = ft.RadioGroup(value="rural", content=ft.Row([
@@ -1686,6 +1990,11 @@ def build_valuation_page(
         charges = saved.get("result_snapshot", {}).get("charges", {})
         details = [
             f"Estimate #{saved['id']} · {saved['transaction_date']}",
+            f"Task no.: {task_number(saved) or 'Not entered'}",
+            f"Saved as: {estimate_name(saved) or 'Not named'}",
+            f"Waseeka name: {waseeka_name(saved) or 'Not entered'}",
+            f"Registry area: {registry_area(saved) or 'Not entered'}",
+            f"Saved at: {saved_at_text(saved)}",
             f"Client: {saved.get('client_name') or 'Unlinked'}",
             f"Location: {(saved.get('location_snapshot') or {}).get('name', 'Not available')}",
             f"Transferred value: {_money(saved.get('transferred_value'))}",
@@ -1715,23 +2024,76 @@ def build_valuation_page(
 
     def refresh_history(records=None):
         history_list.controls.clear()
+        selected_estimates.clear()
         try:
-            records = list_estimates(limit=100) if records is None else records
+            if records is None:
+                records = list_estimates(limit=500, **_history_filter_kwargs())
+            else:
+                # Initial load passes the default recent list; still apply the
+                # default period filters so the displayed count is consistent.
+                records = list(records)
+            history_records[:] = records
             if not records:
-                history_list.controls.append(ft.Text("No saved estimates yet.", color="#64748B"))
+                history_list.controls.append(ft.Text(
+                    "No saved estimates matched the current filters.",
+                    color="#64748B",
+                ))
             for record in records:
+                estimate_id = record["id"]
+                checkbox = ft.Checkbox(
+                    value=False,
+                    data=f"estimate_select:{estimate_id}",
+                    tooltip="Include this estimate in a batch report",
+                )
+
+                def _on_select(event, estimate_id=estimate_id, checkbox=checkbox):
+                    control = getattr(event, "control", None) or checkbox
+                    _toggle_history_selection(estimate_id, bool(control.value))
+
+                checkbox.on_change = _on_select
+                identity = (
+                    record.get("estimate_name")
+                    or record.get("task_no")
+                    or f"Estimate #{estimate_id}"
+                )
+                detail_bits = [
+                    record.get("client_name") or "Unlinked client",
+                    f"transferred {_money(record['transferred_value'])}",
+                ]
+                if record.get("task_no"):
+                    detail_bits.insert(0, f"task {record['task_no']}")
+                if record.get("waseeka_name"):
+                    detail_bits.append(f"waseeka {record['waseeka_name']}")
                 history_list.controls.append(ft.Container(
                     padding=10, bgcolor="#FFFFFF", border=ft.Border.all(1, "#E2E8F0"), border_radius=8,
                     content=ft.Row([
+                        checkbox,
                         ft.Column([
-                            ft.Text(f"{record['property_type']} · {record['transaction_date']}", weight=ft.FontWeight.BOLD),
-                            ft.Text(f"{record.get('client_name') or 'Unlinked client'} · transferred {_money(record['transferred_value'])}", size=12),
+                            ft.Text(
+                                f"{identity} · {record['transaction_date']}",
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                            ft.Text(" · ".join(detail_bits), size=12),
+                            ft.Text(
+                                f"Saved: {saved_at_text(record)}", size=11,
+                                color="#64748B",
+                            ),
                         ], spacing=3, expand=True),
-                        ft.TextButton("Open", on_click=lambda _, estimate_id=record["id"]: show_estimate(estimate_id)),
+                        ft.TextButton("Open", on_click=lambda _, estimate_id=estimate_id: show_estimate(estimate_id)),
                     ]),
                 ))
+            history_status.value = (
+                f"{len(records)} saved estimate(s) shown; 0 selected."
+            )
+            history_status.color = "#475569"
         except Exception as exc:
-            history_list.controls.append(ft.Text(f"Could not load saved estimates: {exc}", color="#B91C1C"))
+            history_records.clear()
+            history_list.controls.append(ft.Text(
+                f"Could not load saved estimates: {exc}", color="#B91C1C"
+            ))
+            history_status.value = f"Could not load saved estimates: {exc}"
+            history_status.color = "#B91C1C"
+        page.update()
 
     def draw_result(valuation: dict[str, Any], charges: dict[str, Any]):
         result_panel.controls.clear()
@@ -1871,7 +2233,7 @@ def build_valuation_page(
             district, tehsil, qanoongoi, mauza, schedule_location,
             square_no, kila_no, khasra_no, town, revenue_circle,
             property_area, area_value, registry_written_value, location_search,
-            classification, task_no,
+            classification, task_no, waseeka_name_field, registry_area_field,
         )
         for control in text_controls:
             control.value = ""
@@ -1902,6 +2264,7 @@ def build_valuation_page(
         form_error.value = ""
         last_calculation.clear()
         _reset_result_panel()
+        _refresh_naming_hint()
         # The draft cache must not restore the cleared values on rebuild.
         _LOCATION_DRAFT.clear()
         switch_property_profile()
@@ -2170,6 +2533,8 @@ def build_valuation_page(
                 "location_id": int(dc_rate["location_id"]),
                 "client_id": int(client.value) if client.value not in (None, "none") else None,
                 "task_no": (task_no.value or "").strip() or None,
+                "waseeka_name": (waseeka_name_field.value or "").strip() or None,
+                "registry_area": (registry_area_field.value or "").strip() or None,
                 "transaction_date": transaction_date,
                 "transaction_type": transaction_type.value,
                 "jurisdiction": "Punjab",
@@ -2234,13 +2599,35 @@ def build_valuation_page(
             return
         try:
             payload = last_calculation
-            client_id = payload["inputs"].get("client_id")
+            inputs = dict(payload["inputs"])
+            inputs.update({
+                "task_no": (task_no.value or "").strip() or None,
+                "waseeka_name": (waseeka_name_field.value or "").strip() or None,
+                "registry_area": (registry_area_field.value or "").strip() or None,
+            })
+            client_id = inputs.get("client_id")
             estimate_id = save_estimate(
-                inputs=payload["inputs"], valuation=payload["valuation"],
+                inputs=inputs, valuation=payload["valuation"],
                 charges=payload["charges"], client_id=client_id,
             )
+            # The service may generate a task number. Show the final identity
+            # in the form so the user can quote it immediately.
+            saved = get_estimate(estimate_id)
+            if saved:
+                if saved.get("task_no"):
+                    task_no.value = saved["task_no"]
+                last_calculation["inputs"].update(inputs)
+                last_calculation["inputs"]["task_no"] = saved.get("task_no")
+                last_calculation["inputs"]["estimate_name"] = estimate_name(saved)
+                _refresh_naming_hint()
             refresh_history()
-            status.value = f"Estimate #{estimate_id} saved with its rate and charge snapshots."
+            label = estimate_name(saved) if saved else None
+            status.value = (
+                f"Estimate #{estimate_id} saved as {label}. Rate and charge "
+                "snapshots are preserved."
+                if label
+                else f"Estimate #{estimate_id} saved with its rate and charge snapshots."
+            )
         except Exception as exc:
             status.value = f"Could not save estimate: {exc}"
         page.update()
@@ -2489,7 +2876,6 @@ def build_valuation_page(
 
     advanced_inputs = ft.Container(
         ft.ResponsiveRow([
-            ft.Container(client, col={"xs": 12, "md": 6}),
             ft.Container(constructed, col={"xs": 12, "md": 4}),
             ft.Container(building_material_value, col={"xs": 12, "md": 4}),
             ft.Container(transaction_type, col={"xs": 12, "md": 4}),
@@ -3636,7 +4022,13 @@ def build_valuation_page(
     estimate_form = ft.Column([
         ft.Text("Estimate inputs", size=19, weight=ft.FontWeight.BOLD),
         ft.Text("Choose Rural or Urban, enter schedule-backed location details, then enter the area in K-M-F format. Matching DC and FBR rates are fetched from saved schedules.", size=12, color="#9A3412"),
-        task_no,
+        ft.ResponsiveRow([
+            ft.Container(task_no, col={"xs": 12, "md": 3}),
+            ft.Container(waseeka_name_field, col={"xs": 12, "md": 3}),
+            ft.Container(registry_area_field, col={"xs": 12, "md": 3}),
+            ft.Container(client, col={"xs": 12, "md": 3}),
+        ], run_spacing=8),
+        naming_hint,
         khewat_section,
         make_collapsible_card("Property Profile & Location", [
             # Display-mode radio sits at the top, right after the
@@ -3710,13 +4102,40 @@ def build_valuation_page(
             ft.Container(result_card, col=12),
         ]),
         ft.Text("Saved estimate history", size=18, weight=ft.FontWeight.BOLD),
+        ft.Text(
+            "Filter saved estimates by save date, task number, or waseeka name. "
+            "Tick the estimates to include them in a batch report.",
+            size=12, color="#64748B",
+        ),
         ft.Row([
+            history_period, history_from, history_to,
+            history_task_filter, history_waseeka_filter,
+            ft.Button("Apply history filters", on_click=_apply_history_filters),
+            ft.OutlinedButton("Clear filters", on_click=_clear_history_filters),
+        ], wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.END),
+        ft.Row([
+            ft.OutlinedButton("Select all shown", on_click=_select_all_history),
+            ft.OutlinedButton("Clear selection", on_click=_clear_history_selection),
+            history_status,
+        ], wrap=True, spacing=8),
+        history_list,
+        ft.Divider(),
+        ft.Row([
+            report_source,
+            ft.Button("Print batch", on_click=_batch_report_handler("print"),
+                      tooltip="Print all estimates from the chosen source in one job"),
+            ft.OutlinedButton("Combined PDF", on_click=_batch_report_handler("pdf"),
+                              tooltip="Save all chosen estimates in one PDF"),
+            ft.OutlinedButton("Individual PDFs (ZIP)", on_click=_batch_report_handler("zip"),
+                              tooltip="Save one PDF per estimate inside a ZIP file"),
+        ], wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.END),
+        ft.Row([
+            ft.Text("History summary exports:", size=12, color="#475569"),
             ft.OutlinedButton("Export history CSV", on_click=history_export_handler("csv")),
             ft.OutlinedButton("Export history Excel", on_click=history_export_handler("xlsx")),
             ft.OutlinedButton("Export history PDF", on_click=history_export_handler("pdf")),
             ft.OutlinedButton("Export history JSON", on_click=history_export_handler("json")),
         ], wrap=True, spacing=6),
-        history_list,
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
     history_list.controls.append(ft.Text("Loading estimate history…", color="#64748B"))
     formula_list.controls.append(ft.Text("Loading saved formulas…", color="#64748B"))

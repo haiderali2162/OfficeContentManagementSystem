@@ -462,6 +462,86 @@ def test_open_backup_folder_button_reports_success(
     )
 
 
+def test_estimate_naming_category_saves_strict_mode_and_template(settings_database):
+    """v0.2.28 naming controls plus v0.2.29 identity choices persist."""
+    root = settings.build_settings_page(FakePage())
+    titles = [
+        control.title.value
+        for control in _walk(root)
+        if isinstance(control, ft.ExpansionTile)
+    ]
+    assert "Valuation estimates — task numbers and naming" in titles
+
+    _checkbox_by_data(root, "naming_strict_mode").value = True
+    _checkbox_by_data(root, "naming_auto_task_no").value = False
+    # v0.2.29: Settings can require any combination of identity fields.
+    _checkbox_by_data(root, "naming_required_waseeka_name").value = False
+    _checkbox_by_data(root, "naming_required_registry_area").value = True
+    _checkbox_by_data(root, "naming_required_client").value = True
+    _dropdown_by_label(root, "Estimate name preset").value = "custom_date_time"
+    _dropdown_by_label(root, "Estimate name preset").on_change(None)
+    _field(root, "Custom naming text").value = "Deed"
+    _field(root, "Custom naming text").on_change(None)
+
+    _button(root, "Save estimate naming").on_click(None)
+
+    saved = settings_service.get_estimate_naming()
+    assert saved["strict_mode"] is True
+    assert saved["auto_task_no"] is False
+    assert saved["required_identity_fields"] == [
+        "task_no", "registry_area", "client",
+    ]
+    assert saved["preset"] == "custom_date_time"
+    assert saved["template"] == "{custom}_{date}_{time}"
+    assert saved["custom_text"] == "Deed"
+    assert any(
+        "Preview: Deed_" in (control.value or "")
+        for control in _walk(root)
+        if isinstance(control, ft.Text)
+    )
+
+
+def test_estimate_naming_preset_updates_template_and_reset_restores_defaults(settings_database):
+    settings_service.set_estimate_naming({
+        "strict_mode": True, "auto_task_no": False,
+        "preset": "task_only", "template": "{task_no}",
+    })
+    root = settings.build_settings_page(FakePage())
+    assert _field(root, "Estimate naming template").value == "{task_no}"
+
+    preset = _dropdown_by_label(root, "Estimate name preset")
+    preset.value = "task_date"
+    preset.on_change(None)
+    assert _field(root, "Estimate naming template").value == "{task_no}_{date}"
+
+    _button(root, "Reset estimate naming").on_click(None)
+
+    assert settings_service.get_estimate_naming() == (
+        settings_service.DEFAULT_ESTIMATE_NAMING
+    )
+    assert _field(root, "Estimate naming template").value == (
+        settings_service.DEFAULT_ESTIMATE_NAMING["template"]
+    )
+    assert _checkbox_by_data(root, "naming_strict_mode").value is True
+    assert _checkbox_by_data(root, "naming_required_waseeka_name").value is True
+    assert _checkbox_by_data(root, "naming_required_client").value is False
+
+
+def test_estimate_naming_blocks_unknown_token_without_saving(settings_database):
+    root = settings.build_settings_page(FakePage())
+    _field(root, "Estimate naming template").value = "{task_no}_{unknown}"
+
+    _button(root, "Save estimate naming").on_click(None)
+
+    assert settings_service.get_estimate_naming() == (
+        settings_service.DEFAULT_ESTIMATE_NAMING
+    )
+    assert any(
+        "Unknown naming token" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
 def test_log_settings_save_and_open_folder(settings_database, monkeypatch, tmp_path):
     folder = tmp_path / "logs"
     folder.mkdir()

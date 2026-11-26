@@ -8,6 +8,9 @@ through ``services.settings_service`` and, for the database choice,
 
 v0.2.27: the backup category opens the backup folder and shows the real
 last-backup age; the logs category configures the file/crash logger.
+v0.2.29: the valuation-estimate category can require any combination of task
+number, waseeka name, registry area, and client instead of assuming a client
+link is mandatory.
 
 It also exposes the database-connection editor (``build_database_section``):
 the user can point the running application at SQLite, PostgreSQL,
@@ -48,8 +51,11 @@ from services.settings_service import (
     CARD_COLOR_LABELS,
     CARD_HEADING_FIELDS,
     DEFAULT_CARD_APPEARANCE,
+    DEFAULT_ESTIMATE_NAMING,
     DEFAULT_VALUATION_REPORT_OPTIONS,
     DEFAULT_VALUATION_TABLE_TEMPLATE,
+    ESTIMATE_NAME_PRESETS,
+    ESTIMATE_REQUIRED_IDENTITY_FIELDS,
     FORMULA_FIELDS,
     REPORT_CHARGE_COLUMN_LABELS,
     REPORT_COMPARISON_COLUMN_LABELS,
@@ -58,9 +64,11 @@ from services.settings_service import (
     VALUATION_TABLE_TEMPLATES,
     format_card_body_lines,
     format_card_heading,
+    format_estimate_template,
     get_card_appearance,
     get_card_fields,
     get_default_file_location,
+    get_estimate_naming,
     get_valuation_report_options,
     get_valuation_table_template,
     normalize_card_appearance,
@@ -68,11 +76,13 @@ from services.settings_service import (
     normalize_valuation_report_options,
     reset_card_appearance,
     reset_card_fields,
+    reset_estimate_naming,
     reset_valuation_report_options,
     reset_valuation_table_template,
     set_card_appearance,
     set_card_fields,
     set_default_file_location,
+    set_estimate_naming,
     set_valuation_report_options,
     set_valuation_table_template,
 )
@@ -1667,6 +1677,189 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     )
     apply_report_to_controls(saved_template["id"], saved_report)
 
+    # v0.2.28: strict/reporting mode and configurable estimate names. v0.2.29
+    # adds selectable required identity fields. This is an additive app_settings
+    # key; old databases keep their saved policy instead of gaining new rules.
+    saved_naming = get_estimate_naming()
+    naming_status = ft.Text("", size=12, color="#475569", selectable=True)
+    naming_preview = ft.Text(
+        "", size=12, color="#334155", selectable=True,
+        data="estimate_naming_preview",
+    )
+    strict_checkbox = ft.Checkbox(
+        label="Strict reporting mode — require the selected fields before saving",
+        value=bool(saved_naming["strict_mode"]),
+        data="naming_strict_mode",
+    )
+    auto_task_checkbox = ft.Checkbox(
+        label="Generate a task number when the field is left blank",
+        value=bool(saved_naming["auto_task_no"]),
+        data="naming_auto_task_no",
+    )
+    required_identity_checkboxes = {
+        field: ft.Checkbox(
+            label=label,
+            value=field in saved_naming["required_identity_fields"],
+            data=f"naming_required_{field}",
+        )
+        for field, label in ESTIMATE_REQUIRED_IDENTITY_FIELDS.items()
+    }
+    naming_preset_dropdown = ft.Dropdown(
+        label="Estimate name preset",
+        value=saved_naming["preset"],
+        width=300,
+        options=[
+            ft.dropdown.Option(preset_id, text=preset["label"])
+            for preset_id, preset in ESTIMATE_NAME_PRESETS.items()
+        ],
+    )
+    naming_template_field = ft.TextField(
+        label="Estimate naming template",
+        value=saved_naming["template"],
+        hint_text="{task_no}_{date}_{time}",
+        width=420,
+        data="estimate_naming_template",
+    )
+    naming_custom_field = ft.TextField(
+        label="Custom naming text",
+        value=saved_naming["custom_text"],
+        hint_text="Used when the template contains {custom}",
+        width=320,
+        data="estimate_naming_custom_text",
+    )
+
+    def update_naming_preview(_=None) -> None:
+        """Render the template with harmless sample tokens."""
+        template = str(naming_template_field.value or "")
+        try:
+            preview = format_estimate_template(template, {
+                "task_no": "1234/26",
+                "date": "2026-11-27",
+                "time": "14-30-00",
+                "datetime": "2026-11-27_14-30-00",
+                "custom": str(naming_custom_field.value or "Deed"),
+                "waseeka": "Sample deed",
+                "registry_area": "Sample area",
+            })
+        except SettingsError as exc:
+            naming_preview.value = f"Preview unavailable: {exc}"
+            naming_preview.color = "#B91C1C"
+        else:
+            naming_preview.value = f"Preview: {preview}.pdf"
+            naming_preview.color = "#334155"
+        page.update()
+
+    naming_template_field.on_change = update_naming_preview
+    naming_custom_field.on_change = update_naming_preview
+
+    def apply_naming_to_controls(values: dict) -> None:
+        strict_checkbox.value = bool(values.get("strict_mode"))
+        auto_task_checkbox.value = bool(values.get("auto_task_no"))
+        required = set(values.get("required_identity_fields") or [])
+        for field, checkbox in required_identity_checkboxes.items():
+            checkbox.value = field in required
+        naming_preset_dropdown.value = (
+            values.get("preset") if values.get("preset") in ESTIMATE_NAME_PRESETS
+            else DEFAULT_ESTIMATE_NAMING["preset"]
+        )
+        naming_template_field.value = values.get("template") or ""
+        naming_custom_field.value = values.get("custom_text") or ""
+        update_naming_preview()
+
+    def choose_naming_preset(_=None) -> None:
+        preset = ESTIMATE_NAME_PRESETS.get(str(naming_preset_dropdown.value))
+        if preset:
+            naming_template_field.value = preset["template"]
+            update_naming_preview()
+
+    naming_preset_dropdown.on_change = choose_naming_preset
+
+    def current_naming_values() -> dict:
+        return {
+            "strict_mode": bool(strict_checkbox.value),
+            "auto_task_no": bool(auto_task_checkbox.value),
+            "required_identity_fields": [
+                field
+                for field, checkbox in required_identity_checkboxes.items()
+                if checkbox.value
+            ],
+            "preset": str(naming_preset_dropdown.value or ""),
+            "template": str(naming_template_field.value or ""),
+            "custom_text": str(naming_custom_field.value or ""),
+        }
+
+    def save_naming_settings(_=None) -> None:
+        values = current_naming_values()
+        try:
+            saved = set_estimate_naming(values)
+        except SettingsError as exc:
+            naming_status.value = str(exc)
+            naming_status.color = "#B91C1C"
+        except Exception as exc:
+            naming_status.value = f"Could not save estimate naming: {exc}"
+            naming_status.color = "#B91C1C"
+        else:
+            apply_naming_to_controls(saved)
+            naming_status.value = (
+                "Estimate naming saved. New estimates use this template; saved "
+                "estimates keep the name they were saved with."
+            )
+            naming_status.color = "#15803D"
+        page.update()
+
+    def reset_naming_settings(_=None) -> None:
+        try:
+            defaults = reset_estimate_naming()
+        except Exception as exc:
+            naming_status.value = f"Could not reset estimate naming: {exc}"
+            naming_status.color = "#B91C1C"
+        else:
+            apply_naming_to_controls(defaults)
+            naming_status.value = "Estimate naming reset to the built-in defaults."
+            naming_status.color = "#15803D"
+        page.update()
+
+    naming_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Choose how each new estimate is identified. Strict mode checks "
+                "the fields selected below before saving; automatic numbering "
+                "fills a blank task number instead of blocking the save. Client "
+                "is optional unless selected. A saved estimate's name never "
+                "changes when these settings change.",
+                size=12, color="#64748B",
+            ),
+            _report_checkbox_rows(
+                {"strict": strict_checkbox, "auto": auto_task_checkbox}, group_size=1
+            ),
+            ft.Text("Require before saving (when strict mode is on)",
+                    size=12, weight=ft.FontWeight.W_500, color="#334155"),
+            _report_checkbox_rows(required_identity_checkboxes, group_size=2),
+            naming_preset_dropdown,
+            naming_template_field,
+            naming_custom_field,
+            ft.Text(
+                "Supported tokens: {task_no}, {date}, {time}, {datetime}, "
+                "{custom}, {waseeka}, {registry_area}. "
+                "Combine any of them; unsafe filename characters are replaced.",
+                size=11, color="#64748B", selectable=True,
+            ),
+            naming_preview,
+            ft.Row(
+                controls=[
+                    ft.Button("Save estimate naming", on_click=save_naming_settings),
+                    ft.OutlinedButton(
+                        "Reset estimate naming", on_click=reset_naming_settings
+                    ),
+                ],
+                spacing=8, wrap=True,
+            ),
+            naming_status,
+        ],
+        spacing=10, tight=True,
+    )
+    apply_naming_to_controls(saved_naming)
+
     guide_card = ft.Column(
         controls=[
             ft.Text(
@@ -1793,6 +1986,12 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Table style, PDF/print sections, charge columns, and "
                 "fee-comparison columns. Saved separately from calculations.",
                 report_card,
+            ),
+            _category_tile(
+                "Valuation estimates — task numbers and naming",
+                "Strict reporting mode, automatic task numbers, and token-based "
+                "estimate names using task, date, time, waseeka, and registry area.",
+                naming_card,
             ),
             _category_tile(
                 "Custom registry formulas — user guide",

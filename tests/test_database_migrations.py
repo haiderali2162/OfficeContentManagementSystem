@@ -85,6 +85,57 @@ def test_legacy_location_table_gets_mauza_column_additively(tmp_path):
         engine.dispose()
 
 
+def test_legacy_estimates_get_identity_columns_and_snapshot_backfill(tmp_path):
+    """v0.2.26 estimate rows recover task/waseeka/area without rewriting data."""
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'legacy_estimates.sqlite3').as_posix()}"
+    )
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE valuation_estimates ("
+                "id INTEGER PRIMARY KEY, "
+                "input_snapshot_json TEXT NOT NULL, "
+                "location_snapshot_json TEXT)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO valuation_estimates "
+                "(id, input_snapshot_json, location_snapshot_json) VALUES "
+                "(1, '{\"task_no\": \"T-9/26\", \"waseeka_name\": \"Old deed\"}', "
+                "'{\"property_area\": \"Zone B\"}')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO valuation_estimates "
+                "(id, input_snapshot_json, location_snapshot_json) VALUES "
+                "(2, '{}', NULL)"
+            )
+
+        migrate_valuation_columns(engine)
+        # Idempotence is required: startup runs this on every launch.
+        migrate_valuation_columns(engine)
+
+        columns = {
+            item["name"]
+            for item in inspect(engine).get_columns("valuation_estimates")
+        }
+        assert {
+            "task_no", "estimate_name", "waseeka_name", "registry_area",
+            "naming_snapshot_json",
+        } <= columns
+        with engine.connect() as connection:
+            rows = connection.exec_driver_sql(
+                "SELECT task_no, waseeka_name, registry_area "
+                "FROM valuation_estimates ORDER BY id"
+            ).all()
+            assert rows[0] == ("T-9/26", "Old deed", "Zone B")
+            assert rows[1] == (None, None, None)
+        assert "ix_estimate_task_no" in {
+            index["name"] for index in inspect(engine).get_indexes("valuation_estimates")
+        }
+    finally:
+        engine.dispose()
+
+
 def test_khewat_rhz_migration_preserves_rows_and_allows_new_year_versions(tmp_path):
     database_path = tmp_path / "legacy_khewats.sqlite3"
     engine = create_engine(f"sqlite:///{database_path.as_posix()}")
