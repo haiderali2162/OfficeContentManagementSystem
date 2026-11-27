@@ -9,7 +9,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.database import Base
-from services import backup_service, logging_service, settings_service
+from services import (
+    backup_service,
+    logging_service,
+    settings_service,
+    setup_warning_service,
+)
 from ui.pages import settings
 
 
@@ -52,6 +57,11 @@ def settings_database(tmp_path, monkeypatch):
         bind=engine, autoflush=False, expire_on_commit=False
     )
     monkeypatch.setattr(settings_service, "SessionLocal", isolated_sessions)
+    # v0.2.30: the warning card reads the same temporary database during page
+    # construction; never let it touch the live office database.
+    monkeypatch.setattr(
+        setup_warning_service, "SessionLocal", isolated_sessions
+    )
     try:
         yield isolated_sessions
     finally:
@@ -572,3 +582,72 @@ def test_log_settings_save_and_open_folder(settings_database, monkeypatch, tmp_p
         "Opened log folder" in (control.value or "")
         for control in _walk(root) if isinstance(control, ft.Text)
     )
+
+
+def test_warning_settings_category_saves_toggles_and_ignored_code(
+    settings_database
+):
+    root = settings.build_settings_page(FakePage())
+    titles = [
+        control.title.value
+        for control in _walk(root)
+        if isinstance(control, ft.ExpansionTile)
+    ]
+    assert "Warnings — missing data and setup checks" in titles
+
+    _checkbox_by_data(root, "warning_show_info").value = False
+    _checkbox_by_data(root, "warning_check_clients").value = False
+    _checkbox_by_data(root, "warning_ignore_no_clients").value = True
+
+    _button(root, "Save warning settings").on_click(None)
+
+    saved = settings_service.get_setup_warning_settings()
+    assert saved["enabled"] is True
+    assert saved["show_info"] is False
+    assert saved["checks"]["clients"] is False
+    assert saved["ignored_codes"] == ["no_clients"]
+    assert any(
+        "Warning settings saved" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_warning_settings_reset_restores_all_checks(settings_database):
+    settings_service.set_setup_warning_settings({
+        "enabled": False,
+        "show_info": False,
+        "checks": {
+            key: False for key in settings_service.SETUP_WARNING_CHECK_LABELS
+        },
+        "ignored_codes": ["no_clients", "no_dc_rates"],
+    })
+    root = settings.build_settings_page(FakePage())
+
+    _button(root, "Reset warning settings").on_click(None)
+
+    assert settings_service.get_setup_warning_settings() == (
+        settings_service.DEFAULT_SETUP_WARNING_SETTINGS
+    )
+    assert _checkbox_by_data(root, "warning_enabled").value is True
+    assert _checkbox_by_data(root, "warning_show_info").value is True
+    assert _checkbox_by_data(root, "warning_check_clients").value is True
+    assert _checkbox_by_data(root, "warning_ignore_no_clients").value is False
+    assert any(
+        "Warning settings reset" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_hidden_warning_remains_reviewable_in_settings(settings_database):
+    settings_service.set_setup_warning_settings({
+        "enabled": False,
+        "ignored_codes": ["no_dc_rates"],
+    })
+    root = settings.build_settings_page(FakePage())
+
+    assert any(
+        "No DC schedule rates" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+    assert _checkbox_by_data(root, "warning_ignore_no_dc_rates").value is True
+    assert setup_warning_service.visible_setup_warnings() == []

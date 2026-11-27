@@ -20,8 +20,9 @@ v0.2.28 adds ``valuation.estimate_naming`` (strict task-number mode, automatic
 task-number fallback, and token-based estimate names). v0.2.29 keeps that key
 but replaces the hard-coded client requirement with a configurable
 ``required_identity_fields`` list (task no., waseeka name, registry area,
-client). All groups use the existing ``app_settings`` JSON table; no new table
-or column is involved.
+client). v0.2.30 adds ``warnings.settings`` (app-wide setup warning toggles,
+suppressed codes, and severity choice). All groups use the existing
+``app_settings`` JSON table; no new table or column is involved.
 """
 
 from __future__ import annotations
@@ -53,6 +54,42 @@ CADASTRAL_STORAGE_MODES = ("ranges", "individual")
 DEFAULT_CADASTRAL_STORAGE = "individual"
 
 FILE_LOCATION_KEY = "files.default_location"
+
+# v0.2.30: one additive app_settings key controls the app-wide setup warning
+# system. Stable codes are used for suppression so wording changes cannot
+# accidentally re-enable a warning the user deliberately ignored.
+SETUP_WARNINGS_KEY = "warnings.settings"
+SETUP_WARNING_CHECK_LABELS = {
+    "database": "Database read checks",
+    "clients": "Missing clients",
+    "dc_rates": "Missing DC schedule rates",
+    "fbr_rates": "Missing FBR schedule rates",
+    "tax_rules": "Missing tax and fee rules",
+    "registry_formulas": "Missing registry fee formulas",
+    "default_folder": "Missing default export folder",
+    "backups": "Backup readiness",
+    "verification": "Unverified rates, rules, and formulas",
+}
+SETUP_WARNING_CODES = frozenset({
+    "database_read_failed",
+    "no_clients",
+    "no_dc_rates",
+    "no_fbr_rates",
+    "no_tax_rules",
+    "no_registry_formulas",
+    "no_default_folder",
+    "backups_disabled",
+    "backup_folder_missing",
+    "unverified_dc_rates",
+    "unverified_tax_rules",
+    "unverified_registry_formulas",
+})
+DEFAULT_SETUP_WARNING_SETTINGS = {
+    "enabled": True,
+    "show_info": True,
+    "checks": {key: True for key in SETUP_WARNING_CHECK_LABELS},
+    "ignored_codes": [],
+}
 
 CARD_APPEARANCE_KEY = "dc_rates.card_appearance"
 DEFAULT_CARD_APPEARANCE = {
@@ -210,6 +247,92 @@ def set_default_file_location(path: Any) -> str:
     normalized = normalize_directory_path(path)
     set_setting(FILE_LOCATION_KEY, normalized)
     return normalized
+
+
+def normalize_setup_warning_settings(values: Any) -> dict[str, Any]:
+    """Validate and complete the v0.2.30 app-wide warning preferences.
+
+    Unknown check names or warning codes are rejected instead of being ignored:
+    a typo in Settings should be visible, not silently leave a check disabled
+    forever. Codes are stored in a canonical order for stable comparisons.
+    """
+    if values is None:
+        values = {}
+    if not isinstance(values, dict):
+        raise SettingsError("Warning settings must be a mapping.")
+
+    checks_input = values.get("checks", {})
+    if not isinstance(checks_input, dict):
+        raise SettingsError("Warning checks must be a mapping.")
+    unknown_checks = set(checks_input) - set(SETUP_WARNING_CHECK_LABELS)
+    if unknown_checks:
+        supported = ", ".join(sorted(SETUP_WARNING_CHECK_LABELS))
+        raise SettingsError(
+            f"Unsupported warning check '{sorted(unknown_checks)[0]}'. Use one of: {supported}."
+        )
+    checks = {
+        key: bool(checks_input.get(key, DEFAULT_SETUP_WARNING_SETTINGS["checks"][key]))
+        for key in SETUP_WARNING_CHECK_LABELS
+    }
+
+    codes_input = values.get("ignored_codes", [])
+    if isinstance(codes_input, (str, bytes)) or not isinstance(
+        codes_input, (list, tuple, set)
+    ):
+        raise SettingsError("Ignored warning codes must be a list.")
+    seen_codes: list[str] = []
+    for item in codes_input:
+        code = str(item).strip()
+        if code not in SETUP_WARNING_CODES:
+            supported = ", ".join(sorted(SETUP_WARNING_CODES))
+            raise SettingsError(
+                f"Unsupported warning code '{code}'. Use one of: {supported}."
+            )
+        if code not in seen_codes:
+            seen_codes.append(code)
+    ignored_codes = sorted(seen_codes)
+
+    return {
+        "enabled": bool(values.get("enabled", DEFAULT_SETUP_WARNING_SETTINGS["enabled"])),
+        "show_info": bool(
+            values.get("show_info", DEFAULT_SETUP_WARNING_SETTINGS["show_info"])
+        ),
+        "checks": checks,
+        "ignored_codes": ignored_codes,
+    }
+
+
+def get_setup_warning_settings() -> dict[str, Any]:
+    """Return saved warning preferences with defensive defaults."""
+    stored = get_setting(SETUP_WARNINGS_KEY, None)
+    try:
+        return normalize_setup_warning_settings(stored)
+    except SettingsError:
+        return {
+            "enabled": DEFAULT_SETUP_WARNING_SETTINGS["enabled"],
+            "show_info": DEFAULT_SETUP_WARNING_SETTINGS["show_info"],
+            "checks": dict(DEFAULT_SETUP_WARNING_SETTINGS["checks"]),
+            "ignored_codes": list(DEFAULT_SETUP_WARNING_SETTINGS["ignored_codes"]),
+        }
+
+
+def set_setup_warning_settings(values: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist app-wide warning preferences."""
+    normalized = normalize_setup_warning_settings(values)
+    set_setting(SETUP_WARNINGS_KEY, normalized)
+    return normalized
+
+
+def reset_setup_warning_settings() -> dict[str, Any]:
+    """Restore the built-in warning preferences."""
+    defaults = {
+        "enabled": DEFAULT_SETUP_WARNING_SETTINGS["enabled"],
+        "show_info": DEFAULT_SETUP_WARNING_SETTINGS["show_info"],
+        "checks": dict(DEFAULT_SETUP_WARNING_SETTINGS["checks"]),
+        "ignored_codes": list(DEFAULT_SETUP_WARNING_SETTINGS["ignored_codes"]),
+    }
+    set_setting(SETUP_WARNINGS_KEY, defaults)
+    return defaults
 
 
 def _normalize_heading_template(template: Any) -> str:

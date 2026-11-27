@@ -11,6 +11,8 @@ last-backup age; the logs category configures the file/crash logger.
 v0.2.29: the valuation-estimate category can require any combination of task
 number, waseeka name, registry area, and client instead of assuming a client
 link is mandatory.
+v0.2.30: the warning category configures the app-wide missing-data/setup
+banner, its checks, and suppressed warning codes.
 
 It also exposes the database-connection editor (``build_database_section``):
 the user can point the running application at SQLite, PostgreSQL,
@@ -44,7 +46,7 @@ from services.backup_service import (
     restore_backup,
     save_backup_settings,
 )
-from services import logging_service
+from services import logging_service, setup_warning_service
 from services.settings_service import (
     CARD_BODY_FIELD_LABELS,
     CARD_COLOR_FIELDS,
@@ -57,6 +59,7 @@ from services.settings_service import (
     ESTIMATE_NAME_PRESETS,
     ESTIMATE_REQUIRED_IDENTITY_FIELDS,
     FORMULA_FIELDS,
+    SETUP_WARNING_CHECK_LABELS,
     REPORT_CHARGE_COLUMN_LABELS,
     REPORT_COMPARISON_COLUMN_LABELS,
     REPORT_SECTION_LABELS,
@@ -69,6 +72,7 @@ from services.settings_service import (
     get_card_fields,
     get_default_file_location,
     get_estimate_naming,
+    get_setup_warning_settings,
     get_valuation_report_options,
     get_valuation_table_template,
     normalize_card_appearance,
@@ -77,12 +81,14 @@ from services.settings_service import (
     reset_card_appearance,
     reset_card_fields,
     reset_estimate_naming,
+    reset_setup_warning_settings,
     reset_valuation_report_options,
     reset_valuation_table_template,
     set_card_appearance,
     set_card_fields,
     set_default_file_location,
     set_estimate_naming,
+    set_setup_warning_settings,
     set_valuation_report_options,
     set_valuation_table_template,
 )
@@ -545,6 +551,7 @@ def build_settings_page(page: ft.Page) -> ft.Control:
 
     * **Database** — backend choice and live connection (open by default).
     * **Files** — the default import/export folder preference.
+    * **Warnings** — app-wide missing-data/setup checks and suppressions.
     * **Rate cards — appearance** — heading template and colours.
     * **Rate cards — shown fields and formulas** — card content editor.
     * **Valuation reports** — table template, PDF/print sections, and columns.
@@ -1860,6 +1867,140 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     )
     apply_naming_to_controls(saved_naming)
 
+    # v0.2.30: app-wide missing-data/setup warnings. The current warnings are
+    # read-only; only the ignore boxes and the check switches are editable.
+    saved_warnings = get_setup_warning_settings()
+    warning_status = ft.Text(
+        "", size=12, color="#475569", selectable=True,
+        data="warning_settings_status",
+    )
+    warning_enabled = ft.Checkbox(
+        label="Enable app-wide setup warnings",
+        value=bool(saved_warnings["enabled"]),
+        data="warning_enabled",
+    )
+    warning_show_info = ft.Checkbox(
+        label="Show informational setup tips (not only warnings)",
+        value=bool(saved_warnings["show_info"]),
+        data="warning_show_info",
+    )
+    warning_checkboxes = {
+        key: ft.Checkbox(
+            label=label,
+            value=bool(saved_warnings["checks"][key]),
+            data=f"warning_check_{key}",
+        )
+        for key, label in SETUP_WARNING_CHECK_LABELS.items()
+    }
+    current_warnings = setup_warning_service.collect_setup_warnings()
+    warning_ignore_checkboxes: dict[str, ft.Checkbox] = {}
+    warning_rows: list[ft.Control] = []
+    for item in current_warnings:
+        code = item["code"]
+        ignore_box = ft.Checkbox(
+            label="Ignore this warning",
+            value=bool(item["ignored"]),
+            data=f"warning_ignore_{code}",
+        )
+        warning_ignore_checkboxes[code] = ignore_box
+        colour = "#9A3412" if item["severity"] == "warning" else "#334155"
+        warning_rows.append(ft.Container(
+            bgcolor="#FFFBEB" if item["severity"] == "warning" else "#F8FAFC",
+            border=ft.Border.all(1, "#FDE68A" if item["severity"] == "warning" else "#E2E8F0"),
+            border_radius=8,
+            padding=10,
+            content=ft.Column(
+                controls=[
+                    ft.Text(
+                        f"{item['severity'].upper()} · {item['title']}",
+                        size=12, weight=ft.FontWeight.BOLD, color=colour,
+                    ),
+                    ft.Text(item["message"], size=12, color=colour, selectable=True),
+                    ft.Text(f"Fix: {item['fix']}", size=11, color="#64748B", selectable=True),
+                    ignore_box,
+                ],
+                spacing=4,
+                tight=True,
+            ),
+        ))
+    if not warning_rows:
+        warning_rows.append(ft.Text(
+            "No setup warnings detected in the active database.",
+            size=12, color="#166534",
+        ))
+
+    def apply_warning_controls(values: dict) -> None:
+        warning_enabled.value = bool(values["enabled"])
+        warning_show_info.value = bool(values["show_info"])
+        for key, checkbox in warning_checkboxes.items():
+            checkbox.value = bool(values["checks"][key])
+        ignored = set(values["ignored_codes"])
+        for code, checkbox in warning_ignore_checkboxes.items():
+            checkbox.value = code in ignored
+
+    def save_warning_settings(_) -> None:
+        try:
+            saved = set_setup_warning_settings({
+                "enabled": bool(warning_enabled.value),
+                "show_info": bool(warning_show_info.value),
+                "checks": {
+                    key: bool(checkbox.value)
+                    for key, checkbox in warning_checkboxes.items()
+                },
+                "ignored_codes": [
+                    code for code, checkbox in warning_ignore_checkboxes.items()
+                    if checkbox.value
+                ],
+            })
+            warning_status.value = (
+                "Warning settings saved. The banner refreshes after the next "
+                f"page change; {len(saved['ignored_codes'])} warning code(s) ignored."
+            )
+            warning_status.color = "#15803D"
+        except SettingsError as exc:
+            warning_status.value = str(exc)
+            warning_status.color = "#B91C1C"
+        page.update()
+
+    def reset_warning_settings(_) -> None:
+        defaults = reset_setup_warning_settings()
+        apply_warning_controls(defaults)
+        warning_status.value = (
+            "Warning settings reset: all checks on, informational tips shown."
+        )
+        warning_status.color = "#15803D"
+        page.update()
+
+    warning_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Choose which missing-data and setup checks appear in the "
+                "app-wide banner. Unverified rates, rules, and formulas are "
+                "always described as estimates; no check supplies an official "
+                "rate or legal conclusion.",
+                size=12, color="#64748B",
+            ),
+            warning_enabled,
+            warning_show_info,
+            ft.Text("Checks", size=12, weight=ft.FontWeight.W_500, color="#334155"),
+            ft.Row(controls=list(warning_checkboxes.values()), wrap=True, spacing=12),
+            ft.Text("Current warnings", size=12, weight=ft.FontWeight.W_500, color="#334155"),
+            *warning_rows,
+            ft.Row(
+                controls=[
+                    ft.Button("Save warning settings", on_click=save_warning_settings),
+                    ft.OutlinedButton(
+                        "Reset warning settings", on_click=reset_warning_settings
+                    ),
+                ],
+                wrap=True, spacing=8,
+            ),
+            warning_status,
+        ],
+        spacing=10, tight=True,
+    )
+    apply_warning_controls(saved_warnings)
+
     guide_card = ft.Column(
         controls=[
             ft.Text(
@@ -1968,6 +2109,12 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Rotating error log, automatic crash reports, folder choice, "
                 "and a button to open the active log folder.",
                 log_card,
+            ),
+            _category_tile(
+                "Warnings — missing data and setup checks",
+                "Choose which app-wide warnings appear, review current "
+                "missing-data/setup findings, and ignore stable warning codes.",
+                warning_card,
             ),
             _category_tile(
                 "Rate cards — appearance",

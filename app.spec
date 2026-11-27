@@ -71,6 +71,8 @@ first_party_modules = [
     "services.registry_fee_service",
     "services.schedule_lookup_service",
     "services.settings_service",
+    # v0.2.30: app-wide setup warning collector used by the shell/Settings.
+    "services.setup_warning_service",
     "services.tax_service",
     "services.valuation_report_service",
     "services.valuation_service",

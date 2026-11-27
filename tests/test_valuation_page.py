@@ -162,6 +162,8 @@ def test_app_shell_hides_shared_header_only_on_rates_tab(monkeypatch):
     monkeypatch.setattr(valuation, "list_registry_fee_custom_fields", lambda: [])
     monkeypatch.setattr(dc_rates, "list_location_picker", lambda **_: {"locations": [], "qanoongoi": [], "has_more": False})
     monkeypatch.setattr(dc_rates, "list_dc_rates", lambda **_kwargs: [])
+    # The v0.2.30 global banner must not query the live office DB in this test.
+    monkeypatch.setattr("ui.app_shell.visible_setup_warnings", lambda: [])
 
     page = FakePage()
     page.add = lambda control: page.controls.append(control)
@@ -175,8 +177,15 @@ def test_app_shell_hides_shared_header_only_on_rates_tab(monkeypatch):
 
     layout = page.controls[0]
     main_column = layout.controls[1].content
-    shared_header = main_column.controls[0]
-    valuation_root = main_column.controls[1].content
+    shared_header = next(
+        control for control in walk_controls(main_column)
+        if getattr(control, "data", None) == "shell_topbar"
+    )
+    page_container = next(
+        control for control in walk_controls(main_column)
+        if getattr(control, "data", None) == "shell_page_content"
+    )
+    valuation_root = page_container.content
     tabs = valuation_root.controls[2]
 
     tabs.on_change(SimpleNamespace(control=SimpleNamespace(selected_index=2)))

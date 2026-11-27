@@ -1,10 +1,17 @@
+"""Application shell: sidebar, shared header, and app-wide setup warnings.
+
+v0.2.30 adds a compact warning banner above the selected page. It comes from
+``services.setup_warning_service`` and is deliberately read-only: page-level
+warnings and calculation warnings remain where they are, while this banner
+answers "what is missing in the active setup?" from every tab.
+"""
 
 import flet as ft
 
 from core.config import APP_NAME, APP_VERSION
+from services.setup_warning_service import visible_setup_warnings
 from ui.navigation import NavigationItem, build_navigation
 from ui.pages.valuation import build_valuation_page
-
 
 
 class AppShell:
@@ -133,6 +140,7 @@ class AppShell:
 
     def build_topbar(self, item: NavigationItem) -> ft.Control:
         return ft.Container(
+            data="shell_topbar",
             content=ft.Row(
                 controls=[
                     ft.Column(
@@ -170,6 +178,53 @@ class AppShell:
             bgcolor="#FFFFFF",
         )
 
+    def build_warning_banner(self) -> ft.Control | None:
+        """Build the v0.2.30 setup warning banner, or ``None`` when clear.
+
+        Only the first two warnings are named inline; the count keeps the
+        banner short. Settings shows every warning with its fix and an option
+        to ignore a stable warning code.
+        """
+        warnings = visible_setup_warnings()
+        if not warnings:
+            return None
+        warning_count = len(warnings)
+        has_warning = any(item["severity"] == "warning" for item in warnings)
+        colour = "#9A3412" if has_warning else "#334155"
+        titles = "; ".join(item["title"] for item in warnings[:2])
+        if warning_count > 2:
+            titles += f"; +{warning_count - 2} more"
+        return ft.Container(
+            data="setup_warning_banner",
+            bgcolor="#FFFBEB" if has_warning else "#F1F5F9",
+            border=ft.Border.all(1, "#FDE68A" if has_warning else "#CBD5E1"),
+            border_radius=9,
+            padding=ft.Padding(left=18, right=18, top=11, bottom=11),
+            content=ft.Row(
+                controls=[
+                    ft.Column(
+                        controls=[
+                            ft.Text(
+                                f"Setup check: {warning_count} item(s) need attention",
+                                size=12,
+                                weight=ft.FontWeight.BOLD,
+                                color=colour,
+                            ),
+                            ft.Text(titles, size=12, color=colour, selectable=True),
+                        ],
+                        spacing=3,
+                        expand=True,
+                    ),
+                    ft.TextButton(
+                        "Review in Settings",
+                        on_click=lambda _: self.navigate("settings"),
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+
     def render(self) -> None:
         item = self.get_current_item()
         topbar = self.build_topbar(item)
@@ -189,15 +244,22 @@ class AppShell:
 
         # Building the selected page runs its initial data query; the completed
         # layout is attached to Page and sent to the Flet client below.
+        # v0.2.30: the warning banner is a sibling of the shared header, so
+        # page-level control trees keep their own structure.
+        content_controls: list[ft.Control] = [topbar]
+        banner = self.build_warning_banner()
+        if banner is not None:
+            content_controls.append(banner)
+        content_controls.append(
+            ft.Container(
+                data="shell_page_content",
+                content=page_content,
+                padding=26,
+                expand=True,
+            )
+        )
         content = ft.Column(
-            controls=[
-                topbar,
-                ft.Container(
-                    content=page_content,
-                    padding=26,
-                    expand=True,
-                ),
-            ],
+            controls=content_controls,
             spacing=0,
             expand=True,
         )

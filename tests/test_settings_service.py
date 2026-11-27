@@ -515,3 +515,74 @@ def test_format_estimate_template_sanitizes_path_characters():
         },
     )
     assert rendered == "Deed-2026_12-26_2026-11-27"
+
+
+# --------------------------------------------------------------------------
+# App-wide setup warning preferences (v0.2.30).
+# --------------------------------------------------------------------------
+
+def test_setup_warning_settings_defaults_round_trips_and_resets(
+    settings_database
+):
+    assert settings_service.get_setup_warning_settings() == (
+        settings_service.DEFAULT_SETUP_WARNING_SETTINGS
+    )
+
+    saved = settings_service.set_setup_warning_settings({
+        "enabled": False,
+        "show_info": False,
+        "checks": {"clients": False, "backups": True},
+        "ignored_codes": ["no_clients", "no_dc_rates", "no_clients"],
+    })
+    expected_checks = dict(
+        settings_service.DEFAULT_SETUP_WARNING_SETTINGS["checks"]
+    )
+    expected_checks["clients"] = False
+    assert saved == {
+        "enabled": False,
+        "show_info": False,
+        "checks": expected_checks,
+        "ignored_codes": ["no_clients", "no_dc_rates"],
+    }
+    assert settings_service.get_setup_warning_settings() == saved
+
+    reset = settings_service.reset_setup_warning_settings()
+    assert reset == settings_service.DEFAULT_SETUP_WARNING_SETTINGS
+
+
+def test_setup_warning_settings_reject_unknown_checks_and_codes(
+    settings_database
+):
+    with pytest.raises(
+        settings_service.SettingsError, match="Unsupported warning check"
+    ):
+        settings_service.set_setup_warning_settings({
+            "checks": {"not_a_check": True},
+        })
+    with pytest.raises(
+        settings_service.SettingsError, match="Unsupported warning code"
+    ):
+        settings_service.set_setup_warning_settings({
+            "ignored_codes": ["not_a_code"],
+        })
+    with pytest.raises(
+        settings_service.SettingsError, match="must be a list"
+    ):
+        settings_service.set_setup_warning_settings({
+            "ignored_codes": "no_clients",
+        })
+    assert settings_service.get_setup_warning_settings() == (
+        settings_service.DEFAULT_SETUP_WARNING_SETTINGS
+    )
+
+
+def test_invalid_stored_warning_settings_fall_back_to_defaults(
+    settings_database
+):
+    settings_service.set_setting(settings_service.SETUP_WARNINGS_KEY, {
+        "checks": {"unknown_check": False},
+    })
+
+    assert settings_service.get_setup_warning_settings() == (
+        settings_service.DEFAULT_SETUP_WARNING_SETTINGS
+    )
