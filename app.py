@@ -10,6 +10,8 @@ from core.database import (
     initialize_database,
 )
 from services.backup_service import start_backup_scheduler
+# v0.2.32: daily ATL PSID expiry/archive check (skipped unless enabled).
+from services.atl_psid_service import start_atl_psid_cleanup_scheduler
 # v0.2.27: configure file logging before database/UI work so startup failures
 # are recorded too. Crash hooks are installed for the whole process.
 from services import logging_service
@@ -54,6 +56,7 @@ def main(page: ft.Page) -> None:
     # The backup scheduler is a daemon thread checking once per minute
     # whether an automatic SQLite backup is due (Settings page controls it).
     start_backup_scheduler()
+    start_atl_psid_cleanup_scheduler()
 
     if not check_database_connection():
         app_log.error("Application database connection check failed")

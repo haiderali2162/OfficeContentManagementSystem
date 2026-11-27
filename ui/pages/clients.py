@@ -8,6 +8,15 @@ import flet as ft
 from core.config import DATABASE_PATH
 from ui.flet_compat import text_button
 
+from services.atl_psid_service import (
+    STORAGE_LABELS,
+    delete_psid,
+    get_psid,
+    list_psids,
+    open_psid_pdf,
+    save_psid,
+    save_psid_pdf,
+)
 from services.client_service import (
     ClientServiceError,
     create_asset,
@@ -414,6 +423,11 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                                 "Tax assets",
                                 on_click=lambda e, cid=client.id:
                                     open_assets(cid),
+                            ),
+                            text_button(
+                                "ATL PSIDs",
+                                on_click=lambda e, cid=client.id:
+                                    open_atl_psids(cid),
                             ),
                             text_button(
                                 "Edit",
@@ -1202,6 +1216,361 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             ],
         )
         open_dialog(page, dialog)
+
+    def _atl_picker() -> ft.FilePicker:
+        """Reuse the page's single file picker for PDF open/save operations."""
+        picker = next(
+            (service for service in page.services if isinstance(service, ft.FilePicker)),
+            None,
+        )
+        if picker is None:
+            picker = ft.FilePicker()
+            page.services.append(picker)
+        return picker
+
+    def _run_atl_task(handler) -> None:
+        """Run an async file-picker handler on the page's task runner."""
+        if hasattr(page, "run_task"):
+            page.run_task(handler)
+        else:
+            asyncio.run(handler())
+
+    def open_atl_psid_form(client_id: int, psid_id: int | None = None) -> None:
+        """Add or edit one annual ATL surcharge PSID/challan."""
+        record = get_psid(psid_id) if psid_id is not None else None
+        editing = record is not None
+        mode = record.storage_mode if record else "none"
+        saved_pdf = ""
+        if editing:
+            label = STORAGE_LABELS.get(mode, mode)
+            saved_pdf = f"Saved PDF: {label}"
+            if record.original_filename and mode != "none":
+                saved_pdf += f" · {record.original_filename}"
+            if record.expiry_processed_at:
+                saved_pdf += " (archived)"
+        else:
+            saved_pdf = "No challan PDF selected."
+
+        year_field = ft.TextField(
+            label="Financial year",
+            value=(record.financial_year if record else str(date.today().year)),
+            width=180,
+        )
+        psid_field = ft.TextField(
+            label="PSID number",
+            value=record.psid_number if record else "",
+            width=260,
+        )
+        amount_field = ft.TextField(
+            label="ATL amount (PKR, optional)",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            value=str(record.amount or "") if record else "",
+            width=210,
+        )
+        payment_date_field = ft.TextField(
+            label="Payment / challan date (YYYY-MM-DD)",
+            value=(record.payment_date.isoformat() if record and record.payment_date else ""),
+            width=250,
+        )
+        expiry_date_field = ft.TextField(
+            label="Expiry date (YYYY-MM-DD, optional)",
+            value=(record.expiry_date.isoformat() if record and record.expiry_date else ""),
+            width=260,
+        )
+        notes_field = ft.TextField(
+            label="Notes",
+            multiline=True,
+            value=(record.notes or "") if record else "",
+        )
+        storage_dropdown = ft.Dropdown(
+            label="Challan PDF storage",
+            value=mode if mode != "none" else "database",
+            width=240,
+            options=[
+                ft.dropdown.Option("database", "Store inside database"),
+                ft.dropdown.Option("managed_file", "Copy to app-managed folder"),
+                ft.dropdown.Option("linked_path", "Link to original file"),
+            ],
+        )
+        selected_pdf = ft.Text(saved_pdf, size=12, color="#475569", selectable=True)
+        clear_pdf_checkbox = ft.Checkbox(
+            label="Remove the currently saved PDF",
+            value=False,
+            visible=editing and mode != "none",
+        )
+        status = ft.Text("", size=12, color="#B91C1C", data="atl_psid_form_status")
+        state: dict[str, str | None] = {"pdf_path": None}
+
+        async def choose_pdf(_=None) -> None:
+            try:
+                picked = await _atl_picker().pick_files(
+                    dialog_title="Choose the ATL challan PDF",
+                    allow_multiple=False,
+                    allowed_extensions=["pdf"],
+                )
+            except Exception as exc:
+                status.value = f"Could not choose the PDF: {exc}"
+                status.color = "#B91C1C"
+            else:
+                if picked:
+                    chosen = picked[0]
+                    state["pdf_path"] = (
+                        getattr(chosen, "path", None)
+                        or getattr(chosen, "name", "")
+                        or None
+                    )
+                    if state["pdf_path"]:
+                        display = str(state["pdf_path"]).replace("\\", "/").split("/")[-1]
+                        selected_pdf.value = f"Selected: {display}"
+                        selected_pdf.color = "#15803D"
+                        clear_pdf_checkbox.value = False
+                status.value = ""
+            page.update()
+
+        def save_form(_=None) -> None:
+            # A record with no PDF can be edited without choosing one; the
+            # dropdown only matters when a saved PDF needs replacing.
+            has_saved_pdf = record is not None and record.storage_mode != "none"
+            if (
+                has_saved_pdf
+                and state["pdf_path"] is None
+                and not clear_pdf_checkbox.value
+                and storage_dropdown.value != mode
+            ):
+                status.value = (
+                    "Choose a new PDF for the selected storage option, or "
+                    "tick 'Remove the currently saved PDF'."
+                )
+                status.color = "#B91C1C"
+                page.update()
+                return
+            try:
+                save_psid(
+                    client_id=client_id,
+                    psid_id=record.id if record else None,
+                    financial_year=year_field.value or "",
+                    psid_number=psid_field.value or "",
+                    amount=amount_field.value or "",
+                    payment_date=payment_date_field.value or "",
+                    expiry_date=expiry_date_field.value or "",
+                    notes=notes_field.value or "",
+                    storage_mode=storage_dropdown.value or "database",
+                    pdf_path=state["pdf_path"],
+                    clear_pdf=bool(clear_pdf_checkbox.value),
+                )
+            except Exception as exc:
+                status.value = str(exc)
+                status.color = "#B91C1C"
+                page.update()
+                return
+            close_dialog(page, dialog)
+            open_atl_psids(client_id)
+            notify(page, "ATL PSID saved.")
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Edit ATL surcharge PSID" if editing else "Add ATL surcharge PSID"),
+            content=ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text(
+                            "Save the annual PSID after the return is submitted. "
+                            "A challan PDF is optional; choose how it should be stored."
+                        ),
+                        ft.Row(
+                            controls=[year_field, psid_field, amount_field],
+                            wrap=True, spacing=10,
+                        ),
+                        ft.Row(
+                            controls=[payment_date_field, expiry_date_field],
+                            wrap=True, spacing=10,
+                        ),
+                        storage_dropdown,
+                        notes_field,
+                        ft.Row(
+                            controls=[
+                                ft.OutlinedButton(
+                                    "Choose challan PDF",
+                                    on_click=lambda e: _run_atl_task(choose_pdf),
+                                ),
+                                selected_pdf,
+                            ],
+                            wrap=True, spacing=10,
+                        ),
+                        clear_pdf_checkbox,
+                        status,
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                    spacing=10,
+                ),
+                width=680,
+                height=590,
+            ),
+            actions=[
+                text_button("Cancel", on_click=lambda e: (
+                    close_dialog(page, dialog), open_atl_psids(client_id)
+                )),
+                ft.Button("Save PSID", on_click=save_form),
+            ],
+        )
+        open_dialog(page, dialog)
+
+    def open_atl_psids(client_id: int) -> None:
+        """Show all annual ATL PSIDs/challans for one client."""
+        rows_column = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
+        status = ft.Text("", size=12, color="#475569", data="atl_psids_status")
+        dialog_mounted = False
+
+        def refresh_rows(_=None) -> None:
+            rows_column.controls.clear()
+            records = list_psids(client_id)
+            for record in records:
+                details = [
+                    f"PSID: {record.psid_number}",
+                    f"Storage: {STORAGE_LABELS.get(record.storage_mode, record.storage_mode)}",
+                ]
+                if record.amount is not None:
+                    details.append(f"Amount: PKR {record.amount:,.2f}")
+                if record.payment_date:
+                    details.append(f"Challan date: {record.payment_date.isoformat()}")
+                if record.expiry_date:
+                    details.append(f"Expiry: {record.expiry_date.isoformat()}")
+                if record.expiry_processed_at:
+                    details.append("PDF archived; PSID details retained")
+                if record.notes:
+                    details.append(record.notes)
+
+                async def download_pdf(event=None, item=record):
+                    try:
+                        target = await _atl_picker().save_file(
+                            dialog_title="Save the ATL challan PDF",
+                            file_name=(
+                                f"atl_challan_{item.financial_year}_"
+                                f"{item.psid_number}.pdf"
+                            ),
+                            allowed_extensions=["pdf"],
+                        )
+                        if target:
+                            saved = save_psid_pdf(item.id, target)
+                            status.value = f"Challan saved to {saved}."
+                            status.color = "#15803D"
+                    except Exception as exc:
+                        status.value = f"Could not save the challan PDF: {exc}"
+                        status.color = "#B91C1C"
+                    page.update()
+
+                def ask_delete(event=None, item=record):
+                    def confirm_delete(_=None):
+                        try:
+                            delete_psid(item.id)
+                        except Exception as exc:
+                            status.value = f"Could not delete the PSID: {exc}"
+                            status.color = "#B91C1C"
+                            page.update()
+                            return
+                        close_dialog(page, confirm_dialog)
+                        refresh_rows()
+                        status.value = f"PSID {item.psid_number} deleted permanently."
+                        status.color = "#B91C1C"
+                        page.update()
+
+                    confirm_dialog = ft.AlertDialog(
+                        modal=True,
+                        title=ft.Text("Delete this PSID permanently?"),
+                        content=ft.Text(
+                            f"Financial year {item.financial_year} · PSID {item.psid_number}. "
+                            "The active PDF and record will be removed. This cannot be undone."
+                        ),
+                        actions=[
+                            text_button("Cancel", on_click=lambda e: close_dialog(page, confirm_dialog)),
+                            ft.Button("Delete permanently", on_click=confirm_delete),
+                        ],
+                    )
+                    open_dialog(page, confirm_dialog)
+
+                rows_column.controls.append(
+                    ft.Container(
+                        content=ft.Column(
+                            controls=[
+                                ft.Text(
+                                    f"{record.financial_year} · {record.psid_number}",
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text("  ·  ".join(details), size=12, color="#475569"),
+                                ft.Row(
+                                    controls=[
+                                        text_button("Edit", on_click=lambda e, item=record: (
+                                            close_dialog(page, dialog),
+                                            open_atl_psid_form(client_id, item.id),
+                                        )),
+                                        text_button("Open PDF", on_click=lambda e, item=record: (
+                                            _open_atl_pdf(item, status),
+                                            page.update(),
+                                        )),
+                                        text_button("Save PDF", on_click=lambda e, item=record: (
+                                            _run_atl_task(lambda: download_pdf(None, item))
+                                        )),
+                                        text_button("Delete", on_click=lambda e, item=record: (
+                                            ask_delete(None, item)
+                                        )),
+                                    ],
+                                    wrap=True, spacing=4,
+                                ),
+                            ],
+                            spacing=6,
+                        ),
+                        bgcolor="#F8FAFC",
+                        border=ft.Border.all(1, "#E2E8F0"),
+                        border_radius=10,
+                        padding=10,
+                    )
+                )
+            if not records:
+                rows_column.controls.append(
+                    ft.Text("No ATL PSIDs have been saved for this client yet.")
+                )
+            if dialog_mounted:
+                rows_column.update()
+
+        def _open_atl_pdf(record, status_control: ft.Text) -> None:
+            try:
+                opened = open_psid_pdf(record.id)
+            except Exception as exc:
+                status_control.value = f"Could not open the challan PDF: {exc}"
+                status_control.color = "#B91C1C"
+            else:
+                status_control.value = f"Opened {opened.name}."
+                status_control.color = "#15803D"
+
+        refresh_rows()
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("ATL surcharge PSIDs and challans"),
+            content=ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text(
+                            "Annual PSIDs are listed newest first. Open or save "
+                            "the stored challan PDF, or add the next year's PSID."
+                        ),
+                        ft.Divider(height=1, color="#E2E8F0"),
+                        rows_column,
+                        status,
+                    ],
+                    spacing=10,
+                ),
+                width=760,
+                height=540,
+            ),
+            actions=[
+                text_button("Close", on_click=lambda e: close_dialog(page, dialog)),
+                ft.Button("Add PSID", on_click=lambda e: (
+                    close_dialog(page, dialog), open_atl_psid_form(client_id)
+                )),
+            ],
+        )
+        open_dialog(page, dialog)
+        dialog_mounted = True
 
     def open_referrer_totals(e=None, *, pending_only=False):
         """Show referrer totals, optionally limiting the table to balances due."""

@@ -23,6 +23,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Application information.
 # Version history: v0.2.30 (app-wide setup warnings) -> v0.2.31
-# (configurable FBR Clients copy fields + setup warning details).
+# (configurable FBR Clients copy fields + setup warning details) -> v0.2.32
+# (per-client ATL surcharge PSIDs, optional challans, and archive/expiry).
 APP_NAME = "Land Office Manager"
-APP_VERSION = "0.2.31"
+APP_VERSION = "0.2.32"

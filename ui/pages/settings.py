@@ -1,8 +1,9 @@
 """Application settings pages.
 
 The settings page is organised into collapsible categories (Flet
-``ExpansionTile``): Database, Files, Automatic backups, Logs, Rate-card
-appearance, Rate-card content, and Valuation reports. Values are persisted
+``ExpansionTile``): Database, Files, Automatic backups, Logs, FBR Clients
+(copy fields and ATL PSID archive), Rate-card appearance, Rate-card content,
+and Valuation reports. Values are persisted
 through ``services.settings_service`` and, for the database choice,
 ``core.database_config``.
 
@@ -15,6 +16,8 @@ v0.2.30: the warning category configures the app-wide missing-data/setup
 banner, its checks, and suppressed warning codes. v0.2.31 fixes the previous
 hard-coded copy buttons (CNIC/address/password only) by adding a category for
 all built-in FBR Client fields, including the requested email and phone.
+v0.2.32 adds the ATL PSID expiry/archive category with a separate archive DB
+and PDF folder, never altering existing client records.
 
 It also exposes the database-connection editor (``build_database_section``):
 the user can point the running application at SQLite, PostgreSQL,
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import flet as ft
 
@@ -49,6 +53,12 @@ from services.backup_service import (
     save_backup_settings,
 )
 from services import logging_service, setup_warning_service
+from services.atl_psid_archive_service import (
+    AtlArchiveError,
+    archive_summary,
+    open_archive_folder,
+)
+from services.atl_psid_service import run_cleanup
 from services.settings_service import (
     CARD_BODY_FIELD_LABELS,
     CARD_COLOR_FIELDS,
@@ -71,6 +81,7 @@ from services.settings_service import (
     format_card_body_lines,
     format_card_heading,
     format_estimate_template,
+    get_atl_psid_archive_settings,
     get_card_appearance,
     get_card_fields,
     get_client_copy_fields,
@@ -82,6 +93,7 @@ from services.settings_service import (
     normalize_card_appearance,
     normalize_card_fields,
     normalize_valuation_report_options,
+    reset_atl_psid_archive_settings,
     reset_card_appearance,
     reset_card_fields,
     reset_client_copy_fields,
@@ -89,6 +101,7 @@ from services.settings_service import (
     reset_setup_warning_settings,
     reset_valuation_report_options,
     reset_valuation_table_template,
+    set_atl_psid_archive_settings,
     set_card_appearance,
     set_card_fields,
     set_client_copy_fields,
@@ -550,6 +563,172 @@ def _adopted_file_picker(page: ft.Page) -> ft.FilePicker:
     return existing_picker
 
 
+def _atl_days_value(field: ft.TextField, label: str) -> int:
+    """Convert an optional day-count field; blank means zero (disabled)."""
+    raw = str(field.value or "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SettingsError(f"{label} must be a whole number of days.") from exc
+    if value < 0:
+        raise SettingsError(f"{label} cannot be negative.")
+    return value
+
+
+def build_atl_psid_archive_section(page: ft.Page) -> ft.Column:
+    """Build the ATL PSID expiry and archive controls."""
+    saved = get_atl_psid_archive_settings()
+    enabled_checkbox = ft.Checkbox(
+        label="Enable automatic daily cleanup",
+        value=bool(saved["enabled"]),
+        data="atl_archive_enabled",
+    )
+    default_expiry_field = ft.TextField(
+        label="Default expiry age in days (0 = only per-record dates)",
+        keyboard_type=ft.KeyboardType.NUMBER,
+        value=str(saved["default_expiry_days"]),
+        width=330,
+        data="atl_archive_default_days",
+    )
+    retention_field = ft.TextField(
+        label="Keep archived PDFs for days (0 = forever)",
+        keyboard_type=ft.KeyboardType.NUMBER,
+        value=str(saved["retention_days"]),
+        width=300,
+        data="atl_archive_retention_days",
+    )
+    status = ft.Text(
+        "", size=12, color="#475569", selectable=True,
+        data="atl_archive_status",
+    )
+    summary = ft.Text("", size=12, color="#475569", data="atl_archive_summary")
+
+    def refresh_summary() -> None:
+        try:
+            count = archive_summary()["rows"]
+        except Exception as exc:
+            summary.value = f"Archive status unavailable: {exc}"
+            summary.color = "#B91C1C"
+        else:
+            summary.value = (
+                f"Archive: {count} PSID record(s) in "
+                "data/atl_archive/atl_archive.sqlite3"
+            )
+            summary.color = "#475569"
+
+    def apply_values(values: dict[str, Any]) -> None:
+        enabled_checkbox.value = bool(values["enabled"])
+        default_expiry_field.value = str(values["default_expiry_days"])
+        retention_field.value = str(values["retention_days"])
+
+    def save_settings(_=None) -> None:
+        try:
+            stored = set_atl_psid_archive_settings({
+                "enabled": bool(enabled_checkbox.value),
+                "default_expiry_days": _atl_days_value(
+                    default_expiry_field, "Default expiry age"
+                ),
+                "retention_days": _atl_days_value(
+                    retention_field, "Archive retention"
+                ),
+            })
+        except (SettingsError, ValueError) as exc:
+            status.value = str(exc)
+            status.color = "#B91C1C"
+        else:
+            apply_values(stored)
+            status.value = (
+                "ATL PSID archive settings saved. Automatic cleanup is "
+                + "enabled." if stored["enabled"] else
+                "ATL PSID archive settings saved. Automatic cleanup is off."
+            )
+            status.color = "#15803D"
+        page.update()
+
+    def reset_settings(_=None) -> None:
+        apply_values(reset_atl_psid_archive_settings())
+        status.value = (
+            "ATL PSID archive settings reset: automatic cleanup off, no "
+            "default expiry, and archived PDFs kept forever."
+        )
+        status.color = "#15803D"
+        page.update()
+
+    def open_folder(_=None) -> None:
+        try:
+            path = open_archive_folder()
+        except AtlArchiveError as exc:
+            status.value = str(exc)
+            status.color = "#B91C1C"
+        else:
+            status.value = f"Archive folder opened: {path}"
+            status.color = "#15803D"
+        page.update()
+
+    def run_now(_=None) -> None:
+        try:
+            result = run_cleanup(force=True)
+        except Exception as exc:
+            status.value = f"Cleanup failed: {exc}"
+            status.color = "#B91C1C"
+        else:
+            warnings = result.get("warnings") or []
+            status.value = (
+                f"Cleanup finished: {result.get('archived', 0)} PDF(s) archived; "
+                f"{result.get('purged_rows', 0)} archive row(s) and "
+                f"{result.get('purged_pdfs', 0)} archived PDF(s) permanently "
+                "deleted."
+            )
+            if warnings:
+                status.value += " " + " | ".join(str(item) for item in warnings[:3])
+                status.color = "#B45309"
+            else:
+                status.color = "#15803D"
+        refresh_summary()
+        page.update()
+
+    refresh_summary()
+    return ft.Column(
+        controls=[
+            ft.Text(
+                "Choose when expired ATL challans are archived. A per-record "
+                "expiry date wins; otherwise the default age applies. Manual "
+                "Delete on a client card remains immediate and is not archived.",
+                size=12, color="#64748B",
+            ),
+            enabled_checkbox,
+            ft.Row(
+                controls=[default_expiry_field, retention_field],
+                wrap=True, spacing=10,
+            ),
+            ft.Text(
+                "Linked PDFs are copied into the archive when they expire but "
+                "the original file outside the app is never deleted. The "
+                "archive database and folder are not part of normal SQLite "
+                "backups; 0 means the rule is off or files are kept forever.",
+                size=11, color="#64748B", selectable=True,
+            ),
+            summary,
+            ft.Row(
+                controls=[
+                    ft.Button("Save archive settings", on_click=save_settings),
+                    ft.OutlinedButton(
+                        "Reset archive settings", on_click=reset_settings
+                    ),
+                    ft.OutlinedButton("Open archive folder", on_click=open_folder),
+                    ft.OutlinedButton("Run cleanup now", on_click=run_now),
+                ],
+                wrap=True, spacing=8,
+            ),
+            status,
+        ],
+        spacing=10,
+        tight=True,
+    )
+
+
 def build_settings_page(page: ft.Page) -> ft.Control:
     """Build the settings page as collapsible categories.
 
@@ -570,6 +749,7 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     database_card = build_database_section(
         page, _adopted_file_picker(page)
     )
+    atl_archive_card = build_atl_psid_archive_section(page)
 
     file_picker = ft.FilePicker()
     default_location = get_default_file_location()
@@ -2212,6 +2392,12 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Choose which built-in client fields get a one-click Copy "
                 "button, including email, phone, address, CNIC, and password.",
                 copy_fields_card,
+            ),
+            _category_tile(
+                "FBR Clients — ATL PSID archive",
+                "Set per-record/default expiry, archived-PDF retention, and "
+                "run the separate archive cleanup without touching live data.",
+                atl_archive_card,
             ),
             _category_tile(
                 "Rate cards — appearance",

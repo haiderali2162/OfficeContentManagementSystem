@@ -22,8 +22,10 @@ but replaces the hard-coded client requirement with a configurable
 ``required_identity_fields`` list (task no., waseeka name, registry area,
 client). v0.2.30 adds ``warnings.settings`` (app-wide setup warning toggles,
 suppressed codes, and severity choice). v0.2.31 adds ``clients.copy_fields``
-(one-click copy buttons shown on FBR Clients cards). All groups use the
-existing ``app_settings`` JSON table; no new table or column is involved.
+(one-click copy buttons shown on FBR Clients cards). v0.2.32 adds
+``clients.atl_psid_archive`` (ATL PSID expiry, archive retention, and the
+last cleanup timestamp). All groups use the existing ``app_settings`` JSON
+table; no new settings table or column is involved.
 """
 
 from __future__ import annotations
@@ -123,6 +125,18 @@ CLIENT_COPY_FIELD_LABELS = {
 DEFAULT_CLIENT_COPY_FIELDS = [
     "cnic", "phone_number", "email", "address", "password",
 ]
+
+# v0.2.32: one additive app_settings key controls the optional ATL PSID
+# expiry/archive workflow. Zero days means "no rule" and "keep forever",
+# so an older database never starts deleting files after an upgrade.
+ATL_PSID_ARCHIVE_KEY = "clients.atl_psid_archive"
+DEFAULT_ATL_PSID_ARCHIVE_SETTINGS = {
+    "enabled": False,
+    "default_expiry_days": 0,
+    "retention_days": 0,
+    "last_cleanup_at": "",
+}
+_MAX_ATL_PSID_DAYS = 3650
 
 CARD_APPEARANCE_KEY = "dc_rates.card_appearance"
 DEFAULT_CARD_APPEARANCE = {
@@ -414,6 +428,98 @@ def reset_client_copy_fields() -> list[str]:
     defaults = list(DEFAULT_CLIENT_COPY_FIELDS)
     set_setting(CLIENT_COPY_FIELDS_KEY, defaults)
     return defaults
+
+
+def _normalize_atl_psid_days(value: Any, label: str) -> int:
+    """Validate a non-negative day count; zero disables that rule."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SettingsError(f"{label} must be a whole number of days.")
+    if value < 0 or value > _MAX_ATL_PSID_DAYS:
+        raise SettingsError(
+            f"{label} must be between 0 and {_MAX_ATL_PSID_DAYS} days."
+        )
+    return value
+
+
+def normalize_atl_psid_archive_settings(values: Any) -> dict[str, Any]:
+    """Validate and complete the v0.2.32 ATL PSID archive preferences."""
+    if values is None:
+        values = DEFAULT_ATL_PSID_ARCHIVE_SETTINGS
+    if not isinstance(values, dict):
+        raise SettingsError("ATL PSID archive settings must be a mapping.")
+
+    unknown = set(values) - set(DEFAULT_ATL_PSID_ARCHIVE_SETTINGS)
+    if unknown:
+        raise SettingsError(
+            "Unsupported ATL PSID archive setting: " + ", ".join(sorted(unknown))
+        )
+
+    enabled = values.get(
+        "enabled", DEFAULT_ATL_PSID_ARCHIVE_SETTINGS["enabled"]
+    )
+    if not isinstance(enabled, bool):
+        raise SettingsError("ATL PSID automatic cleanup must be on or off.")
+
+    last_cleanup_at = values.get("last_cleanup_at", "")
+    if last_cleanup_at is None:
+        last_cleanup_at = ""
+    if not isinstance(last_cleanup_at, str):
+        raise SettingsError("The last cleanup timestamp must be text.")
+
+    return {
+        "enabled": enabled,
+        "default_expiry_days": _normalize_atl_psid_days(
+            values.get(
+                "default_expiry_days",
+                DEFAULT_ATL_PSID_ARCHIVE_SETTINGS["default_expiry_days"],
+            ),
+            "Default expiry",
+        ),
+        "retention_days": _normalize_atl_psid_days(
+            values.get(
+                "retention_days",
+                DEFAULT_ATL_PSID_ARCHIVE_SETTINGS["retention_days"],
+            ),
+            "Archive retention",
+        ),
+        "last_cleanup_at": last_cleanup_at,
+    }
+
+
+def get_atl_psid_archive_settings() -> dict[str, Any]:
+    """Return saved ATL PSID archive settings with safe defaults."""
+    stored = get_setting(ATL_PSID_ARCHIVE_KEY, None)
+    try:
+        return normalize_atl_psid_archive_settings(stored)
+    except SettingsError:
+        return dict(DEFAULT_ATL_PSID_ARCHIVE_SETTINGS)
+
+
+def set_atl_psid_archive_settings(values: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist ATL PSID archive settings, keeping cleanup time."""
+    normalized = normalize_atl_psid_archive_settings(values)
+    stored = get_setting(ATL_PSID_ARCHIVE_KEY, None)
+    if isinstance(stored, dict) and isinstance(
+        stored.get("last_cleanup_at"), str
+    ):
+        normalized["last_cleanup_at"] = stored["last_cleanup_at"]
+    set_setting(ATL_PSID_ARCHIVE_KEY, normalized)
+    return normalized
+
+
+def reset_atl_psid_archive_settings() -> dict[str, Any]:
+    """Restore the non-destructive ATL PSID archive defaults."""
+    defaults = dict(DEFAULT_ATL_PSID_ARCHIVE_SETTINGS)
+    set_setting(ATL_PSID_ARCHIVE_KEY, defaults)
+    return defaults
+
+
+def record_atl_psid_cleanup(timestamp: str) -> dict[str, Any]:
+    """Store the last automatic cleanup time without changing user choices."""
+    settings = get_atl_psid_archive_settings()
+    settings["last_cleanup_at"] = str(timestamp)
+    set_setting(ATL_PSID_ARCHIVE_KEY, settings)
+    return settings
 
 
 def _normalize_heading_template(template: Any) -> str:

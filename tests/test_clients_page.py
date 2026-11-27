@@ -31,8 +31,10 @@ class FakePage:
 
 def _walk(control):
     yield control
-    for child in getattr(control, "controls", ()) or ():
-        yield from _walk(child)
+    for attribute in ("controls", "actions"):
+        for child in getattr(control, attribute, ()) or ():
+            if isinstance(child, ft.Control):
+                yield from _walk(child)
     content = getattr(control, "content", None)
     if isinstance(content, ft.Control):
         yield from _walk(content)
@@ -85,6 +87,102 @@ class FakeClipboard:
 
     async def set(self, value):
         self.copied.append(value)
+
+
+def test_client_card_offers_atl_psid_manager_and_add_form(monkeypatch):
+    """v0.2.32: the new card action opens the PSID manager and add dialog."""
+    _patch_client_listing(monkeypatch)
+    monkeypatch.setattr(clients, "list_psids", lambda client_id: [])
+    page = FakePage()
+    root = clients.build_clients_page(page)
+    card_buttons = {
+        getattr(control, "content", ""): control
+        for control in _walk(root)
+        if isinstance(control, ft.TextButton)
+    }
+    assert "ATL PSIDs" in card_buttons
+
+    card_buttons["ATL PSIDs"].on_click(None)
+    assert page.dialogs, "The ATL PSID manager dialog did not open."
+    manager_buttons = {
+        getattr(control, "content", ""): control
+        for control in _walk(page.dialogs[-1])
+        if isinstance(control, (ft.Button, ft.TextButton, ft.OutlinedButton))
+    }
+    assert "Add PSID" in manager_buttons
+
+    manager_buttons["Add PSID"].on_click(None)
+    # The manager is closed before the form opens, so the form replaces it.
+    assert len(page.dialogs) == 1, "The add form did not replace the manager."
+    title = getattr(page.dialogs[-1], "title", None)
+    assert isinstance(title, ft.Text) and title.value == "Add ATL surcharge PSID"
+    storage_dropdown = next(
+        control for control in _walk(page.dialogs[-1])
+        if isinstance(control, ft.Dropdown)
+        and control.label == "Challan PDF storage"
+    )
+    assert {option.key for option in storage_dropdown.options} == {
+        "database", "managed_file", "linked_path",
+    }
+    assert "Store inside database" in {
+        option.text for option in storage_dropdown.options
+    }
+
+
+def test_psid_without_pdf_can_be_edited_without_choosing_a_pdf(monkeypatch):
+    """A PDF-less record must not be trapped by the storage-mode guard."""
+    _patch_client_listing(monkeypatch)
+    record = SimpleNamespace(
+        id=9,
+        storage_mode="none",
+        financial_year="2025-26",
+        psid_number="PSID-NOPDF",
+        amount=None,
+        payment_date=None,
+        expiry_date=None,
+        notes="before",
+        original_filename=None,
+        expiry_processed_at=None,
+    )
+    monkeypatch.setattr(clients, "list_psids", lambda client_id: [record])
+    monkeypatch.setattr(clients, "get_psid", lambda psid_id: record)
+    monkeypatch.setattr(clients, "notify", lambda page, message: None)
+    calls = []
+    monkeypatch.setattr(
+        clients, "save_psid", lambda **kwargs: calls.append(kwargs) or 9
+    )
+
+    page = FakePage()
+    root = clients.build_clients_page(page)
+    card_buttons = {
+        getattr(control, "content", ""): control
+        for control in _walk(root)
+        if isinstance(control, ft.TextButton)
+    }
+    card_buttons["ATL PSIDs"].on_click(None)
+    manager_buttons = {
+        getattr(control, "content", ""): control
+        for control in _walk(page.dialogs[-1])
+        if isinstance(control, (ft.Button, ft.TextButton, ft.OutlinedButton))
+    }
+    manager_buttons["Edit"].on_click(None)
+
+    notes = next(
+        control for control in _walk(page.dialogs[-1])
+        if isinstance(control, ft.TextField) and control.label == "Notes"
+    )
+    notes.value = "after"
+    form_buttons = {
+        getattr(control, "content", ""): control
+        for control in _walk(page.dialogs[-1])
+        if isinstance(control, (ft.Button, ft.TextButton, ft.OutlinedButton))
+    }
+    form_buttons["Save PSID"].on_click(None)
+
+    assert len(calls) == 1
+    assert calls[0]["psid_id"] == 9
+    assert calls[0]["notes"] == "after"
+    assert calls[0]["clear_pdf"] is False
 
 
 def test_client_dialogs_open_without_name_errors(monkeypatch):

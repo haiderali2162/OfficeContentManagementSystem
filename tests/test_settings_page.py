@@ -62,6 +62,9 @@ def settings_database(tmp_path, monkeypatch):
     monkeypatch.setattr(
         setup_warning_service, "SessionLocal", isolated_sessions
     )
+    # v0.2.32: the new ATL archive tile must not create the real archive
+    # database while a settings-page test builds the page.
+    monkeypatch.setattr(settings, "archive_summary", lambda: {"rows": 0})
     try:
         yield isolated_sessions
     finally:
@@ -703,3 +706,57 @@ def test_client_copy_fields_reset_restores_defaults(settings_database):
         "Copy fields reset" in (control.value or "")
         for control in _walk(root) if isinstance(control, ft.Text)
     )
+
+
+def test_atl_psid_archive_category_renders_and_saves_settings(settings_database):
+    """v0.2.32: the archive category is editable without touching live data."""
+    root = settings.build_settings_page(FakePage())
+    titles = [
+        control.title.value
+        for control in _walk(root)
+        if isinstance(control, ft.ExpansionTile)
+    ]
+    assert "FBR Clients — ATL PSID archive" in titles
+
+    enabled = _checkbox_by_data(root, "atl_archive_enabled")
+    default_days = _field(
+        root, "Default expiry age in days (0 = only per-record dates)"
+    )
+    retention_days = _field(
+        root, "Keep archived PDFs for days (0 = forever)"
+    )
+    assert enabled.value is False
+    assert default_days.value == "0"
+    assert retention_days.value == "0"
+
+    enabled.value = True
+    default_days.value = "365"
+    retention_days.value = "180"
+    _button(root, "Save archive settings").on_click(None)
+
+    saved = settings_service.get_atl_psid_archive_settings()
+    assert saved["enabled"] is True
+    assert saved["default_expiry_days"] == 365
+    assert saved["retention_days"] == 180
+    assert any(
+        "ATL PSID archive settings saved" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_atl_psid_archive_category_reset_restores_non_destructive_defaults(
+    settings_database
+):
+    settings_service.set_atl_psid_archive_settings({
+        "enabled": True, "default_expiry_days": 90, "retention_days": 30,
+    })
+    root = settings.build_settings_page(FakePage())
+    _button(root, "Reset archive settings").on_click(None)
+
+    assert settings_service.get_atl_psid_archive_settings() == (
+        settings_service.DEFAULT_ATL_PSID_ARCHIVE_SETTINGS
+    )
+    assert _checkbox_by_data(root, "atl_archive_enabled").value is False
+    assert _field(
+        root, "Default expiry age in days (0 = only per-record dates)"
+    ).value == "0"

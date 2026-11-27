@@ -584,6 +584,16 @@ def update_client(
 
 
 def delete_client(client_id: int) -> None:
+    # v0.2.32: ORM cascades remove child rows but cannot remove physical
+    # app-managed challan copies. Collect the paths first, delete the client,
+    # then remove only those app copies. Archive rows and linked originals are
+    # deliberately untouched.
+    from services.atl_psid_service import (
+        managed_psid_paths_for_client,
+        remove_managed_psid_paths,
+    )
+
+    managed_paths = managed_psid_paths_for_client(client_id)
     with SessionLocal() as session:
         client = session.get(Client, client_id)
 
@@ -592,6 +602,8 @@ def delete_client(client_id: int) -> None:
 
         session.delete(client)
         session.commit()
+
+    remove_managed_psid_paths(managed_paths)
 
 
 def list_custom_fields(

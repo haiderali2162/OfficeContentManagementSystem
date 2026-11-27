@@ -647,3 +647,56 @@ def test_reset_client_copy_fields_restores_defaults(settings_database):
     assert settings_service.get_client_copy_fields() == (
         settings_service.DEFAULT_CLIENT_COPY_FIELDS
     )
+
+
+# --------------------------------------------------------------------------
+# ATL PSID expiry and archive settings (v0.2.32).
+# --------------------------------------------------------------------------
+
+def test_atl_archive_defaults_are_non_destructive(settings_database):
+    assert settings_service.get_atl_psid_archive_settings() == (
+        settings_service.DEFAULT_ATL_PSID_ARCHIVE_SETTINGS
+    )
+    assert settings_service.DEFAULT_ATL_PSID_ARCHIVE_SETTINGS["enabled"] is False
+    assert settings_service.DEFAULT_ATL_PSID_ARCHIVE_SETTINGS["retention_days"] == 0
+
+
+def test_atl_archive_settings_round_trip_preserves_cleanup_time(settings_database):
+    settings_service.record_atl_psid_cleanup("2026-11-27T10:00:00+00:00")
+    saved = settings_service.set_atl_psid_archive_settings({
+        "enabled": True,
+        "default_expiry_days": 365,
+        "retention_days": 180,
+    })
+    assert saved["enabled"] is True
+    assert saved["last_cleanup_at"] == "2026-11-27T10:00:00+00:00"
+    assert settings_service.get_atl_psid_archive_settings() == saved
+
+
+def test_atl_archive_settings_reject_invalid_values(settings_database):
+    with pytest.raises(settings_service.SettingsError, match="whole number"):
+        settings_service.set_atl_psid_archive_settings({"default_expiry_days": "30"})
+    with pytest.raises(settings_service.SettingsError, match="between 0 and"):
+        settings_service.set_atl_psid_archive_settings({"retention_days": -1})
+    with pytest.raises(settings_service.SettingsError, match="on or off"):
+        settings_service.set_atl_psid_archive_settings({"enabled": "yes"})
+    with pytest.raises(settings_service.SettingsError, match="Unsupported"):
+        settings_service.set_atl_psid_archive_settings({"unknown": 1})
+    assert settings_service.get_atl_psid_archive_settings() == (
+        settings_service.DEFAULT_ATL_PSID_ARCHIVE_SETTINGS
+    )
+
+
+def test_invalid_stored_atl_archive_settings_fall_back_and_reset(
+    settings_database
+):
+    settings_service.set_setting(settings_service.ATL_PSID_ARCHIVE_KEY, {
+        "enabled": "maybe", "retention_days": -5,
+    })
+    assert settings_service.get_atl_psid_archive_settings() == (
+        settings_service.DEFAULT_ATL_PSID_ARCHIVE_SETTINGS
+    )
+    settings_service.set_atl_psid_archive_settings({"enabled": True})
+    assert settings_service.reset_atl_psid_archive_settings() == (
+        settings_service.DEFAULT_ATL_PSID_ARCHIVE_SETTINGS
+    )

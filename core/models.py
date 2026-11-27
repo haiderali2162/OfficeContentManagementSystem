@@ -94,6 +94,14 @@ class Client(Base):
         cascade="all, delete-orphan",
     )
 
+    # v0.2.32: one row per annual ATL surcharge PSID/challan. Child rows are
+    # removed with their client, but the separate archive database is never
+    # touched by client deletion.
+    atl_psids: Mapped[list["ClientAtlPsid"]] = relationship(
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+
     # Tax estimates are historical records; deleting a client clears only
     # their optional link while preserving each estimate's saved snapshots.
     valuation_estimates: Mapped[list["ValuationEstimate"]] = relationship(
@@ -221,6 +229,65 @@ class ClientAsset(Base):
     client: Mapped["Client"] = relationship(
         back_populates="assets"
     )
+
+
+class ClientAtlPsid(Base):
+    """One annual ATL surcharge PSID/challan attached to an FBR client.
+
+    v0.2.32 adds this as a new child table only. It never alters or rewrites
+    the ``clients`` table. PDFs can be stored as bytes in this row, as an
+    app-managed file, or as a link to the user's original file; the chosen
+    mode is preserved with the record. Expired records keep their PSID details
+    but have their active PDF cleared after that PDF is archived separately.
+    """
+
+    __tablename__ = "client_atl_psids"
+    __table_args__ = (
+        CheckConstraint(
+            "storage_mode IN ('none', 'database', 'managed_file', 'linked_path')",
+            name="ck_client_atl_psid_storage_mode",
+        ),
+        Index("ix_client_atl_psid_client_year", "client_id", "financial_year"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    client_id: Mapped[int] = mapped_column(
+        ForeignKey("clients.id", ondelete="CASCADE"),
+        index=True,
+    )
+
+    financial_year: Mapped[str] = mapped_column(String(20), nullable=False)
+    psid_number: Mapped[str] = mapped_column(String(100), nullable=False)
+    amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    payment_date: Mapped[Optional[date]] = mapped_column(Date)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    expiry_date: Mapped[Optional[date]] = mapped_column(Date)
+    expiry_processed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+    storage_mode: Mapped[str] = mapped_column(
+        String(20), default="none", server_default="none", nullable=False
+    )
+    original_filename: Mapped[Optional[str]] = mapped_column(String(255))
+    # Only one of these three fields is populated for a saved PDF.
+    pdf_blob: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    pdf_relative_path: Mapped[Optional[str]] = mapped_column(String(500))
+    pdf_source_path: Mapped[Optional[str]] = mapped_column(String(1000))
+    pdf_size_bytes: Mapped[Optional[int]] = mapped_column(Integer)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+    client: Mapped["Client"] = relationship(back_populates="atl_psids")
+
 
 # =========================================
 
