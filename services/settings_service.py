@@ -21,8 +21,9 @@ task-number fallback, and token-based estimate names). v0.2.29 keeps that key
 but replaces the hard-coded client requirement with a configurable
 ``required_identity_fields`` list (task no., waseeka name, registry area,
 client). v0.2.30 adds ``warnings.settings`` (app-wide setup warning toggles,
-suppressed codes, and severity choice). All groups use the existing
-``app_settings`` JSON table; no new table or column is involved.
+suppressed codes, and severity choice). v0.2.31 adds ``clients.copy_fields``
+(one-click copy buttons shown on FBR Clients cards). All groups use the
+existing ``app_settings`` JSON table; no new table or column is involved.
 """
 
 from __future__ import annotations
@@ -90,6 +91,38 @@ DEFAULT_SETUP_WARNING_SETTINGS = {
     "checks": {key: True for key in SETUP_WARNING_CHECK_LABELS},
     "ignored_codes": [],
 }
+
+# v0.2.31: FBR Clients used to hard-code CNIC/address/password copy buttons.
+# The selected built-in fields now come from this additive setting; email and
+# phone are enabled by default because they were the most requested additions.
+# User-defined custom client columns are intentionally excluded: they have no
+# stable identity and are managed separately on the FBR Clients page.
+CLIENT_COPY_FIELDS_KEY = "clients.copy_fields"
+CLIENT_COPY_FIELD_LABELS = {
+    "name": "Client name",
+    "father_name": "Father / husband name",
+    "cnic": "CNIC",
+    "ntn_number": "NTN number",
+    "cnic_expiry_date": "CNIC expiry date",
+    "date_of_birth": "Date of birth",
+    "registration_date": "Registration date",
+    "status_updated_date": "Status updated date",
+    "phone_number": "Phone number",
+    "email": "Email",
+    "address": "Address",
+    "tehsil": "Tehsil",
+    "district": "District",
+    "city": "City",
+    "province": "Province",
+    "payment_amount": "Payment amount",
+    "amount_received": "Amount received",
+    "current_status": "Current status",
+    "referred_by": "Referred by",
+    "password": "Password",
+}
+DEFAULT_CLIENT_COPY_FIELDS = [
+    "cnic", "phone_number", "email", "address", "password",
+]
 
 CARD_APPEARANCE_KEY = "dc_rates.card_appearance"
 DEFAULT_CARD_APPEARANCE = {
@@ -332,6 +365,54 @@ def reset_setup_warning_settings() -> dict[str, Any]:
         "ignored_codes": list(DEFAULT_SETUP_WARNING_SETTINGS["ignored_codes"]),
     }
     set_setting(SETUP_WARNINGS_KEY, defaults)
+    return defaults
+
+
+def normalize_client_copy_fields(values: Any) -> list[str]:
+    """Validate the v0.2.31 FBR Clients one-click copy preferences.
+
+    The stored list is re-ordered by :data:`CLIENT_COPY_FIELD_LABELS`, so card
+    buttons stay stable even if Settings saved them in a different order.
+    Unknown keys are rejected instead of silently producing a missing button.
+    """
+    if values is None:
+        values = DEFAULT_CLIENT_COPY_FIELDS
+    if isinstance(values, (str, bytes)) or not isinstance(
+        values, (list, tuple, set)
+    ):
+        raise SettingsError("Client copy fields must be a list.")
+    chosen: set[str] = set()
+    for item in values:
+        field = str(item).strip()
+        if field not in CLIENT_COPY_FIELD_LABELS:
+            supported = ", ".join(sorted(CLIENT_COPY_FIELD_LABELS))
+            raise SettingsError(
+                f"Unsupported client copy field '{field}'. Use one of: {supported}."
+            )
+        chosen.add(field)
+    return [key for key in CLIENT_COPY_FIELD_LABELS if key in chosen]
+
+
+def get_client_copy_fields() -> list[str]:
+    """Return saved copy fields, with v0.2.31 defaults for older databases."""
+    stored = get_setting(CLIENT_COPY_FIELDS_KEY, None)
+    try:
+        return normalize_client_copy_fields(stored)
+    except SettingsError:
+        return list(DEFAULT_CLIENT_COPY_FIELDS)
+
+
+def set_client_copy_fields(values: list[str]) -> list[str]:
+    """Validate and persist the selected copy fields."""
+    normalized = normalize_client_copy_fields(values)
+    set_setting(CLIENT_COPY_FIELDS_KEY, normalized)
+    return normalized
+
+
+def reset_client_copy_fields() -> list[str]:
+    """Restore the built-in CNIC/phone/email/address/password buttons."""
+    defaults = list(DEFAULT_CLIENT_COPY_FIELDS)
+    set_setting(CLIENT_COPY_FIELDS_KEY, defaults)
     return defaults
 
 

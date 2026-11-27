@@ -12,12 +12,20 @@ class FakePage:
     def __init__(self):
         self.controls = []
         self.updates = 0
+        self.dialogs = []
 
     def add(self, control):
         self.controls.append(control)
 
     def update(self):
         self.updates += 1
+
+    def show_dialog(self, dialog):
+        self.dialogs.append(dialog)
+
+    def pop_dialog(self):
+        if self.dialogs:
+            self.dialogs.pop()
 
 
 def _walk(control):
@@ -124,3 +132,66 @@ def test_no_banner_when_all_setup_warnings_are_hidden(
     assert _find(main_column, "shell_page_content").content.value == (
         "Dashboard page"
     )
+
+
+def test_view_details_dialog_lists_every_counted_warning_with_fixes(
+    shell_page, monkeypatch
+):
+    """v0.2.31: the dialog matches the banner count, with complete details."""
+    warnings = [
+        {
+            "severity": "warning",
+            "title": "No DC schedule rates",
+            "code": "no_dc_rates",
+            "message": "DC valuation cannot calculate a rate yet.",
+            "fix": "Add or import the DC schedule for your area.",
+            "visible": True,
+        },
+        {
+            "severity": "info",
+            "title": "No clients saved",
+            "code": "no_clients",
+            "message": "The client dropdown is empty.",
+            "fix": "Add or import clients in FBR Clients.",
+            "visible": True,
+        },
+        {
+            "severity": "warning",
+            "title": "Hidden warning",
+            "code": "backups_disabled",
+            "message": "This should not appear.",
+            "fix": "This should not appear.",
+            "visible": False,
+        },
+    ]
+    visible = [item for item in warnings if item["visible"]]
+    monkeypatch.setattr(
+        app_shell, "visible_setup_warnings", lambda: visible
+    )
+    shell = _make_shell(shell_page)
+
+    shell.render()
+    main_column = shell_page.controls[0].controls[1].content
+    _find(main_column, "setup_warning_view_details").on_click(None)
+
+    assert shell_page.dialogs
+    dialog = shell_page.dialogs[-1]
+    assert dialog.data == "setup_warning_details_dialog"
+    assert dialog.title.value == "Setup check details"
+    texts = [
+        control.value for control in _walk(dialog)
+        if isinstance(control, ft.Text)
+    ]
+    for item in visible:
+        assert any(item["title"] in text for text in texts)
+        assert item["message"] in texts
+        assert f"Fix: {item['fix']}" in texts
+        assert f"Code: {item['code']}" in texts
+    assert not any("This should not appear." in text for text in texts)
+
+    close_button = next(
+        control for control in dialog.actions
+        if isinstance(control, ft.TextButton)
+    )
+    close_button.on_click(None)
+    assert shell_page.dialogs == []

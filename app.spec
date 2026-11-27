@@ -60,6 +60,8 @@ first_party_modules = [
     "services.area_export_service",
     "services.area_history_service",
     "services.backup_service",
+    # v0.2.31: built-in client field formatting for one-click copy buttons.
+    "services.client_copy_service",
     "services.client_import_service",
     "services.client_service",
     "services.dashboard_service",

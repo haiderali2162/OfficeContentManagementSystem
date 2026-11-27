@@ -28,7 +28,13 @@ from services.client_service import (
     update_asset,
 )
 from core.security import generate_secure_password
-from core.security import decrypt_secret
+from services.client_copy_service import (
+    client_copy_field_available,
+    client_copy_field_label,
+    client_copy_value,
+    copy_button_label,
+    decrypted_password_for_copy,
+)
 from services.client_import_service import (
     CLIENT_FIELD_LABELS,
     REQUIREMENT_DEFAULTS,
@@ -45,6 +51,7 @@ from services.client_import_service import (
 from services.client_import_service import (
     SWAPPABLE_CLIENT_FIELDS as _SWAPPABLE_FIELDS,
 )
+from services.settings_service import get_client_copy_fields
 
 
 def open_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
@@ -89,7 +96,16 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
     UI events call services.client_service; that service reads/writes the
     SQLAlchemy models, which core.database stores in DATABASE_PATH.
+
+    v0.2.30 cards hard-coded CNIC/address/password copy actions. v0.2.31
+    builds those buttons from the saved built-in fields in Settings, adding
+    email, phone, and every other stable client column. Custom client columns
+    remain under the existing column manager.
     """
+    # v0.2.31: read the preference once so every card in this list shows the
+    # same buttons; a Settings change takes effect on the next page refresh.
+    client_copy_fields = get_client_copy_fields()
+
     # search field for the page
     search_field = ft.TextField(
         label="Search name, CNIC, NTN, referral, or address",
@@ -255,17 +271,34 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         address_parts = [client.address, client.tehsil, client.district, client.city, client.province]
         full_address = ", ".join(part.strip() for part in address_parts if part and part.strip())
 
-        # These are async event handlers themselves. Assigning a normal lambda
-        # that merely returns a coroutine makes Flet treat it as synchronous,
-        # so the copy request may never be awaited.
-        async def copy_cnic(e):
-            await copy_to_clipboard(client.cnic or "", "CNIC")
+        # v0.2.31: one factory-made async handler per configured field. A
+        # factory is required because a lambda returning a coroutine is treated
+        # as synchronous by Flet, so the clipboard write may never be awaited.
+        def make_copy_handler(field: str):
+            async def copy_selected_field(_):
+                if field == "password":
+                    # Never store or render plaintext: reload and decrypt only
+                    # after this explicit button click.
+                    await copy_client_password(client.id)
+                    return
+                value = client_copy_value(client, field)
+                label = client_copy_field_label(field)
+                if not value:
+                    notify(page, f"No {label.lower()} is saved for this client.")
+                    return
+                await copy_to_clipboard(value, label)
+            return copy_selected_field
 
-        async def copy_address(e):
-            await copy_to_clipboard(full_address, "Address")
-
-        async def copy_password(e):
-            await copy_client_password(client.id)
+        copy_buttons = [
+            ft.OutlinedButton(
+                copy_button_label(field),
+                icon=ft.Icons.CONTENT_COPY,
+                data=f"copy_client_field:{field}",
+                on_click=make_copy_handler(field),
+                disabled=not client_copy_field_available(client, field),
+            )
+            for field in client_copy_fields
+        ]
 
         def save_card_status(e, client_id=client.id, previous=client.current_status):
             """Save this card's status immediately and restore it on failure."""
@@ -371,24 +404,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                     ft.Divider(height=1, color="#E2E8F0"),
                     ft.Row(
                         controls=[
-                            ft.OutlinedButton(
-                                "Copy CNIC",
-                                icon=ft.Icons.CONTENT_COPY,
-                                on_click=copy_cnic,
-                                disabled=not bool(client.cnic),
-                            ),
-                            ft.OutlinedButton(
-                                "Copy address",
-                                icon=ft.Icons.CONTENT_COPY,
-                                on_click=copy_address,
-                                disabled=not bool(full_address),
-                            ),
-                            ft.OutlinedButton(
-                                "Copy password",
-                                icon=ft.Icons.CONTENT_COPY,
-                                on_click=copy_password,
-                                disabled=not bool(client.password_ciphertext),
-                            ),
+                            *copy_buttons,
                             text_button(
                                 "Custom data",
                                 on_click=lambda e, cid=client.id:
@@ -433,19 +449,14 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             notify(page, f"Could not copy {label.lower()}: {exc}")
 
     async def copy_client_password(client_id: int):
-        # Load and decrypt only when the user explicitly requests a copy.
+        # v0.2.31: the service reloads and decrypts only on this explicit click;
+        # the card list itself still contains ciphertext only.
         try:
-            saved_client = get_client(client_id)
-            password = decrypt_secret(
-                saved_client.password_ciphertext if saved_client else None
-            )
-            if not password:
-                notify(page, "No password is saved for this client.")
-                return
-            await clipboard.set(password)
-            notify(page, "Password copied to clipboard.")
+            password = decrypted_password_for_copy(client_id)
         except Exception as exc:
             notify(page, f"Could not copy password: {exc}")
+            return
+        await copy_to_clipboard(password, "Password")
 
     def open_client_form(client=None):
         editing = client is not None

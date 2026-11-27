@@ -586,3 +586,64 @@ def test_invalid_stored_warning_settings_fall_back_to_defaults(
     assert settings_service.get_setup_warning_settings() == (
         settings_service.DEFAULT_SETUP_WARNING_SETTINGS
     )
+
+
+# --------------------------------------------------------------------------
+# FBR Clients one-click copy fields (v0.2.31).
+# --------------------------------------------------------------------------
+
+def test_client_copy_fields_defaults_include_email_and_phone(settings_database):
+    defaults = settings_service.get_client_copy_fields()
+    assert defaults == [
+        "cnic", "phone_number", "email", "address", "password",
+    ]
+    assert defaults == settings_service.DEFAULT_CLIENT_COPY_FIELDS
+
+
+def test_client_copy_fields_round_trip_orders_and_deduplicates(
+    settings_database
+):
+    saved = settings_service.set_client_copy_fields([
+        "password", "email", "name", "email", "phone_number",
+    ])
+    assert saved == ["name", "phone_number", "email", "password"]
+    assert settings_service.get_client_copy_fields() == saved
+
+    # An empty selection is valid: the card simply has no copy buttons.
+    assert settings_service.set_client_copy_fields([]) == []
+
+
+def test_client_copy_fields_reject_unknown_and_wrong_types(settings_database):
+    with pytest.raises(
+        settings_service.SettingsError, match="Unsupported client copy field"
+    ):
+        settings_service.set_client_copy_fields(["password_ciphertext"])
+    with pytest.raises(
+        settings_service.SettingsError, match="must be a list"
+    ):
+        settings_service.set_client_copy_fields("email")
+
+    assert settings_service.get_client_copy_fields() == (
+        settings_service.DEFAULT_CLIENT_COPY_FIELDS
+    )
+
+
+def test_invalid_stored_client_copy_fields_fall_back_to_defaults(
+    settings_database
+):
+    settings_service.set_setting(
+        settings_service.CLIENT_COPY_FIELDS_KEY, ["not-a-field"]
+    )
+    assert settings_service.get_client_copy_fields() == (
+        settings_service.DEFAULT_CLIENT_COPY_FIELDS
+    )
+
+
+def test_reset_client_copy_fields_restores_defaults(settings_database):
+    settings_service.set_client_copy_fields(["name"])
+    assert settings_service.reset_client_copy_fields() == (
+        settings_service.DEFAULT_CLIENT_COPY_FIELDS
+    )
+    assert settings_service.get_client_copy_fields() == (
+        settings_service.DEFAULT_CLIENT_COPY_FIELDS
+    )

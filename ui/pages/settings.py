@@ -12,7 +12,9 @@ v0.2.29: the valuation-estimate category can require any combination of task
 number, waseeka name, registry area, and client instead of assuming a client
 link is mandatory.
 v0.2.30: the warning category configures the app-wide missing-data/setup
-banner, its checks, and suppressed warning codes.
+banner, its checks, and suppressed warning codes. v0.2.31 fixes the previous
+hard-coded copy buttons (CNIC/address/password only) by adding a category for
+all built-in FBR Client fields, including the requested email and phone.
 
 It also exposes the database-connection editor (``build_database_section``):
 the user can point the running application at SQLite, PostgreSQL,
@@ -52,6 +54,7 @@ from services.settings_service import (
     CARD_COLOR_FIELDS,
     CARD_COLOR_LABELS,
     CARD_HEADING_FIELDS,
+    CLIENT_COPY_FIELD_LABELS,
     DEFAULT_CARD_APPEARANCE,
     DEFAULT_ESTIMATE_NAMING,
     DEFAULT_VALUATION_REPORT_OPTIONS,
@@ -70,6 +73,7 @@ from services.settings_service import (
     format_estimate_template,
     get_card_appearance,
     get_card_fields,
+    get_client_copy_fields,
     get_default_file_location,
     get_estimate_naming,
     get_setup_warning_settings,
@@ -80,12 +84,14 @@ from services.settings_service import (
     normalize_valuation_report_options,
     reset_card_appearance,
     reset_card_fields,
+    reset_client_copy_fields,
     reset_estimate_naming,
     reset_setup_warning_settings,
     reset_valuation_report_options,
     reset_valuation_table_template,
     set_card_appearance,
     set_card_fields,
+    set_client_copy_fields,
     set_default_file_location,
     set_estimate_naming,
     set_setup_warning_settings,
@@ -2001,6 +2007,91 @@ def build_settings_page(page: ft.Page) -> ft.Control:
     )
     apply_warning_controls(saved_warnings)
 
+    # v0.2.31: all stable built-in client columns can be one-click copy buttons.
+    # v0.2.30 hard-coded only CNIC/address/password, so email and phone were
+    # missing. Custom client columns remain under the FBR Clients column
+    # manager because a renamed/deleted definition has no stable copy key.
+    saved_copy_fields = get_client_copy_fields()
+    copy_fields_status = ft.Text(
+        "", size=12, color="#475569", selectable=True,
+        data="client_copy_fields_status",
+    )
+    copy_field_checkboxes = {
+        key: ft.Checkbox(
+            label=label,
+            value=key in saved_copy_fields,
+            data=f"client_copy_field:{key}",
+        )
+        for key, label in CLIENT_COPY_FIELD_LABELS.items()
+    }
+
+    def apply_client_copy_fields(values: list[str]) -> None:
+        selected = set(values)
+        for key, checkbox in copy_field_checkboxes.items():
+            checkbox.value = key in selected
+
+    def save_copy_field_settings(_) -> None:
+        selected = [
+            key for key, checkbox in copy_field_checkboxes.items()
+            if checkbox.value
+        ]
+        try:
+            saved = set_client_copy_fields(selected)
+            apply_client_copy_fields(saved)
+            copy_fields_status.value = (
+                f"Copy fields saved: {len(saved)} field(s) will appear on each "
+                "FBR Clients card after the page is refreshed."
+            )
+            copy_fields_status.color = "#15803D"
+        except SettingsError as exc:
+            copy_fields_status.value = str(exc)
+            copy_fields_status.color = "#B91C1C"
+        page.update()
+
+    def reset_copy_field_settings(_) -> None:
+        defaults = reset_client_copy_fields()
+        apply_client_copy_fields(defaults)
+        copy_fields_status.value = (
+            "Copy fields reset: CNIC, phone number, email, address, and "
+            "password are selected."
+        )
+        copy_fields_status.color = "#15803D"
+        page.update()
+
+    copy_fields_card = ft.Column(
+        controls=[
+            ft.Text(
+                "Tick every built-in client field that should have a direct "
+                "Copy button on its FBR Clients card. An empty selection is "
+                "allowed and leaves only the other card actions.",
+                size=12, color="#64748B",
+            ),
+            ft.Row(
+                controls=list(copy_field_checkboxes.values()),
+                wrap=True, spacing=12,
+            ),
+            ft.Text(
+                "Password is reloaded and decrypted only when its Copy button "
+                "is clicked; ciphertext is never shown as a field value. "
+                "User-defined custom columns are managed on the FBR Clients "
+                "page and are not saved here.",
+                size=11, color="#64748B", selectable=True,
+            ),
+            ft.Row(
+                controls=[
+                    ft.Button("Save copy fields", on_click=save_copy_field_settings),
+                    ft.OutlinedButton(
+                        "Reset copy fields", on_click=reset_copy_field_settings
+                    ),
+                ],
+                wrap=True, spacing=8,
+            ),
+            copy_fields_status,
+        ],
+        spacing=10, tight=True,
+    )
+    apply_client_copy_fields(saved_copy_fields)
+
     guide_card = ft.Column(
         controls=[
             ft.Text(
@@ -2115,6 +2206,12 @@ def build_settings_page(page: ft.Page) -> ft.Control:
                 "Choose which app-wide warnings appear, review current "
                 "missing-data/setup findings, and ignore stable warning codes.",
                 warning_card,
+            ),
+            _category_tile(
+                "FBR Clients — direct copy fields",
+                "Choose which built-in client fields get a one-click Copy "
+                "button, including email, phone, address, CNIC, and password.",
+                copy_fields_card,
             ),
             _category_tile(
                 "Rate cards — appearance",

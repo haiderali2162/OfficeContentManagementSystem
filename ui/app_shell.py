@@ -4,6 +4,10 @@ v0.2.30 adds a compact warning banner above the selected page. It comes from
 ``services.setup_warning_service`` and is deliberately read-only: page-level
 warnings and calculation warnings remain where they are, while this banner
 answers "what is missing in the active setup?" from every tab.
+
+v0.2.31 fixes the previous count-only summary: "View details" opens a dialog
+with the same visible warnings that the banner counted, including the full
+message, the exact fix, and the stable warning code.
 """
 
 import flet as ft
@@ -179,11 +183,11 @@ class AppShell:
         )
 
     def build_warning_banner(self) -> ft.Control | None:
-        """Build the v0.2.30 setup warning banner, or ``None`` when clear.
+        """Build the v0.2.30 banner (extended in v0.2.31), or ``None``.
 
         Only the first two warnings are named inline; the count keeps the
-        banner short. Settings shows every warning with its fix and an option
-        to ignore a stable warning code.
+        banner short. "View details" opens every warning counted in this
+        banner, while Settings additionally allows suppressing stable codes.
         """
         warnings = visible_setup_warnings()
         if not warnings:
@@ -215,15 +219,120 @@ class AppShell:
                         spacing=3,
                         expand=True,
                     ),
-                    ft.TextButton(
-                        "Review in Settings",
-                        on_click=lambda _: self.navigate("settings"),
+                    ft.Row(
+                        controls=[
+                            ft.TextButton(
+                                "View details",
+                                data="setup_warning_view_details",
+                                on_click=lambda _, items=warnings:
+                                    self.show_warning_details(items),
+                            ),
+                            ft.TextButton(
+                                "Review in Settings",
+                                on_click=lambda _: self.navigate("settings"),
+                            ),
+                        ],
+                        spacing=4,
+                        wrap=True,
                     ),
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
         )
+
+    def show_warning_details(self, warnings: list[dict]) -> None:
+        """Open a read-only dialog with the warnings counted in the banner.
+
+        v0.2.31: the dialog receives the exact list used for the banner count,
+        so hidden/suppressed warnings cannot appear here by accident. Each row
+        names the severity, stable code, full message, and complete fix.
+        """
+        rows: list[ft.Control] = []
+        for item in warnings:
+            severity = str(item.get("severity", "info")).upper()
+            is_warning = severity == "WARNING"
+            colour = "#9A3412" if is_warning else "#334155"
+            rows.append(
+                ft.Container(
+                    bgcolor="#FFFBEB" if is_warning else "#F8FAFC",
+                    border=ft.Border.all(1, "#FDE68A" if is_warning else "#E2E8F0"),
+                    border_radius=8,
+                    padding=10,
+                    content=ft.Column(
+                        controls=[
+                            ft.Text(
+                                f"{severity} · {item.get('title', 'Setup item')}",
+                                size=12,
+                                weight=ft.FontWeight.BOLD,
+                                color=colour,
+                            ),
+                            ft.Text(
+                                f"Code: {item.get('code', '—')}",
+                                size=11,
+                                color="#64748B",
+                                selectable=True,
+                            ),
+                            ft.Text(
+                                str(item.get("message", "")),
+                                size=12,
+                                color=colour,
+                                selectable=True,
+                            ),
+                            ft.Text(
+                                f"Fix: {item.get('fix', '')}",
+                                size=11,
+                                color="#475569",
+                                selectable=True,
+                            ),
+                        ],
+                        spacing=4,
+                        tight=True,
+                    ),
+                )
+            )
+        if not rows:
+            rows.append(ft.Text(
+                "No setup warnings are currently visible.",
+                size=12,
+                color="#166534",
+            ))
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            data="setup_warning_details_dialog",
+            title=ft.Text("Setup check details"),
+            content=ft.Container(
+                content=ft.Column(
+                    controls=rows,
+                    scroll=ft.ScrollMode.AUTO,
+                    spacing=10,
+                    tight=True,
+                ),
+                width=720,
+                height=520,
+            ),
+            actions=[
+                ft.TextButton(
+                    "Close",
+                    on_click=lambda _: self.close_warning_details(dialog),
+                ),
+            ],
+        )
+        if hasattr(self.page, "show_dialog"):
+            self.page.show_dialog(dialog)
+        else:
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
+
+    def close_warning_details(self, dialog: ft.AlertDialog) -> None:
+        """Close the details dialog using the installed Flet 1.x stack API."""
+        if hasattr(self.page, "pop_dialog"):
+            self.page.pop_dialog()
+        else:
+            dialog.open = False
+            self.page.update()
 
     def render(self) -> None:
         item = self.get_current_item()

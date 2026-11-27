@@ -651,3 +651,55 @@ def test_hidden_warning_remains_reviewable_in_settings(settings_database):
     )
     assert _checkbox_by_data(root, "warning_ignore_no_dc_rates").value is True
     assert setup_warning_service.visible_setup_warnings() == []
+
+
+def test_client_copy_fields_category_offers_and_saves_all_builtin_fields(
+    settings_database
+):
+    root = settings.build_settings_page(FakePage())
+    titles = [
+        control.title.value
+        for control in _walk(root)
+        if isinstance(control, ft.ExpansionTile)
+    ]
+    assert "FBR Clients — direct copy fields" in titles
+    assert {
+        control.data.removeprefix("client_copy_field:")
+        for control in _walk(root)
+        if isinstance(control, ft.Checkbox)
+        and str(control.data).startswith("client_copy_field:")
+    } == set(settings_service.CLIENT_COPY_FIELD_LABELS)
+
+    for key in settings_service.DEFAULT_CLIENT_COPY_FIELDS:
+        assert _checkbox_by_data(root, f"client_copy_field:{key}").value is True
+
+    _checkbox_by_data(root, "client_copy_field:password").value = False
+    _checkbox_by_data(root, "client_copy_field:name").value = True
+
+    _button(root, "Save copy fields").on_click(None)
+
+    assert settings_service.get_client_copy_fields() == [
+        "name", "cnic", "phone_number", "email", "address",
+    ]
+    assert any(
+        "Copy fields saved" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
+
+
+def test_client_copy_fields_reset_restores_defaults(settings_database):
+    settings_service.set_client_copy_fields(["name"])
+    root = settings.build_settings_page(FakePage())
+
+    _button(root, "Reset copy fields").on_click(None)
+
+    assert settings_service.get_client_copy_fields() == (
+        settings_service.DEFAULT_CLIENT_COPY_FIELDS
+    )
+    assert _checkbox_by_data(root, "client_copy_field:email").value is True
+    assert _checkbox_by_data(root, "client_copy_field:phone_number").value is True
+    assert _checkbox_by_data(root, "client_copy_field:name").value is False
+    assert any(
+        "Copy fields reset" in (control.value or "")
+        for control in _walk(root) if isinstance(control, ft.Text)
+    )
