@@ -76,6 +76,17 @@ def _copy_buttons(root):
     }
 
 
+def _cnic_checkbox(root):
+    return next(
+        (
+            control for control in _walk(root)
+            if isinstance(control, ft.Checkbox)
+            and control.data == "cnic_without_dashes"
+        ),
+        None,
+    )
+
+
 def _patch_client_listing(monkeypatch):
     monkeypatch.setattr(clients, "list_clients", lambda **kwargs: [_fake_client()])
     monkeypatch.setattr(clients, "get_referrer_payment_totals", lambda: [])
@@ -255,6 +266,69 @@ def test_copy_buttons_follow_saved_selection(monkeypatch):
     root = clients.build_clients_page(FakePage())
 
     assert list(_copy_buttons(root)) == ["name", "father_name", "city"]
+
+
+def test_cnic_copy_checkbox_is_temporary_and_per_card(monkeypatch):
+    """v0.2.33: checked copies digits only; rebuilding resets to dashes."""
+    _patch_client_listing(monkeypatch)
+    monkeypatch.setattr(clients, "get_client_copy_fields", lambda: ["cnic"])
+    monkeypatch.setattr(ft, "Clipboard", FakeClipboard)
+    page = FakePage()
+    clipboard = FakeClipboard()
+    page.services.append(clipboard)
+    root = clients.build_clients_page(page)
+
+    checkbox = _cnic_checkbox(root)
+    assert checkbox is not None
+    assert checkbox.label == "CNIC without dashes"
+    assert checkbox.value is False
+
+    button = _copy_buttons(root)["cnic"]
+    asyncio.run(button.on_click(None))
+    assert clipboard.copied == ["12345-6789012-3"]
+
+    checkbox.value = True
+    asyncio.run(button.on_click(None))
+    assert clipboard.copied == [
+        "12345-6789012-3", "1234567890123",
+    ]
+
+    checkbox.value = False
+    asyncio.run(button.on_click(None))
+    assert clipboard.copied == [
+        "12345-6789012-3", "1234567890123", "12345-6789012-3",
+    ]
+    assert _cnic_checkbox(clients.build_clients_page(FakePage())).value is False
+
+
+def test_cnic_checkbox_is_absent_when_cnic_copy_is_not_configured(monkeypatch):
+    _patch_client_listing(monkeypatch)
+    monkeypatch.setattr(clients, "get_client_copy_fields", lambda: ["email"])
+
+    root = clients.build_clients_page(FakePage())
+
+    assert list(_copy_buttons(root)) == ["email"]
+    assert _cnic_checkbox(root) is None
+
+
+def test_cnic_form_explains_dashes_are_optional(monkeypatch):
+    _patch_client_listing(monkeypatch)
+    page = FakePage()
+    root = clients.build_clients_page(page)
+    add_button = next(
+        control for control in _walk(root)
+        if isinstance(control, (ft.Button, ft.TextButton))
+        and getattr(control, "content", "") == "Add client"
+    )
+
+    add_button.on_click(None)
+    cnic_field = next(
+        control for control in _walk(page.dialogs[-1])
+        if isinstance(control, ft.TextField)
+        and control.label == "CNIC number (optional)"
+    )
+    assert cnic_field.hint_text == "00000-0000000-0"
+    assert "with or without dashes" in cnic_field.helper
 
 
 def test_email_and_phone_copy_handlers_are_awaited(monkeypatch):

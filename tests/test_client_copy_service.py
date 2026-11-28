@@ -32,6 +32,29 @@ def test_format_copy_value_uses_plain_clipboard_text():
     assert client_copy_service.format_copy_value("password", b"cipher") == ""
 
 
+def test_cnic_copy_value_can_strip_dashes_without_changing_the_client():
+    client = SimpleNamespace(cnic="12345-6789012-3")
+
+    assert client_copy_service.cnic_copy_value(client) == "12345-6789012-3"
+    assert (
+        client_copy_service.cnic_copy_value(client, without_dashes=True)
+        == "1234567890123"
+    )
+    assert client.cnic == "12345-6789012-3"
+
+    plain = SimpleNamespace(cnic="1234567890123")
+    assert (
+        client_copy_service.cnic_copy_value(plain, without_dashes=True)
+        == "1234567890123"
+    )
+    assert (
+        client_copy_service.cnic_copy_value(
+            SimpleNamespace(cnic=None), without_dashes=True
+        )
+        == ""
+    )
+
+
 def test_client_copy_value_composes_full_address_and_keeps_parts_available():
     client = SimpleNamespace(
         address="House 1",

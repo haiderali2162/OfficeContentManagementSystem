@@ -388,6 +388,24 @@ def test_cnic_normalizes_dashed_and_plain_values(import_database):
     assert "CNIC" in bad["rows"][0]["problem"]
 
 
+def test_manual_create_client_accepts_plain_cnic(import_database):
+    """v0.2.33: the FBR Clients form stores 13 digits canonically."""
+    client_id = client_service.create_client(
+        name="Manual Client",
+        cnic="3520112345671",
+        cnic_expiry_date="2027-12-31",
+        phone_number="0300-1111111",
+        email="manual@example.com",
+        referred_by="Ref",
+        payment_amount="1000.00",
+        password="secret123",
+    )
+
+    with client_service.SessionLocal.begin() as session:
+        saved = session.get(Client, client_id)
+    assert saved.cnic == "35201-1234567-1"
+
+
 def test_expiry_date_formats_normalize(import_database):
     """DD-MM-YYYY, DD.MM.YYYY, DD/MM/YYYY, ISO, and datetime cells import."""
     headers = ["Name", "CNIC", "CNIC Expiry", "Phone", "Referred By"]

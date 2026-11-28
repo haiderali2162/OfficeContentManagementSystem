@@ -38,6 +38,7 @@ from services.client_service import (
 )
 from core.security import generate_secure_password
 from services.client_copy_service import (
+    cnic_copy_value,
     client_copy_field_available,
     client_copy_field_label,
     client_copy_value,
@@ -108,7 +109,8 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
     v0.2.30 cards hard-coded CNIC/address/password copy actions. v0.2.31
     builds those buttons from the saved built-in fields in Settings, adding
-    email, phone, and every other stable client column. Custom client columns
+    email, phone, and every other stable client column. v0.2.33 adds a temporary
+    per-card checkbox to copy CNIC digits without dashes. Custom client columns
     remain under the existing column manager.
     """
     # v0.2.31: read the preference once so every card in this list shows the
@@ -280,6 +282,16 @@ def build_clients_page(page: ft.Page) -> ft.Control:
         address_parts = [client.address, client.tehsil, client.district, client.city, client.province]
         full_address = ", ".join(part.strip() for part in address_parts if part and part.strip())
 
+        # v0.2.33: a temporary, per-card format switch. It is held only in
+        # this card's checkbox state, so a page refresh returns to dashes.
+        cnic_dash_checkbox = None
+        if "cnic" in client_copy_fields:
+            cnic_dash_checkbox = ft.Checkbox(
+                label="CNIC without dashes",
+                value=False,
+                data="cnic_without_dashes",
+            )
+
         # v0.2.31: one factory-made async handler per configured field. A
         # factory is required because a lambda returning a coroutine is treated
         # as synchronous by Flet, so the clipboard write may never be awaited.
@@ -290,7 +302,14 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                     # after this explicit button click.
                     await copy_client_password(client.id)
                     return
-                value = client_copy_value(client, field)
+                if (
+                    field == "cnic"
+                    and cnic_dash_checkbox is not None
+                    and cnic_dash_checkbox.value
+                ):
+                    value = cnic_copy_value(client, without_dashes=True)
+                else:
+                    value = client_copy_value(client, field)
                 label = client_copy_field_label(field)
                 if not value:
                     notify(page, f"No {label.lower()} is saved for this client.")
@@ -308,6 +327,12 @@ def build_clients_page(page: ft.Page) -> ft.Control:
             )
             for field in client_copy_fields
         ]
+        # Keep the checkbox directly beside the CNIC button it affects.
+        copy_controls = []
+        for field, button in zip(client_copy_fields, copy_buttons):
+            copy_controls.append(button)
+            if field == "cnic" and cnic_dash_checkbox is not None:
+                copy_controls.append(cnic_dash_checkbox)
 
         def save_card_status(e, client_id=client.id, previous=client.current_status):
             """Save this card's status immediately and restore it on failure."""
@@ -413,7 +438,7 @@ def build_clients_page(page: ft.Page) -> ft.Control:
                     ft.Divider(height=1, color="#E2E8F0"),
                     ft.Row(
                         controls=[
-                            *copy_buttons,
+                            *copy_controls,
                             text_button(
                                 "Custom data",
                                 on_click=lambda e, cid=client.id:
@@ -494,7 +519,12 @@ def build_clients_page(page: ft.Page) -> ft.Control:
 
         name_field = ft.TextField(label="Client name *", value=client.name if editing else "", autofocus=True)
         father_field = ft.TextField(label="Father name", value=(client.father_name or "") if editing else "")
-        cnic_field = ft.TextField(label="CNIC number (optional)", hint_text="00000-0000000-0", value=(client.cnic or "") if editing else "")
+        cnic_field = ft.TextField(
+            label="CNIC number (optional)",
+            hint_text="00000-0000000-0",
+            helper="Enter 13 digits with or without dashes.",
+            value=(client.cnic or "") if editing else "",
+        )
         ntn_field = ft.TextField(label="NTN number (optional)", value=(client.ntn_number or "") if editing else "")
         cnic_expiry_field = ft.TextField(label="CNIC expiry date (required when CNIC is entered)", hint_text="YYYY-MM-DD", value=date_text("cnic_expiry_date"))
         address_field = ft.TextField(label="Street / postal address", value=(client.address or "") if editing else "", multiline=True, min_lines=2, max_lines=3)
